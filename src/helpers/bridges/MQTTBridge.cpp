@@ -326,13 +326,12 @@ void MQTTBridge::end() {
   }
   
   // Clean up queued packets from FreeRTOS queue
+  // NOTE: Do NOT free queued.packet - the Dispatcher owns those packets.
+  // We just discard our references to them.
   if (_packet_queue_handle != nullptr) {
     QueuedPacket queued;
     while (xQueueReceive(_packet_queue_handle, &queued, 0) == pdTRUE) {
-      if (queued.packet) {
-        _mgr->free(queued.packet);
-        queued.packet = nullptr;
-      }
+      queued.packet = nullptr;
       _queue_count--;
     }
     vQueueDelete(_packet_queue_handle);
@@ -365,13 +364,12 @@ void MQTTBridge::end() {
     _analyzer_eu_client = nullptr;
   }
   
-  // Clean up queued packets to prevent memory leaks
+  // Clean up queued packet references
+  // NOTE: Do NOT free the packets - the Dispatcher owns those packets.
+  // We just discard our references to them.
   for (int i = 0; i < _queue_count; i++) {
     int index = (_queue_head + i) % MAX_QUEUE_SIZE;
-    if (_packet_queue[index].packet) {
-      _mgr->free(_packet_queue[index].packet);
-      _packet_queue[index].packet = nullptr;
-    }
+    _packet_queue[index].packet = nullptr;
     memset(&_packet_queue[index], 0, sizeof(QueuedPacket));
   }
   
@@ -1140,18 +1138,9 @@ void MQTTBridge::processPacketQueue() {
       publishRaw(queued.packet);
     }
     
-    // Free packet memory
-    // NOTE: PacketManager::free() is not thread-safe, but in practice this should be safe because:
-    // - Packets are allocated on Core 1 (main loop) and queued immediately
-    // - Once queued, packets are no longer accessed by Core 1
-    // - Packets are only freed here on Core 0 (MQTT task)
-    // - There's no concurrent access to the same packet instance
-    // However, concurrent access to PacketManager's internal pool structures could theoretically
-    // cause issues. If problems occur, consider adding a mutex wrapper around PacketManager operations.
-    if (queued.packet) {
-      _mgr->free(queued.packet);
-      queued.packet = nullptr;
-    }
+    // NOTE: Do NOT free the packet here - the Dispatcher owns and frees it after logRx() returns.
+    // The MQTT bridge only stores a pointer to read from; it does not own the packet.
+    queued.packet = nullptr;
     
     _queue_count--;
     processed++;
@@ -1203,10 +1192,8 @@ void MQTTBridge::processPacketQueue() {
       publishRaw(queued.packet);
     }
     
-    if (queued.packet) {
-      _mgr->free(queued.packet);
-      queued.packet = nullptr;
-    }
+    // NOTE: Do NOT free the packet here - the Dispatcher owns and frees it after logRx() returns.
+    queued.packet = nullptr;
     
     dequeuePacket();
     processed++;
@@ -1723,10 +1710,9 @@ void MQTTBridge::queuePacket(mesh::Packet* packet, bool is_tx) {
     // Queue full - try to remove oldest packet
     QueuedPacket oldest;
     if (xQueueReceive(_packet_queue_handle, &oldest, 0) == pdTRUE) {
-      if (oldest.packet) {
-        MQTT_DEBUG_PRINTLN("Queue full, dropping oldest packet");
-        _mgr->free(oldest.packet);
-      }
+      // NOTE: Do NOT free oldest.packet - the Dispatcher owns and frees it.
+      // We just drop our reference to it.
+      MQTT_DEBUG_PRINTLN("Queue full, dropping oldest packet reference");
       // Now try to send again
       if (xQueueSend(_packet_queue_handle, &queued, 0) != pdTRUE) {
         MQTT_DEBUG_PRINTLN("Failed to queue packet after dropping oldest");
@@ -1745,11 +1731,10 @@ void MQTTBridge::queuePacket(mesh::Packet* packet, bool is_tx) {
   // Non-ESP32: Use circular buffer
   if (_queue_count >= MAX_QUEUE_SIZE) {
     QueuedPacket& oldest = _packet_queue[_queue_head];
-    if (oldest.packet) {
-      MQTT_DEBUG_PRINTLN("Queue full, dropping oldest packet (queue size: %d)", _queue_count);
-      _mgr->free(oldest.packet);
-      oldest.packet = nullptr;
-    }
+    // NOTE: Do NOT free oldest.packet - the Dispatcher owns and frees it.
+    // We just drop our reference to it.
+    MQTT_DEBUG_PRINTLN("Queue full, dropping oldest packet reference (queue size: %d)", _queue_count);
+    oldest.packet = nullptr;
     dequeuePacket();
   }
   
