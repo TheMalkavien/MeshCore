@@ -1,6 +1,6 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
-
+#define Serial Serial2
 #include "MyMesh.h"
 
 #ifdef DISPLAY_CLASS
@@ -24,6 +24,10 @@ unsigned long lastActive = 0; // mark last active time
 unsigned long nextSleepinSecs = 120; // next sleep in seconds. The first sleep (if enabled) is after 2 minutes from boot
 
 void setup() {
+  #ifdef MLK_PIN_SERIAL_RX
+    Serial.setRX(MLK_PIN_SERIAL_RX);
+    Serial.setTX(MLK_PIN_SERIAL_TX);
+  #endif
   Serial.begin(115200);
   delay(1000);
 
