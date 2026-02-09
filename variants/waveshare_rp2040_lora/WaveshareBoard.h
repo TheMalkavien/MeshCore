@@ -20,14 +20,14 @@
  *              |    100k
  *    BAT- -----+
  */
-#define PIN_VBAT_READ            28
+#define PIN_VBAT_READ            26
 #define BATTERY_SAMPLES          8
 #define ADC_MULTIPLIER           (3.0f * 3.3f * 1000)
 
 class WaveshareBoard : public mesh::MainBoard {
 protected:
   uint8_t startup_reason;
-
+  float adc_mult = ADC_MULTIPLIER;
 public:
   void begin();
   uint8_t getStartupReason() const override { return startup_reason; }
@@ -47,12 +47,34 @@ public:
     }
     raw = raw / BATTERY_SAMPLES;
 
-    return (ADC_MULTIPLIER * raw) / 4096;
+    return (adc_mult * raw) / 4096;
 #else
     return 0;
 #endif
   }
-
+  bool setAdcMultiplier(float multiplier) override {
+#if defined(PIN_VBAT_READ) && defined(ADC_MULTIPLIER)
+     if (multiplier == 0.0f) {
+      adc_mult = ADC_MULTIPLIER;}
+    else {
+      adc_mult = multiplier;
+    }
+    return true;
+#else
+    return false;
+#endif
+  }
+  float getAdcMultiplier() const override {
+#if defined(PIN_VBAT_READ) && defined(ADC_MULTIPLIER)
+    if (adc_mult == 0.0f) {
+      return ADC_MULTIPLIER;
+    } else {
+      return adc_mult;
+    }
+#else
+    return 0.0f;
+#endif
+  }
   const char *getManufacturerName() const override { return "Waveshare RP2040-LoRa"; }
 
   void reboot() override { rp2040.reboot(); }
