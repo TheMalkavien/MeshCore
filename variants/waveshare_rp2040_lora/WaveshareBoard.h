@@ -47,7 +47,7 @@ public:
     }
     raw = raw / BATTERY_SAMPLES;
 
-    return (adc_mult * raw) / 4096;
+    return (adc_mult * raw * 1000) / 4096;
 #else
     return 0;
 #endif
