@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Mesh.h"
+#include <limits.h>
 
 
 class LocationProvider {
@@ -14,6 +15,8 @@ public:
     virtual long getLongitude() = 0;
     virtual long getAltitude() = 0;
     virtual long satellitesCount() = 0;
+    virtual long getSpeed() { return LONG_MIN; }   // thousandths of knot, LONG_MIN when unavailable
+    virtual long getCourse() { return LONG_MIN; }  // thousandths of degree, LONG_MIN when unavailable
     virtual bool isValid() = 0;
     virtual long getTimestamp() = 0;
     virtual void sendSentence(const char * sentence);
