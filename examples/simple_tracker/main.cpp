@@ -2,6 +2,10 @@
 #include "../simple_sensor/SensorMesh.h"
 #include <base64.hpp>
 #include <limits.h>
+#if defined(ESP32)
+  #include <esp_sleep.h>
+  #include <driver/rtc_io.h>
+#endif
 
 #ifdef DISPLAY_CLASS
   #include "../simple_sensor/UITask.h"
@@ -44,6 +48,14 @@
   #define TRACKER_BOOT_GRACE_SECS 20
 #endif
 
+#ifndef TRACKER_SLEEP_DRAIN_RECHECK_MS
+  #define TRACKER_SLEEP_DRAIN_RECHECK_MS 1500
+#endif
+
+#ifndef TRACKER_SLEEP_FLUSH_TIMEOUT_SECS
+  #define TRACKER_SLEEP_FLUSH_TIMEOUT_SECS 12
+#endif
+
 #ifndef TRACKER_SERIAL_DEBUG
   #define TRACKER_SERIAL_DEBUG 1
 #endif
@@ -57,6 +69,23 @@
 #else
   #define TRACKER_DBG(...) do { } while (0)
 #endif
+
+static void enterTimerOnlyDeepSleep(uint32_t secs) {
+#if defined(ESP32)
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  if (secs > 0) {
+    esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
+  }
+#if defined(P_LORA_NSS)
+  if (rtc_gpio_is_valid_gpio((gpio_num_t)P_LORA_NSS)) {
+    rtc_gpio_hold_en((gpio_num_t)P_LORA_NSS);
+  }
+#endif
+  esp_deep_sleep_start();
+#else
+  board.sleep(secs);
+#endif
+}
 
 class TrackerMesh : public SensorMesh {
 public:
@@ -78,6 +107,12 @@ public:
     SensorMesh::begin(fs);
     _cfg_fs = fs;
     loadTrackerConfig();
+#if defined(ESP32)
+    if (_sleep_enabled && esp_reset_reason() == ESP_RST_DEEPSLEEP) {
+      _next_measure_millis = millis() + TRACKER_SLEEP_DRAIN_RECHECK_MS;
+      TRACKER_DBG("wake from deep sleep: schedule next cycle in %ums", (unsigned)TRACKER_SLEEP_DRAIN_RECHECK_MS);
+    }
+#endif
   }
 
   void loop() {
@@ -86,6 +121,10 @@ public:
     if (_tracking_in_progress) {
       pollTrackingCycle();
     } else if (_next_measure_millis && millisHasNowPassed(_next_measure_millis)) {
+      if (_sleep_waiting_for_queue_drain) {
+        handleSleepQueueDrain();
+        return;
+      }
       TRACKER_DBG("next cycle due");
       _next_measure_millis = 0;
       startTrackingCycle();
@@ -100,6 +139,8 @@ protected:
   uint8_t _min_sats = TRACKER_DEFAULT_MIN_SATS;
   uint16_t _min_live_fix_age_secs = TRACKER_DEFAULT_MIN_FIX_AGE_SECS;
   unsigned long _next_measure_millis = 0;
+  bool _sleep_waiting_for_queue_drain = false;
+  unsigned long _sleep_drain_started_millis = 0;
   mesh::GroupChannel _group_channel;
   bool _group_ready = false;
   bool _group_psk_is_default = true;
@@ -157,10 +198,14 @@ protected:
     if (memcmp(command, "tracker sleep ", 14) == 0) {
       if (memcmp(&command[14], "on", 2) == 0) {
         _sleep_enabled = true;
+        _sleep_waiting_for_queue_drain = false;
+        _sleep_drain_started_millis = 0;
         persistTrackerConfig();
         strcpy(reply, "OK");
       } else if (memcmp(&command[14], "off", 3) == 0) {
         _sleep_enabled = false;
+        _sleep_waiting_for_queue_drain = false;
+        _sleep_drain_started_millis = 0;
         persistTrackerConfig();
         strcpy(reply, "OK");
       } else {
@@ -258,6 +303,8 @@ protected:
     }
 
     if (strcmp(command, "tracker send") == 0 || strcmp(command, "tracker now") == 0) {
+      _sleep_waiting_for_queue_drain = false;
+      _sleep_drain_started_millis = 0;
       _next_measure_millis = millis();
       strcpy(reply, "queued");
       return true;
@@ -395,6 +442,46 @@ private:
       gps.raw_lat,
       gps.raw_lon,
       gps.timestamp);
+  }
+
+  void syncRTCFromGPS(const GPSState& gps) {
+    if (!gps.valid) {
+      return;
+    }
+    if (gps.raw_lat == 0 && gps.raw_lon == 0) {
+      return;
+    }
+    if (gps.timestamp < 1577836800L) { // 2020-01-01
+      return;
+    }
+    uint32_t rtc_now = getRTCClock()->getCurrentTime();
+    long drift = (long)gps.timestamp - (long)rtc_now;
+    long abs_drift = drift >= 0 ? drift : -drift;
+
+    // Default fallback epoch used by VolatileRTCClock/ESP32RTCClock startup path.
+    const uint32_t fallback_epoch = 1715770351UL; // 15 May 2024, 20:52:31 UTC
+    bool rtc_is_fallback = (rtc_now >= (fallback_epoch - 86400UL) && rtc_now <= (fallback_epoch + 86400UL));
+
+    // Safety: after user/manual time set, do not apply large GPS jumps.
+    // Only allow large jumps when the RTC still looks like fallback/default.
+    if (abs_drift <= 2) {
+      return;
+    }
+    if (!rtc_is_fallback && abs_drift > 30) {
+      TRACKER_DBG("rtc gps sync skipped: large drift=%lds rtc=%lu gps=%ld",
+        drift,
+        (unsigned long)rtc_now,
+        gps.timestamp);
+      return;
+    }
+
+    if (drift > 2 || drift < -2) {
+      getRTCClock()->setCurrentTime((uint32_t)gps.timestamp);
+      TRACKER_DBG("rtc synced from gps: gps_ts=%ld rtc_prev=%lu drift=%lds",
+        gps.timestamp,
+        (unsigned long)rtc_now,
+        drift);
+    }
   }
 
   void applyGroupPolicyGuard() {
@@ -636,25 +723,37 @@ private:
     }
 
     uint8_t data[5 + 128];
-    uint32_t timestamp = getRTCClock()->getCurrentTime();
+    uint32_t timestamp = getRTCClock()->getCurrentTimeUnique();
+    const char* sender_name = "tracker";
+    NodePrefs* prefs = getNodePrefs();
+    if (prefs && prefs->node_name[0]) {
+      sender_name = prefs->node_name;
+    }
     memcpy(data, &timestamp, 4);
     data[4] = 0;
 
-    snprintf((char*)&data[5], 123, "%s: %s", _group_name, text);
+    snprintf((char*)&data[5], 123, "%s: %s", sender_name, text);
     int text_len = strlen((char*)&data[5]);
 
     auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _group_channel, data, 5 + text_len);
     if (pkt) {
-      TRACKER_DBG("send group text (psk hash=%02X%02X%02X%02X): %s",
+      TRACKER_DBG("send group text (psk hash=%02X%02X%02X%02X sender=%s ts=%lu): %s",
         _group_channel.hash[0],
         _group_channel.hash[1],
         _group_channel.hash[2],
         _group_channel.hash[3],
+        sender_name,
+        (unsigned long)timestamp,
         (char*)&data[5]);
       sendFlood(pkt);
     } else {
       TRACKER_DBG("group packet alloc failed");
     }
+  }
+
+  void enterTrackerSleep(uint32_t secs) {
+    TRACKER_DBG("enter deep sleep (%lus)", (unsigned long)secs);
+    enterTimerOnlyDeepSleep(secs);
   }
 
   void scheduleNextCycle() {
@@ -664,14 +763,50 @@ private:
         (unsigned long)pending,
         (unsigned long)_interval_secs);
       if (pending == 0) {
-        TRACKER_DBG("enter board.sleep(%lus)", (unsigned long)_interval_secs);
-        board.sleep(_interval_secs);
+        enterTrackerSleep(_interval_secs);
+        _sleep_waiting_for_queue_drain = false;
+        _sleep_drain_started_millis = 0;
+      } else {
+        _sleep_waiting_for_queue_drain = true;
+        _sleep_drain_started_millis = millis();
+        TRACKER_DBG("sleep deferred: outbound queue not empty, recheck in %ums",
+          (unsigned)TRACKER_SLEEP_DRAIN_RECHECK_MS);
       }
-      _next_measure_millis = millis() + 1500;
-      TRACKER_DBG("post-sleep wake window in 1500ms");
+      _next_measure_millis = millis() + TRACKER_SLEEP_DRAIN_RECHECK_MS;
+      TRACKER_DBG("post-sleep wake window in %ums", (unsigned)TRACKER_SLEEP_DRAIN_RECHECK_MS);
     } else {
+      _sleep_waiting_for_queue_drain = false;
+      _sleep_drain_started_millis = 0;
       _next_measure_millis = millis() + _interval_secs * 1000UL;
       TRACKER_DBG("schedule: sleep=off next in %lus", (unsigned long)_interval_secs);
+    }
+  }
+
+  void handleSleepQueueDrain() {
+    uint32_t pending = _mgr->getOutboundCount(0xFFFFFFFF);
+    uint32_t waited_ms = (_sleep_drain_started_millis == 0) ? 0 : (uint32_t)(millis() - _sleep_drain_started_millis);
+    uint32_t waited_s = waited_ms / 1000UL;
+    bool force_sleep = waited_ms >= (TRACKER_SLEEP_FLUSH_TIMEOUT_SECS * 1000UL);
+    if (pending == 0) {
+      TRACKER_DBG("sleep queue drained after %lus", (unsigned long)waited_s);
+      enterTrackerSleep(_interval_secs);
+      _sleep_waiting_for_queue_drain = false;
+      _sleep_drain_started_millis = 0;
+      _next_measure_millis = millis() + TRACKER_SLEEP_DRAIN_RECHECK_MS;
+      TRACKER_DBG("post-sleep wake window in %ums", (unsigned)TRACKER_SLEEP_DRAIN_RECHECK_MS);
+    } else if (force_sleep) {
+      TRACKER_DBG("sleep force after %lus with pending=%lu", (unsigned long)waited_s, (unsigned long)pending);
+      enterTrackerSleep(_interval_secs);
+      _sleep_waiting_for_queue_drain = false;
+      _sleep_drain_started_millis = 0;
+      _next_measure_millis = millis() + TRACKER_SLEEP_DRAIN_RECHECK_MS;
+      TRACKER_DBG("post-sleep wake window in %ums", (unsigned)TRACKER_SLEEP_DRAIN_RECHECK_MS);
+    } else {
+      _next_measure_millis = millis() + TRACKER_SLEEP_DRAIN_RECHECK_MS;
+      TRACKER_DBG("sleep wait: pending=%lu waited=%lus retry in %ums",
+        (unsigned long)pending,
+        (unsigned long)waited_s,
+        (unsigned)TRACKER_SLEEP_DRAIN_RECHECK_MS);
     }
   }
 
@@ -687,6 +822,12 @@ private:
   }
 
   void completeTrackingCycle() {
+#if ENV_INCLUDE_GPS == 1
+    if (_sleep_enabled) {
+      sensors.setSettingValue("gps", "0");
+      TRACKER_DBG("gps disabled for sleep");
+    }
+#endif
     _tracking_in_progress = false;
     TRACKER_DBG("tracking cycle complete");
     scheduleNextCycle();
@@ -695,6 +836,7 @@ private:
   void pollTrackingCycle() {
 #if ENV_INCLUDE_GPS == 1
     GPSState gps = getGPSState();
+    syncRTCFromGPS(gps);
     bool gps_live_fix = gps.valid;
     bool live_coords_ok = !(gps.raw_lat == 0 && gps.raw_lon == 0);
     bool gps_live_with_coords = gps_live_fix && live_coords_ok;
