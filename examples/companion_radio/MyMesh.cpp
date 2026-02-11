@@ -3,6 +3,24 @@
 #include <Arduino.h> // needed for PlatformIO
 #include <Mesh.h>
 
+bool __attribute__((weak)) trackerHybridSetGroupName(const char* name) {
+  (void)name;
+  return false;
+}
+
+const char* __attribute__((weak)) trackerHybridGetGroupName() {
+  return NULL;
+}
+
+bool __attribute__((weak)) trackerHybridSetGroupPSK(const char* psk) {
+  (void)psk;
+  return false;
+}
+
+const char* __attribute__((weak)) trackerHybridGetGroupPSK() {
+  return NULL;
+}
+
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
 #define CMD_SEND_CHANNEL_TXT_MSG      3
@@ -1636,6 +1654,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     }
   } else if (cmd_frame[0] == CMD_GET_CUSTOM_VARS) {
     out_frame[0] = RESP_CODE_CUSTOM_VARS;
+    char *start = (char *)&out_frame[1];
     char *dp = (char *)&out_frame[1];
     for (int i = 0; i < sensors.getNumSettings() && dp - (char *)&out_frame[1] < 140; i++) {
       if (i > 0) {
@@ -1647,6 +1666,38 @@ void MyMesh::handleCmdFrame(size_t len) {
       strcpy(dp, sensors.getSettingValue(i));
       dp = strchr(dp, 0);
     }
+    const char* tracker_group_name = trackerHybridGetGroupName();
+    if (tracker_group_name && tracker_group_name[0]) {
+      const char* key = "tracker.group";
+      int remaining = 140 - (int)(dp - start);
+      int needed = (dp > start ? 1 : 0) + (int)strlen(key) + 1 + (int)strlen(tracker_group_name);
+      if (remaining > needed) {
+        if (dp > start) {
+          *dp++ = ',';
+        }
+        strcpy(dp, key);
+        dp = strchr(dp, 0);
+        *dp++ = ':';
+        strcpy(dp, tracker_group_name);
+        dp = strchr(dp, 0);
+      }
+    }
+    const char* tracker_group_psk = trackerHybridGetGroupPSK();
+    if (tracker_group_psk && tracker_group_psk[0]) {
+      const char* key = "tracker.group.psk";
+      int remaining = 140 - (int)(dp - start);
+      int needed = (dp > start ? 1 : 0) + (int)strlen(key) + 1 + (int)strlen(tracker_group_psk);
+      if (remaining > needed) {
+        if (dp > start) {
+          *dp++ = ',';
+        }
+        strcpy(dp, key);
+        dp = strchr(dp, 0);
+        *dp++ = ':';
+        strcpy(dp, tracker_group_psk);
+        dp = strchr(dp, 0);
+      }
+    }
     _serial->writeFrame(out_frame, dp - (char *)out_frame);
   } else if (cmd_frame[0] == CMD_SET_CUSTOM_VAR && len >= 4) {
     cmd_frame[len] = 0;
@@ -1654,7 +1705,14 @@ void MyMesh::handleCmdFrame(size_t len) {
     char *np = strchr(sp, ':'); // look for separator char
     if (np) {
       *np++ = 0; // modify 'cmd_frame', replace ':' with null
-      bool success = sensors.setSettingValue(sp, np);
+      bool success = false;
+      if (strcmp(sp, "tracker.group") == 0) {
+        success = trackerHybridSetGroupName(np);
+      } else if (strcmp(sp, "tracker.group.psk") == 0) {
+        success = trackerHybridSetGroupPSK(np);
+      } else {
+        success = sensors.setSettingValue(sp, np);
+      }
       if (success) {
         #if ENV_INCLUDE_GPS == 1
         // Update node preferences for GPS settings

@@ -125,6 +125,8 @@ public:
   long getLongitude() override { return _lng; }
   long getAltitude() override { return _alt; }
   long satellitesCount() override { return _sats; }
+  long getSpeed() override { return LONG_MIN; }
+  long getCourse() override { return LONG_MIN; }
   bool isValid() override { return _fix; }
   long getTimestamp() override { return _epoch; }
   void sendSentence(const char * sentence) override { }
