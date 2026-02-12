@@ -1,0 +1,162 @@
+[
+  {
+    "id": "a8f6b2a1e9f64c6f",
+    "type": "tab",
+    "label": "MeshCore Tracker -> HA",
+    "disabled": false,
+    "info": "External decoder mode: subscribe to meshcore/decoded/... and forward tracker positions to Home Assistant."
+  },
+  {
+    "id": "e35f31991a3f07fd",
+    "type": "mqtt in",
+    "z": "a8f6b2a1e9f64c6f",
+    "name": "MeshCore decoded tracker",
+    "topic": "meshcore/decoded/+/+/tracker",
+    "qos": "1",
+    "datatype": "json",
+    "broker": "f2e79c83d8cc3bde",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 210,
+    "y": 120,
+    "wires": [
+      [
+        "f0b6f780d3bbcb4b",
+        "6e76064f3f7f15f2"
+      ]
+    ]
+  },
+  {
+    "id": "6e76064f3f7f15f2",
+    "type": "debug",
+    "z": "a8f6b2a1e9f64c6f",
+    "name": "tracker decoded (debug)",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 500,
+    "y": 80,
+    "wires": []
+  },
+  {
+    "id": "f0b6f780d3bbcb4b",
+    "type": "function",
+    "z": "a8f6b2a1e9f64c6f",
+    "name": "Build HA device_tracker payload",
+    "func": "const p = msg.payload || {};\nconst t = p.tracker || {};\nif (typeof t.lat !== 'number' || typeof t.lon !== 'number') return null;\n\nconst rawId = String(p.device_id || p.origin_id || p.sender || 'mesh_tracker').toLowerCase();\nconst cleaned = rawId.replace(/[^a-z0-9_]/g, '_');\nconst devId = cleaned ? ('mesh_' + cleaned).slice(0, 63) : 'mesh_tracker';\n\nconst sats = Number.isFinite(t.sats) ? t.sats : null;\nlet gpsAccuracy = 50;\nif (sats !== null) {\n  if (sats >= 12) gpsAccuracy = 5;\n  else if (sats >= 8) gpsAccuracy = 10;\n  else if (sats >= 5) gpsAccuracy = 25;\n  else gpsAccuracy = 100;\n}\n\nmsg.payload = {\n  dev_id: devId,\n  gps: [t.lat, t.lon],\n  gps_accuracy: gpsAccuracy,\n  source_type: 'gps'\n};\n\nif (p.sender || p.origin) {\n  msg.payload.host_name = String(p.sender || p.origin);\n}\n\nreturn msg;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 530,
+    "y": 120,
+    "wires": [
+      [
+        "ea4c2ff41f66d8d1",
+        "fd6de7cfa8ecba4d"
+      ]
+    ]
+  },
+  {
+    "id": "fd6de7cfa8ecba4d",
+    "type": "debug",
+    "z": "a8f6b2a1e9f64c6f",
+    "name": "HA payload (debug)",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 800,
+    "y": 80,
+    "wires": []
+  },
+  {
+    "id": "ea4c2ff41f66d8d1",
+    "type": "api-call-service",
+    "z": "a8f6b2a1e9f64c6f",
+    "name": "HA call service",
+    "server": "REPLACE_WITH_HA_SERVER_ID",
+    "version": 7,
+    "debugenabled": false,
+    "action": "device_tracker.see",
+    "floorId": [],
+    "areaId": [],
+    "deviceId": [],
+    "entityId": [],
+    "labelId": [],
+    "data": "{\"dev_id\": payload.dev_id, \"gps\": payload.gps, \"gps_accuracy\": payload.gps_accuracy, \"source_type\": payload.source_type, \"host_name\": payload.host_name}",
+    "dataType": "jsonata",
+    "mergeContext": "",
+    "mustacheAltTags": false,
+    "outputProperties": [],
+    "queue": "none",
+    "x": 780,
+    "y": 140,
+    "wires": [
+      [
+        "e007ca6dd7ded286"
+      ]
+    ]
+  },
+  {
+    "id": "e007ca6dd7ded286",
+    "type": "debug",
+    "z": "a8f6b2a1e9f64c6f",
+    "name": "HA call result",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "true",
+    "targetType": "full",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 1010,
+    "y": 140,
+    "wires": []
+  },
+  {
+    "id": "f2e79c83d8cc3bde",
+    "type": "mqtt-broker",
+    "name": "REPLACE_MQTT_BROKER",
+    "broker": "127.0.0.1",
+    "port": "1883",
+    "clientid": "",
+    "autoConnect": true,
+    "usetls": false,
+    "protocolVersion": "4",
+    "keepalive": "60",
+    "cleansession": true,
+    "autoUnsubscribe": true,
+    "birthTopic": "",
+    "birthQos": "0",
+    "birthRetain": "false",
+    "birthPayload": "",
+    "birthMsg": {},
+    "closeTopic": "",
+    "closeQos": "0",
+    "closeRetain": "false",
+    "closePayload": "",
+    "closeMsg": {},
+    "willTopic": "",
+    "willQos": "0",
+    "willRetain": "false",
+    "willPayload": "",
+    "willMsg": {},
+    "userProps": "",
+    "sessionExpiry": ""
+  }
+]
