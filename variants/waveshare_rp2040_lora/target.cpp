@@ -33,6 +33,10 @@ uint32_t radio_get_rng_seed() {
   return radio.random(0x7FFFFFFF);
 }
 
+extern "C" bool meshcore_radio_hw_irq_pending(void) {
+  return radio.getIrqFlags() != 0;
+}
+
 void radio_set_params(float freq, float bw, uint8_t sf, uint8_t cr) {
   radio.setFrequency(freq);
   radio.setSpreadingFactor(sf);
