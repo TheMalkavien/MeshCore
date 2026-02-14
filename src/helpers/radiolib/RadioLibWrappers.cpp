@@ -12,6 +12,29 @@
 #define SAMPLING_THRESHOLD  14
 
 static volatile uint8_t state = STATE_IDLE;
+static PhysicalLayer* g_radio_for_sleep = NULL;
+
+// Optional board hook for platforms that want to wake the MCU on radio DIO1 IRQ
+// while RadioLib owns the interrupt callback on that pin.
+extern "C" void meshcore_on_lora_dio1_irq(void) __attribute__((weak));
+extern "C" void meshcore_on_lora_dio1_irq(void) {
+}
+extern "C" bool meshcore_radio_irq_pending(void) __attribute__((weak));
+extern "C" bool meshcore_radio_irq_pending(void) {
+  return (state & STATE_INT_READY) != 0;
+}
+extern "C" bool meshcore_radio_prepare_for_sleep(void) __attribute__((weak));
+extern "C" bool meshcore_radio_prepare_for_sleep(void) {
+  if (state & STATE_INT_READY) {
+    return true;
+  }
+  if (((state & ~STATE_INT_READY) != STATE_RX) && g_radio_for_sleep) {
+    if (g_radio_for_sleep->startReceive() == RADIOLIB_ERR_NONE) {
+      state = STATE_RX;
+    }
+  }
+  return (state & STATE_INT_READY) != 0;
+}
 
 // this function is called when a complete packet
 // is transmitted by the module
@@ -22,9 +45,11 @@ static
 void setFlag(void) {
   // we sent a packet, set the flag
   state |= STATE_INT_READY;
+  meshcore_on_lora_dio1_irq();
 }
 
 void RadioLibWrapper::begin() {
+  g_radio_for_sleep = _radio;
   _radio->setPacketReceivedAction(setFlag);  // this is also SentComplete interrupt
   state = STATE_IDLE;
 

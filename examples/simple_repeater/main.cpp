@@ -21,7 +21,7 @@ static char command[160];
 
 // For power saving
 unsigned long lastActive = 0; // mark last active time
-unsigned long nextSleepinSecs = 120; // next sleep in seconds. The first sleep (if enabled) is after 2 minutes from boot
+unsigned long nextSleepinSecs = 60; // next sleep in seconds. The first sleep (if enabled) is after 1 minutes from boot
 
 void setup() {
   #ifdef MLK_PIN_SERIAL_RX
@@ -138,16 +138,19 @@ void loop() {
 #endif
   rtc_clock.tick();
 
-  if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
+  if (the_mesh.getNodePrefs()->powersaving_enabled) {
     #if defined(NRF52_PLATFORM)
     board.sleep(1800); // nrf ignores seconds param, sleeps whenever possible
     #else
-    if (the_mesh.millisHasNowPassed(lastActive + nextSleepinSecs * 1000)) { // To check if it is time to sleep
+    if (the_mesh.hasPendingWork()) {
+      // Keep postponing sleep while work is pending.
+      lastActive = millis();
+    } else if (the_mesh.millisHasNowPassed(lastActive + nextSleepinSecs * 1000)) { // To check if it is time to sleep
+      Serial.println("Entering sleep mode...");
       board.sleep(1800);             // To sleep. Wake up after 30 minutes or when receiving a LoRa packet
+      Serial.println("Awake!");
       lastActive = millis();
       nextSleepinSecs = 5;  // Default: To work for 5s and sleep again
-    } else {
-      nextSleepinSecs += 5; // When there is pending work, to work another 5s
     }
     #endif
   }
