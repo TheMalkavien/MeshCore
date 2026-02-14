@@ -29,6 +29,10 @@ bool radio_init() {
   return radio.std_init(NULL);
 }
 
+extern "C" bool meshcore_radio_hw_irq_pending(void) {
+  return radio.getIrqFlags() != 0;
+}
+
 mesh::LocalIdentity radio_new_identity() {
   RadioNoiseListener rng(radio);
   return mesh::LocalIdentity(&rng); // create new random identity

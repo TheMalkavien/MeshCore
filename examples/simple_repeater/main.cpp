@@ -28,7 +28,12 @@ static char ethernet_command[160];
 #endif
 
 // For power saving
+#if defined(RP2040_PLATFORM)
+unsigned long lastActive = 0; // mark last active time
+unsigned long nextSleepinSecs = 60; // first sleep is one minute after boot
+#else
 unsigned long POWERSAVING_FIRSTSLEEP_SECS = 120; // The first sleep (if enabled) from boot
+#endif
 
 #if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_)
 static unsigned long userBtnDownAt = 0;
@@ -199,11 +204,26 @@ void loop() {
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.loop();
 #endif
-  if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
+
+  if (the_mesh.getNodePrefs()->powersaving_enabled) {
 #if defined(NRF52_PLATFORM)
-    board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
+    if (!the_mesh.hasPendingWork()) {
+      board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
+    }
+#elif defined(RP2040_PLATFORM)
+    if (the_mesh.hasPendingWork()) {
+      // Keep postponing sleep while work is pending.
+      lastActive = millis();
+    } else if (the_mesh.millisHasNowPassed(lastActive + nextSleepinSecs * 1000)) {
+      Serial.println("Entering sleep mode...");
+      board.sleep(1800); // Wake after 30 minutes or when receiving a LoRa packet
+      Serial.println("Awake!");
+      lastActive = millis();
+      nextSleepinSecs = 5; // Work for 5 seconds before sleeping again
+    }
 #else
-    if (the_mesh.millisHasNowPassed(POWERSAVING_FIRSTSLEEP_SECS * 1000)) { // To check if it is time to sleep
+    if (!the_mesh.hasPendingWork() &&
+        the_mesh.millisHasNowPassed(POWERSAVING_FIRSTSLEEP_SECS * 1000)) {
       board.sleep(30); // Sleep. Wake up after a while or when receiving a LoRa packet
     }
 #endif

@@ -28,8 +28,10 @@ class WaveshareBoard : public mesh::MainBoard {
 protected:
   uint8_t startup_reason;
   float adc_mult = ADC_MULTIPLIER;
+  uint32_t _sleep_until_millis;
 public:
   void begin();
+  void sleep(uint32_t secs) override;
   uint8_t getStartupReason() const override { return startup_reason; }
 
 #ifdef P_LORA_TX_LED
