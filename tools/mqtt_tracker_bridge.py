@@ -329,6 +329,9 @@ class BridgeApp:
         self._dedupe_seconds = max(0, int(args.dedupe_seconds))
         self._seen_packets: Dict[str, float] = {}
         self._last_prune = 0.0
+        self._mqtt_ok_rc = getattr(mqtt, "MQTT_ERR_SUCCESS", 0)
+        self._reconnect_min = max(1, int(args.reconnect_min_seconds))
+        self._reconnect_max = max(self._reconnect_min, int(args.reconnect_max_seconds))
         self.client = self._create_mqtt_client(args.client_id)
         if args.username:
             self.client.username_pw_set(args.username, args.password)
@@ -338,7 +341,14 @@ class BridgeApp:
         except Exception:
             # Older paho versions may not support enable_logger.
             pass
+        try:
+            self.client.reconnect_delay_set(min_delay=self._reconnect_min, max_delay=self._reconnect_max)
+        except Exception:
+            # Older paho versions may not expose reconnect_delay_set.
+            pass
         self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
+        self.client.on_subscribe = self._on_subscribe
         self.client.on_message = self._on_message
 
     def _create_mqtt_client(self, client_id: str):
@@ -351,8 +361,94 @@ class BridgeApp:
         return mqtt.Client(client_id=client_id)
 
     def _on_connect(self, client, userdata, flags, reason_code=0, properties=None):
+        rc_value = self._reason_code_value(reason_code)
+        if rc_value not in (self._mqtt_ok_rc, 0):
+            logging.warning("MQTT connected with non-success reason=%s", reason_code)
         logging.info("MQTT connected rc=%s, subscribing to %s", reason_code, self.args.topic)
-        client.subscribe(self.args.topic, qos=1)
+        sub_rc, mid = client.subscribe(self.args.topic, qos=1)
+        if sub_rc != self._mqtt_ok_rc:
+            logging.error("MQTT subscribe failed rc=%s topic=%s", sub_rc, self.args.topic)
+        else:
+            logging.debug("MQTT subscribe requested mid=%s topic=%s", mid, self.args.topic)
+
+    def _on_disconnect(self, client, userdata, reason_code=0, properties=None):
+        rc_value = self._reason_code_value(reason_code)
+        if rc_value in (self._mqtt_ok_rc, 0):
+            logging.info("MQTT disconnected cleanly")
+        else:
+            logging.warning("MQTT disconnected unexpectedly reason=%s", reason_code)
+
+    def _on_subscribe(self, client, userdata, mid, granted_qos, properties=None):
+        logging.debug("MQTT subscribed mid=%s qos=%s", mid, granted_qos)
+
+    @staticmethod
+    def _reason_code_value(reason_code) -> int:
+        try:
+            return int(reason_code)
+        except Exception:
+            value = getattr(reason_code, "value", None)
+            if value is not None:
+                try:
+                    return int(value)
+                except Exception:
+                    return -1
+        return -1
+
+    def _is_connected(self) -> bool:
+        if hasattr(self.client, "is_connected"):
+            try:
+                return bool(self.client.is_connected())
+            except Exception:
+                return False
+        return False
+
+    def _safe_publish(self, topic: str, payload: dict) -> None:
+        try:
+            info = self.client.publish(
+                topic,
+                json.dumps(payload, separators=(",", ":")),
+                qos=1,
+                retain=False,
+            )
+        except Exception:
+            logging.exception("MQTT publish threw exception topic=%s", topic)
+            return
+
+        if info.rc != self._mqtt_ok_rc:
+            logging.error("MQTT publish failed rc=%s topic=%s", info.rc, topic)
+
+    def _connect_with_backoff(self) -> None:
+        delay = self._reconnect_min
+        while True:
+            try:
+                self.client.connect(self.args.host, self.args.port, keepalive=60)
+                return
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                logging.exception(
+                    "Initial MQTT connection failed to %s:%s, retry in %ss",
+                    self.args.host,
+                    self.args.port,
+                    delay,
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, self._reconnect_max)
+
+    def _reconnect_with_backoff(self) -> None:
+        delay = self._reconnect_min
+        while not self._is_connected():
+            try:
+                rc = self.client.reconnect()
+                if rc == self._mqtt_ok_rc:
+                    return
+                logging.warning("MQTT reconnect returned rc=%s, retry in %ss", rc, delay)
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                logging.exception("MQTT reconnect failed, retry in %ss", delay)
+            time.sleep(delay)
+            delay = min(delay * 2, self._reconnect_max)
 
     def _dedupe_key(self, base: dict) -> str:
         packet_hash = str(base.get("packet_hash") or "").strip()
@@ -391,46 +487,61 @@ class BridgeApp:
         except json.JSONDecodeError:
             return
 
-        base = _decode_packet_message(topic, payload, self.channels)
-        if not base:
-            return
-        if self._is_duplicate(base):
-            logging.debug(
-                "duplicate tracker packet ignored hash=%s topic=%s",
-                base.get("packet_hash"),
-                topic,
-            )
-            return
+        try:
+            base = _decode_packet_message(topic, payload, self.channels)
+            if not base:
+                return
+            if self._is_duplicate(base):
+                logging.debug(
+                    "duplicate tracker packet ignored hash=%s topic=%s",
+                    base.get("packet_hash"),
+                    topic,
+                )
+                return
 
-        iata = base["iata"]
-        device_id = base["device_id"]
-        if self.args.publish_text:
-            text_topic = f"{self.args.out_prefix}/{iata}/{device_id}/text"
-            # Keep text topic focused on decrypted textual content only.
-            text_payload = dict(base)
-            text_payload.pop("tracker", None)
-            client.publish(text_topic, json.dumps(text_payload, separators=(",", ":")), qos=1, retain=False)
+            iata = base["iata"]
+            device_id = base["device_id"]
+            if self.args.publish_text:
+                text_topic = f"{self.args.out_prefix}/{iata}/{device_id}/text"
+                # Keep text topic focused on decrypted textual content only.
+                text_payload = dict(base)
+                text_payload.pop("tracker", None)
+                self._safe_publish(text_topic, text_payload)
 
-        if "tracker" in base:
-            tracker_topic = f"{self.args.out_prefix}/{iata}/{device_id}/tracker"
-            client.publish(tracker_topic, json.dumps(base, separators=(",", ":")), qos=1, retain=False)
-            logging.info(
-                "tracker %s %s lat=%.6f lon=%.6f sats=%s",
-                iata,
-                device_id,
-                base["tracker"]["lat"],
-                base["tracker"]["lon"],
-                base["tracker"].get("sats", "?"),
-            )
+            if "tracker" in base:
+                tracker_topic = f"{self.args.out_prefix}/{iata}/{device_id}/tracker"
+                self._safe_publish(tracker_topic, base)
+                logging.info(
+                    "tracker %s %s lat=%.6f lon=%.6f sats=%s",
+                    iata,
+                    device_id,
+                    base["tracker"]["lat"],
+                    base["tracker"]["lon"],
+                    base["tracker"].get("sats", "?"),
+                )
+        except Exception:
+            logging.exception("Unhandled error while processing MQTT message topic=%s", topic)
 
     def run(self) -> None:
         logging.info("Configured channels: %s", ", ".join(ch.name for ch in self.channels))
-        self.client.connect(self.args.host, self.args.port, keepalive=60)
+        self._connect_with_backoff()
         try:
-            self.client.loop_forever(retry_first_connection=True)
-        except TypeError:
-            # Older paho versions do not support retry_first_connection.
-            self.client.loop_forever()
+            while True:
+                rc = self.client.loop(timeout=1.0)
+                if rc not in (self._mqtt_ok_rc, 0):
+                    logging.debug("MQTT loop returned rc=%s", rc)
+                if not self._is_connected():
+                    logging.warning("MQTT connection lost, trying to reconnect")
+                    self._reconnect_with_backoff()
+                    continue
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            logging.info("Interrupted, stopping bridge")
+        finally:
+            try:
+                self.client.disconnect()
+            except Exception:
+                pass
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -453,6 +564,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=int(os.getenv("MESHCORE_DEDUPE_SECONDS", "15")),
         help="Ignore duplicate packets seen within this window (default: 15, set 0 to disable)",
+    )
+    p.add_argument(
+        "--reconnect-min-seconds",
+        type=int,
+        default=int(os.getenv("MESHCORE_RECONNECT_MIN_SECONDS", "2")),
+        help="Minimum delay for MQTT reconnect retry backoff (default: 2)",
+    )
+    p.add_argument(
+        "--reconnect-max-seconds",
+        type=int,
+        default=int(os.getenv("MESHCORE_RECONNECT_MAX_SECONDS", "60")),
+        help="Maximum delay for MQTT reconnect retry backoff (default: 60)",
     )
     p.add_argument("--client-id", default=os.getenv("MESHCORE_MQTT_CLIENT_ID", "meshcore-tracker-bridge"))
     p.add_argument("--debug", action="store_true", default=_parse_bool(os.getenv("MESHCORE_DEBUG"), False))
