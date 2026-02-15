@@ -64,6 +64,10 @@
   #define TRACKER_CONFIG_PATH "/tracker.cfg"
 #endif
 
+#ifndef TRACKER_GROUP_TEXT_BUFFER
+  #define TRACKER_GROUP_TEXT_BUFFER 176
+#endif
+
 #if TRACKER_SERIAL_DEBUG == 1
   #define TRACKER_DBG(fmt, ...) Serial.printf("[tracker %10lu] " fmt "\r\n", millis(), ##__VA_ARGS__)
 #else
@@ -716,13 +720,74 @@ private:
     return false;
   }
 
-  void sendGroupText(const char* text) {
+  void sendTrackerFixJson(
+    float lat,
+    float lon,
+    float alt,
+    int sats,
+    bool speed_ok,
+    float speed_kmh,
+    bool course_ok,
+    float course_deg,
+    const char* fix_mode
+  ) {
+    char sats_txt[12];
+    char speed_txt[16];
+    char course_txt[16];
+
+    if (sats >= 0) {
+      snprintf(sats_txt, sizeof(sats_txt), "%d", sats);
+    } else {
+      StrHelper::strncpy(sats_txt, "null", sizeof(sats_txt));
+    }
+
+    if (speed_ok) {
+      snprintf(speed_txt, sizeof(speed_txt), "%.1f", speed_kmh);
+    } else {
+      StrHelper::strncpy(speed_txt, "null", sizeof(speed_txt));
+    }
+
+    if (course_ok) {
+      snprintf(course_txt, sizeof(course_txt), "%.1f", course_deg);
+    } else {
+      StrHelper::strncpy(course_txt, "null", sizeof(course_txt));
+    }
+
+    char text[TRACKER_GROUP_TEXT_BUFFER];
+    snprintf(text, sizeof(text),
+      "{\"t\":\"tracker\",\"v\":1,\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,\"sat\":%s,\"spd\":%s,\"dir\":%s,\"fix\":\"%s\"}",
+      lat,
+      lon,
+      alt,
+      sats_txt,
+      speed_txt,
+      course_txt,
+      (fix_mode && fix_mode[0]) ? fix_mode : "unknown");
+    sendGroupText(text);
+  }
+
+  void sendTrackerEventJson(const char* event_name, const char* reason = NULL) {
+    char text[TRACKER_GROUP_TEXT_BUFFER];
+    if (reason && reason[0]) {
+      snprintf(text, sizeof(text),
+        "{\"t\":\"tracker\",\"v\":1,\"event\":\"%s\",\"reason\":\"%s\"}",
+        event_name,
+        reason);
+    } else {
+      snprintf(text, sizeof(text),
+        "{\"t\":\"tracker\",\"v\":1,\"event\":\"%s\"}",
+        event_name);
+    }
+    sendGroupText(text);
+  }
+
+  void sendGroupText(const char* text, bool include_sender = true) {
     if (!_group_ready) {
       TRACKER_DBG("skip group send: group not ready for '%s' (set tracker group.psk ...)", _group_name);
       return;
     }
 
-    uint8_t data[5 + 128];
+    uint8_t data[5 + TRACKER_GROUP_TEXT_BUFFER];
     uint32_t timestamp = getRTCClock()->getCurrentTimeUnique();
     const char* sender_name = "tracker";
     NodePrefs* prefs = getNodePrefs();
@@ -732,7 +797,19 @@ private:
     memcpy(data, &timestamp, 4);
     data[4] = 0;
 
-    snprintf((char*)&data[5], 123, "%s: %s", sender_name, text);
+    int written = 0;
+    if (include_sender) {
+      written = snprintf((char*)&data[5], TRACKER_GROUP_TEXT_BUFFER, "%s: %s", sender_name, text);
+    } else {
+      written = snprintf((char*)&data[5], TRACKER_GROUP_TEXT_BUFFER, "%s", text);
+    }
+    if (written < 0) {
+      TRACKER_DBG("group text format failed");
+      return;
+    }
+    if (written >= TRACKER_GROUP_TEXT_BUFFER) {
+      TRACKER_DBG("group text truncated (%d/%u)", written, (unsigned)TRACKER_GROUP_TEXT_BUFFER);
+    }
     int text_len = strlen((char*)&data[5]);
 
     auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _group_channel, data, 5 + text_len);
@@ -868,9 +945,6 @@ private:
         StrHelper::strncpy(course_txt, "n/a", sizeof(course_txt));
       }
 
-      char text[128];
-      snprintf(text, sizeof(text), "GPS lat=%.6f lon=%.6f alt=%.1fm sats=%d spd=%skm/h dir=%sdeg fix=%s",
-        lat, lon, alt, report_sats, speed_txt, course_txt, gps_live_accepted ? "live" : "cached");
       TRACKER_DBG("gps position ready (%s fix): lat=%.6f lon=%.6f sats=%d spd=%s km/h dir=%s deg",
         gps_live_accepted ? "live" : "cached",
         lat,
@@ -878,7 +952,16 @@ private:
         report_sats,
         speed_txt,
         course_txt);
-      sendGroupText(text);
+      sendTrackerFixJson(
+        lat,
+        lon,
+        alt,
+        report_sats,
+        speed_ok,
+        speed_kmh,
+        course_ok,
+        course_deg,
+        gps_live_accepted ? "live" : "cached");
       completeTrackingCycle();
       return;
     }
@@ -919,11 +1002,11 @@ private:
         _require_live_fix ? "live" : "cached");
     }
     if (millisHasNowPassed(_tracking_started_millis + timeout_millis)) {
-      sendGroupText("GPS timeout: no qualified fix");
+      sendTrackerEventJson("timeout", "no_qualified_fix");
       completeTrackingCycle();
     }
 #else
-    sendGroupText("GPS unavailable on this build");
+    sendTrackerEventJson("gps_unavailable", "build_without_gps");
     completeTrackingCycle();
 #endif
   }
