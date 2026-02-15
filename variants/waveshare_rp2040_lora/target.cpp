@@ -10,8 +10,12 @@ WRAPPER_CLASS radio_driver(radio, board);
 
 VolatileRTCClock fallback_clock;
 AutoDiscoverRTCClock rtc_clock(fallback_clock);
-//SensorManager sensors;
+
+#ifdef MLK_SENSORS
 EnvironmentSensorManager sensors;
+#else
+SensorManager sensors;
+#endif
 
 bool radio_init() {
   rtc_clock.begin(Wire);
