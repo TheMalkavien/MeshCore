@@ -16,3 +16,4 @@ cmake-*
 compile_commands.json
 .venv/
 venv/
+tools/__pycache__/mqtt_tracker_bridge.cpython-313.pyc
