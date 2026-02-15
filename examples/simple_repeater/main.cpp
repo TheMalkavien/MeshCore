@@ -1,6 +1,8 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
+#ifdef MLK_PIN_SERIAL_RX
 #define Serial Serial2
+#endif
 #include "MyMesh.h"
 
 #ifdef DISPLAY_CLASS
