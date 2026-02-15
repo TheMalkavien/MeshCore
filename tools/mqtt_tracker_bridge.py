@@ -2,8 +2,8 @@
 """MeshCore MQTT group-text decoder and tracker extractor.
 
 This bridge subscribes to MeshCore MQTT packet messages, decrypts group text
-(PAYLOAD_TYPE_GRP_TXT = 5), parses tracker text payloads, and republishes
-normalized JSON for Node-RED/Home Assistant automation.
+(PAYLOAD_TYPE_GRP_TXT = 5), parses tracker payloads (JSON or legacy text),
+and republishes normalized JSON for Node-RED/Home Assistant automation.
 
 Requirements:
   pip install paho-mqtt pycryptodome
@@ -61,7 +61,8 @@ TRACKER_RE = re.compile(
     re.IGNORECASE,
 )
 
-SENDER_PREFIX_RE = re.compile(r"^(?P<sender>[^:]{1,96}):\s*(?P<body>GPS\b.*)$", re.IGNORECASE)
+SENDER_GPS_PREFIX_RE = re.compile(r"^(?P<sender>[^:]{1,96}):\s*(?P<body>GPS\b.*)$", re.IGNORECASE)
+SENDER_JSON_PREFIX_RE = re.compile(r"^(?P<sender>[^:]{1,96}):\s*(?P<body>\{.*)$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -246,13 +247,144 @@ def _decode_group_text(raw_hex: str, channels: Sequence[ChannelConfig]) -> Optio
 
 
 def _extract_sender_and_body(text: str) -> Tuple[Optional[str], str]:
-    m = SENDER_PREFIX_RE.match(text.strip())
-    if not m:
-        return None, text.strip()
-    return m.group("sender").strip(), m.group("body").strip()
+    stripped = text.strip()
+    if not stripped:
+        return None, stripped
+    if stripped[0] == "{":
+        return None, stripped
+
+    # Primary path for tracker payloads emitted as "<sender>: <body>".
+    # Use right split so sender names containing ":" still parse when body is JSON/GPS.
+    if ": " in stripped:
+        sender_part, _, body_part = stripped.rpartition(": ")
+        sender = sender_part.strip()
+        body = body_part.strip()
+        if sender and body and (body.startswith("{") or body.upper().startswith("GPS")):
+            return sender, body
+
+    m = SENDER_GPS_PREFIX_RE.match(stripped)
+    if m:
+        return m.group("sender").strip(), m.group("body").strip()
+
+    m = SENDER_JSON_PREFIX_RE.match(stripped)
+    if m:
+        return m.group("sender").strip(), m.group("body").strip()
+
+    return None, stripped
+
+
+def _coerce_float(value) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        v = value.strip()
+        if not v or v.lower() in {"null", "none", "n/a", "na"}:
+            return None
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_int(value) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        v = value.strip()
+        if not v or v.lower() in {"null", "none", "n/a", "na"}:
+            return None
+        try:
+            return int(float(v))
+        except ValueError:
+            return None
+    return None
+
+
+def _first_present(mapping: dict, keys: Sequence[str]):
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
+
+
+def _parse_tracker_json(body: str) -> Optional[dict]:
+    try:
+        payload = json.loads(body)
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    tracker_obj = payload
+    nested = payload.get("tracker")
+    if isinstance(nested, dict):
+        tracker_obj = nested
+
+    out = {}
+    lat = _coerce_float(_first_present(tracker_obj, ("lat",)))
+    lon = _coerce_float(_first_present(tracker_obj, ("lon",)))
+    if lat is not None and lon is not None:
+        out["lat"] = lat
+        out["lon"] = lon
+
+    alt = _coerce_float(_first_present(tracker_obj, ("alt_m", "alt")))
+    if alt is not None:
+        out["alt_m"] = alt
+
+    sats = _coerce_int(_first_present(tracker_obj, ("sats", "sat")))
+    if sats is not None:
+        out["sats"] = sats
+
+    speed = _coerce_float(_first_present(tracker_obj, ("speed_kmh", "spd_kmh", "spd")))
+    if speed is not None:
+        out["speed_kmh"] = speed
+
+    heading = _coerce_float(_first_present(tracker_obj, ("heading_deg", "dir_deg", "dir", "heading")))
+    if heading is not None:
+        out["heading_deg"] = heading
+
+    fix = _first_present(tracker_obj, ("fix",))
+    if isinstance(fix, str) and fix:
+        out["fix"] = fix
+
+    version = _coerce_int(_first_present(tracker_obj, ("ver", "version", "v")))
+    if version is not None:
+        out["version"] = version
+
+    tracker_type = _first_present(tracker_obj, ("type", "t"))
+    if isinstance(tracker_type, str) and tracker_type:
+        out["type"] = tracker_type
+
+    event = _first_present(tracker_obj, ("event", "evt"))
+    if isinstance(event, str) and event:
+        out["event"] = event
+
+    reason = _first_present(tracker_obj, ("reason", "err"))
+    if isinstance(reason, str) and reason:
+        out["reason"] = reason
+
+    # Position report: require lat/lon.
+    if "lat" in out and "lon" in out:
+        return out
+    # Tracker event without coordinates (timeout, gps_unavailable, ...).
+    if out.get("type") == "tracker" and ("event" in out or "reason" in out):
+        return out
+    return None
 
 
 def _parse_tracker(body: str) -> Optional[dict]:
+    json_tracker = _parse_tracker_json(body)
+    if json_tracker:
+        return json_tracker
+
     m = TRACKER_RE.search(body)
     if not m:
         return None
@@ -280,16 +412,38 @@ def _decode_packet_message(
     channels: Sequence[ChannelConfig],
     received_at: Optional[int] = None,
 ) -> Optional[dict]:
-    packet_type = str(payload.get("packet_type", ""))
-    if packet_type != "5":
+    packet_type_raw = payload.get("packet_type", payload.get("payload_type", payload.get("type")))
+    packet_type: Optional[int] = None
+    if isinstance(packet_type_raw, int):
+        packet_type = packet_type_raw
+    elif isinstance(packet_type_raw, str):
+        s = packet_type_raw.strip().lower()
+        if s.isdigit():
+            packet_type = int(s)
+        elif s.startswith("0x"):
+            try:
+                packet_type = int(s, 16)
+            except ValueError:
+                packet_type = None
+        elif s in {"grp_txt", "group_text", "group-txt"}:
+            packet_type = PAYLOAD_TYPE_GRP_TXT
+
+    if packet_type != PAYLOAD_TYPE_GRP_TXT:
+        logging.debug("skip packet: unsupported packet_type=%r topic=%s", packet_type_raw, topic)
         return None
 
     raw_hex = payload.get("raw")
+    if raw_hex is None and isinstance(payload.get("packet"), dict):
+        raw_hex = payload["packet"].get("raw")
+    if raw_hex is None:
+        raw_hex = payload.get("data")
     if not raw_hex:
+        logging.debug("skip packet: missing raw hex topic=%s keys=%s", topic, sorted(payload.keys()))
         return None
 
     decoded = _decode_group_text(raw_hex, channels)
     if not decoded:
+        logging.debug("skip packet: group decrypt failed topic=%s", topic)
         return None
 
     sender, body = _extract_sender_and_body(decoded["text"])
@@ -314,6 +468,8 @@ def _decode_packet_message(
     }
     if tracker:
         base["tracker"] = tracker
+    else:
+        logging.debug("decoded text but no tracker payload topic=%s text=%r", topic, decoded["text"])
     return base
 
 
@@ -511,14 +667,24 @@ class BridgeApp:
             if "tracker" in base:
                 tracker_topic = f"{self.args.out_prefix}/{iata}/{device_id}/tracker"
                 self._safe_publish(tracker_topic, base)
-                logging.info(
-                    "tracker %s %s lat=%.6f lon=%.6f sats=%s",
-                    iata,
-                    device_id,
-                    base["tracker"]["lat"],
-                    base["tracker"]["lon"],
-                    base["tracker"].get("sats", "?"),
-                )
+                t = base["tracker"]
+                if "lat" in t and "lon" in t:
+                    logging.info(
+                        "tracker %s %s lat=%.6f lon=%.6f sats=%s",
+                        iata,
+                        device_id,
+                        t["lat"],
+                        t["lon"],
+                        t.get("sats", "?"),
+                    )
+                else:
+                    logging.info(
+                        "tracker-event %s %s event=%s reason=%s",
+                        iata,
+                        device_id,
+                        t.get("event", "?"),
+                        t.get("reason", "?"),
+                    )
         except Exception:
             logging.exception("Unhandled error while processing MQTT message topic=%s", topic)
 
