@@ -94,7 +94,11 @@ void CommonCLI::loadPrefsInt(FILESYSTEM* fs, const char* filename) {
     _prefs->cr = constrain(_prefs->cr, 5, 8);
     _prefs->tx_power_dbm = constrain(_prefs->tx_power_dbm, -9, 30);
     _prefs->multi_acks = constrain(_prefs->multi_acks, 0, 1);
-    _prefs->adc_multiplier = constrain(_prefs->adc_multiplier, 0.0f, 10.0f);
+    // Some boards use large ADC multiplier scales (e.g. RP2040 variants around ~9900).
+    // Keep valid values, reset only clearly invalid/corrupted ones.
+    if (!isfinite(_prefs->adc_multiplier) || _prefs->adc_multiplier < 0.0f || _prefs->adc_multiplier > 100000.0f) {
+      _prefs->adc_multiplier = 0.0f;
+    }
 
     // sanitise bad bridge pref values
     _prefs->bridge_enabled = constrain(_prefs->bridge_enabled, 0, 1);
