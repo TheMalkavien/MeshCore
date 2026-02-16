@@ -28,7 +28,6 @@ class WaveshareBoard : public mesh::MainBoard {
 protected:
   uint8_t startup_reason;
   float adc_mult = ADC_MULTIPLIER;
-  uint32_t _sleep_until_millis;
 public:
   void begin();
   void sleep(uint32_t secs) override;
@@ -115,11 +114,12 @@ inline void rp2040_apply_clock_profile(uint32_t clock_mhz) {
 }
 
 inline void rp2040_enter_sleep_profile() {
-  vreg_set_voltage(VREG_VOLTAGE_0_90);
   rp2040_apply_clock_profile(RP2040_SLEEP_CLOCK_MHZ);
+  vreg_set_voltage(VREG_VOLTAGE_0_90);
 }
 
 inline void rp2040_restore_active_profile() {
+  vreg_set_voltage(VREG_VOLTAGE_DEFAULT);
   rp2040_apply_clock_profile(RP2040_ACTIVE_CLOCK_MHZ);
 }
 #endif
