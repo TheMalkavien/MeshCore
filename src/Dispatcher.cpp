@@ -106,6 +106,11 @@ void Dispatcher::loop() {
   }
   checkRecv();
   checkSend();
+
+#if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
+  // Idle the core until next interrupt (SysTick or radio IRQ) to trim idle current.
+  __asm volatile("wfi");
+#endif
 }
 
 void Dispatcher::checkRecv() {

@@ -5,6 +5,10 @@ extern "C" bool meshcore_board_usb_on_demand(void) __attribute__((weak));
 extern "C" bool meshcore_board_usb_on_demand(void) {
   return false;
 }
+extern "C" bool meshcore_board_usb_off_demand(void) __attribute__((weak));
+extern "C" bool meshcore_board_usb_off_demand(void) {
+  return false;
+}
 extern "C" bool meshcore_board_usb_is_connected(void) __attribute__((weak));
 extern "C" bool meshcore_board_usb_is_connected(void) {
   return false;
@@ -1180,6 +1184,12 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
   } else if (strcmp(command, "usb on") == 0) {
     if (meshcore_board_usb_on_demand()) {
       strcpy(reply, "OK - USB enabled");
+    } else {
+      strcpy(reply, "Err - USB unsupported");
+    }
+  } else if (strcmp(command, "usb off") == 0) {
+    if (meshcore_board_usb_off_demand()) {
+      strcpy(reply, "OK - USB disabled");
     } else {
       strcpy(reply, "Err - USB unsupported");
     }
