@@ -1,11 +1,15 @@
 #include "WaveshareBoard.h"
 
 #include <Arduino.h>
+#include <SPI.h>
 #include <Wire.h>
 
 #if defined(ARDUINO_ARCH_RP2040)
   #include <hardware/clocks.h>
   #include <hardware/sync.h>
+#if defined(MLK_RP2040_LOWPOWER) && !defined(NO_USB) && !defined(USE_TINYUSB)
+  #include <USB.h>
+#endif
 #endif
 
 #if defined(ARDUINO_ARCH_RP2040) && defined(P_LORA_DIO_1)
@@ -19,6 +23,72 @@ extern "C" bool meshcore_radio_hw_irq_pending(void) {
 }
 extern "C" void meshcore_on_lora_dio1_irq(void) {
   g_lora_wake_irq = true;
+}
+#endif
+
+#if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
+static bool g_usb_restore_on_wake = true;
+static bool g_usb_connected = true;
+static bool g_has_slept_once = false;
+
+static void rp2040_suspend_runtime_peripherals() {
+#if defined(MLK_PIN_SERIAL_RX) && defined(MLK_PIN_SERIAL_TX)
+  Serial2.flush();
+  Serial2.end();
+#endif
+
+  Wire.end();
+
+#if defined(P_LORA_SCLK) && defined(P_LORA_MOSI) && defined(P_LORA_MISO)
+  SPI1.end();
+#endif
+
+#if !defined(NO_USB) && !defined(USE_TINYUSB)
+  if (g_usb_connected) {
+    USB.disconnect();
+    g_usb_connected = false;
+  }
+#endif
+}
+
+static void rp2040_resume_runtime_peripherals(bool resume_usb) {
+#if defined(P_LORA_NSS)
+  pinMode(P_LORA_NSS, OUTPUT);
+  digitalWrite(P_LORA_NSS, HIGH);
+#endif
+
+#if defined(P_LORA_SCLK) && defined(P_LORA_MOSI) && defined(P_LORA_MISO)
+  SPI1.begin(false);
+#endif
+
+  Wire.begin();
+
+#if defined(MLK_PIN_SERIAL_RX) && defined(MLK_PIN_SERIAL_TX)
+  Serial2.begin(115200);
+#endif
+
+#if !defined(NO_USB) && !defined(USE_TINYUSB)
+  if (resume_usb && !g_usb_connected) {
+    USB.connect();
+    g_usb_connected = true;
+  }
+#endif
+}
+
+extern "C" bool meshcore_board_usb_on_demand(void) {
+#if !defined(NO_USB) && !defined(USE_TINYUSB)
+  if (!g_usb_connected) {
+    USB.connect();
+    g_usb_connected = true;
+  }
+  return true;
+#else
+  return false;
+#endif
+}
+
+extern "C" bool meshcore_board_usb_is_connected(void) {
+  return g_usb_connected;
 }
 #endif
 
@@ -58,7 +128,7 @@ void WaveshareBoard::begin() {
   delay(10); // give sx1262 some time to power up
 
   #ifdef MLK_RP2040_LOWPOWER
-    rp2040_lowpower();
+    rp2040_restore_active_profile();
   #endif
   #ifdef MLK_ESP32_FLASHER_PIN
     pinMode(MLK_ESP32_FLASHER_PIN, OUTPUT);
@@ -71,7 +141,7 @@ void WaveshareBoard::sleep(uint32_t secs) {
 #if defined(ARDUINO_ARCH_RP2040)
   if (secs == 0) return;
 
-  // Sleep window with immediate wake on LoRa DIO1 assertion.
+  // Timed sleep window with immediate wake on LoRa DIO1 assertion.
   _sleep_until_millis = millis() + ((uint32_t)secs * 1000);
   #ifdef P_LORA_DIO_1
     if (meshcore_radio_prepare_for_sleep()) {
@@ -88,14 +158,32 @@ void WaveshareBoard::sleep(uint32_t secs) {
     }
   #endif
 
+#ifdef MLK_RP2040_LOWPOWER
+  if (!g_has_slept_once) {
+    g_has_slept_once = true;
+    g_usb_restore_on_wake = false;
+  }
+  rp2040_enter_sleep_profile();
+  rp2040_suspend_runtime_peripherals();
+#endif
+
   while ((int32_t)(millis() - _sleep_until_millis) < 0) {
     #ifdef P_LORA_DIO_1
-      if (g_lora_wake_irq || digitalRead(P_LORA_DIO_1) == HIGH || meshcore_radio_irq_pending() || meshcore_radio_hw_irq_pending()) {
+      if (g_lora_wake_irq || digitalRead(P_LORA_DIO_1) == HIGH || meshcore_radio_irq_pending()
+#ifndef MLK_RP2040_LOWPOWER
+          || meshcore_radio_hw_irq_pending()
+#endif
+      ) {
         break;  // packet IRQ latched/pending -> return immediately to process it
       }
     #endif
     __wfi();
   }
+
+#ifdef MLK_RP2040_LOWPOWER
+  rp2040_restore_active_profile();
+  rp2040_resume_runtime_peripherals(g_usb_restore_on_wake);
+#endif
 
 #else
   delay(secs * 1000);

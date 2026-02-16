@@ -86,26 +86,40 @@ public:
 
 #ifdef MLK_RP2040_LOWPOWER
 #include <hardware/vreg.h>
-#define CLOCK_MHZ 48
 
-inline void rp2040_lowpower() {
-  vreg_set_voltage(VREG_VOLTAGE_0_90);
-      /* Set the system frequency to 18 MHz. */
-  set_sys_clock_khz(CLOCK_MHZ * KHZ, false);
-  /* The previous line automatically detached clk_peri from clk_sys, and
-      attached it to pll_usb. We need to attach clk_peri back to system PLL to keep SPI
-      working at this low speed.
-      For details see https://github.com/jgromes/RadioLib/discussions/938
-  */
+#ifndef RP2040_SLEEP_CLOCK_MHZ
+  #define RP2040_SLEEP_CLOCK_MHZ 18
+#endif
+
+#ifndef RP2040_ACTIVE_CLOCK_MHZ
+  #ifdef RP2040_CPU_FREQ_MHZ
+    #define RP2040_ACTIVE_CLOCK_MHZ RP2040_CPU_FREQ_MHZ
+  #else
+    #define RP2040_ACTIVE_CLOCK_MHZ 125
+  #endif
+#endif
+
+inline void rp2040_apply_clock_profile(uint32_t clock_mhz) {
+  set_sys_clock_khz(clock_mhz * KHZ, false);
+
+  // Keep SPI, ADC and RTC on coherent clock sources after changing clk_sys.
   clock_configure(clk_peri,
-                  0,                                                // No glitchless mux
-                  CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS, // System PLL on AUX mux
-                  CLOCK_MHZ * MHZ,                                         // Input frequency
-                  CLOCK_MHZ * MHZ                                          // Output (must be same as no divider)
-  );
-  /* Run also ADC on lower clk_sys. */
-  clock_configure(clk_adc, 0, CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS, 48 * MHZ, 48 * MHZ);
-  /* Run RTC from XOSC since USB clock is off */
+                  0,                                      // No glitchless mux
+                  CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+                  clock_mhz * MHZ,                        // Input frequency
+                  clock_mhz * MHZ);                       // Output frequency
+  clock_configure(clk_adc, 0,
+                  CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                  clock_mhz * MHZ, clock_mhz * MHZ);
   clock_configure(clk_rtc, 0, CLOCKS_CLK_RTC_CTRL_AUXSRC_VALUE_XOSC_CLKSRC, 12 * MHZ, 46875);
+}
+
+inline void rp2040_enter_sleep_profile() {
+  vreg_set_voltage(VREG_VOLTAGE_0_90);
+  rp2040_apply_clock_profile(RP2040_SLEEP_CLOCK_MHZ);
+}
+
+inline void rp2040_restore_active_profile() {
+  rp2040_apply_clock_profile(RP2040_ACTIVE_CLOCK_MHZ);
 }
 #endif
