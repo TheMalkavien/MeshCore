@@ -803,7 +803,6 @@ void MyMesh::onControlDataRecv(mesh::Packet* packet) {
     if (tag != pending_discover_tag) {
       return;
     }
-
     mesh::Identity id(&packet->payload[6]);
     if (id.matches(self_id)) {
       return;
@@ -813,6 +812,7 @@ void MyMesh::onControlDataRecv(mesh::Packet* packet) {
 }
 
 void MyMesh::sendNodeDiscoverReq() {
+  if (_prefs.disable_fwd) return;
   uint8_t data[10];
   data[0] = CTL_TYPE_NODE_DISCOVER_REQ; // prefix_only=0
   data[1] = (1 << ADV_TYPE_REPEATER);
