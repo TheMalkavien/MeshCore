@@ -1,6 +1,15 @@
 #include "MyMesh.h"
 #include <algorithm>
 
+extern "C" bool meshcore_board_usb_on_demand(void) __attribute__((weak));
+extern "C" bool meshcore_board_usb_on_demand(void) {
+  return false;
+}
+extern "C" bool meshcore_board_usb_is_connected(void) __attribute__((weak));
+extern "C" bool meshcore_board_usb_is_connected(void) {
+  return false;
+}
+
 /* ------------------------------ Config -------------------------------- */
 
 #ifndef LORA_FREQ
@@ -1258,6 +1267,14 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     } else {
       strcpy(reply, "Err - ??");
     }
+  } else if (strcmp(command, "usb on") == 0) {
+    if (meshcore_board_usb_on_demand()) {
+      strcpy(reply, "OK - USB enabled");
+    } else {
+      strcpy(reply, "Err - USB unsupported");
+    }
+  } else if (strcmp(command, "usb status") == 0) {
+    strcpy(reply, meshcore_board_usb_is_connected() ? "> on" : "> off");
   } else if (memcmp(command, "discover.neighbors", 18) == 0) {
     const char* sub = command + 18;
     while (*sub == ' ') sub++;
