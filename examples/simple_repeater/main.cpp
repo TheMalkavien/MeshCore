@@ -29,6 +29,19 @@ static char command[160];
 static char ethernet_command[160];
 #endif
 
+static bool isUsbOffCommand(const char *cmd) {
+  while (*cmd == ' ') {
+    cmd++;
+  }
+  if (strlen(cmd) > 3 && cmd[2] == '|') {
+    cmd += 3;
+  }
+  while (*cmd == ' ') {
+    cmd++;
+  }
+  return strcmp(cmd, "usb off") == 0;
+}
+
 // For power saving
 #if defined(RP2040_PLATFORM)
 unsigned long lastActive = 0; // mark last active time
@@ -152,6 +165,7 @@ void loop() {
   if (len > 0 && command[len - 1] == '\r') {  // received complete line
     Serial.print('\n');
     command[len - 1] = 0;  // replace newline with C string null terminator
+    bool is_usb_off = isUsbOffCommand(command);
     char reply[160];
     reply[0] = 0;
 #ifdef ETHERNET_ENABLED
@@ -161,7 +175,7 @@ void loop() {
 #else
     the_mesh.handleCommand(0, command, reply);  // NOTE: there is no sender_timestamp via serial!
 #endif
-    if (reply[0]) {
+    if (reply[0] && !is_usb_off) {
       Serial.print("  -> "); Serial.println(reply);
     }
 
@@ -212,6 +226,9 @@ void loop() {
     if (!the_mesh.hasPendingWork()) {
       board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
     }
+#elif defined(RP2040_PLATFORM) && defined(MLK_RP2040_LOWPOWER)
+    // Sleep is intentionally disabled on RP2040 low-power runtime profile.
+    lastActive = millis();
 #elif defined(RP2040_PLATFORM)
     if (the_mesh.hasPendingWork()) {
       // Keep postponing sleep while work is pending.
