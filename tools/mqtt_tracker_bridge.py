@@ -16,6 +16,8 @@ Environment shortcuts (optional):
   MESHCORE_MQTT_TOPIC
   MESHCORE_MQTT_OUT_PREFIX
   MESHCORE_CHANNELS   (format: "Name=PSK,Other=PSK2")
+  MESHCORE_DEBUG
+  MESHCORE_VERBOSE_DEBUG
 """
 
 from __future__ import annotations
@@ -82,6 +84,17 @@ class ChannelConfig:
 def _require_crypto() -> None:
     if AES is None:
         raise SystemExit("Missing dependency: pycryptodome (pip install pycryptodome)")
+
+
+def _vdebug(enabled: bool, message: str, *args) -> None:
+    if enabled:
+        logging.debug("[verbose] " + message, *args)
+
+
+def _shorten(value: str, max_len: int = 220) -> str:
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 3] + "..."
 
 
 def _parse_bool(value: str, default: bool = False) -> bool:
@@ -169,14 +182,16 @@ def _channel_hash_byte(secret32: bytes, hash_len: int) -> int:
     return hashlib.sha256(secret32[:hash_len]).digest()[0]
 
 
-def _decode_group_text(raw_hex: str, channels: Sequence[ChannelConfig]) -> Optional[dict]:
+def _decode_group_text(raw_hex: str, channels: Sequence[ChannelConfig], verbose: bool = False) -> Optional[dict]:
     _require_crypto()
     try:
         raw = bytes.fromhex(raw_hex)
     except ValueError:
+        _vdebug(verbose, "group decode failed: raw hex invalid")
         return None
 
     if len(raw) < 4:
+        _vdebug(verbose, "group decode failed: frame too short len=%s", len(raw))
         return None
 
     idx = 0
@@ -189,23 +204,41 @@ def _decode_group_text(raw_hex: str, channels: Sequence[ChannelConfig]) -> Optio
     # Transport route types include 2x uint16 transport codes in header.
     if route_type in (0x00, 0x03):
         if len(raw) < idx + 4:
+            _vdebug(verbose, "group decode failed: missing transport header route_type=%s", route_type)
             return None
         idx += 4
 
     if len(raw) < idx + 1:
+        _vdebug(verbose, "group decode failed: missing path length byte")
         return None
 
     path_len = raw[idx]
     idx += 1
     if len(raw) < idx + path_len:
+        _vdebug(
+            verbose,
+            "group decode failed: path overflow path_len=%s frame_len=%s",
+            path_len,
+            len(raw),
+        )
         return None
     idx += path_len
 
     payload = raw[idx:]
+    _vdebug(
+        verbose,
+        "group frame parsed: route_type=%s payload_type=%s path_len=%s payload_len=%s",
+        route_type,
+        payload_type,
+        path_len,
+        len(payload),
+    )
     if payload_type != PAYLOAD_TYPE_GRP_TXT:
+        _vdebug(verbose, "group decode skipped: payload_type=%s (expected=%s)", payload_type, PAYLOAD_TYPE_GRP_TXT)
         return None
 
     if len(payload) < PATH_HASH_SIZE + CIPHER_MAC_SIZE + 16:
+        _vdebug(verbose, "group decode failed: payload too short len=%s", len(payload))
         return None
 
     channel_hash = payload[0]
@@ -213,25 +246,55 @@ def _decode_group_text(raw_hex: str, channels: Sequence[ChannelConfig]) -> Optio
     ciphertext = payload[1 + CIPHER_MAC_SIZE :]
 
     if len(ciphertext) % 16 != 0:
+        _vdebug(verbose, "group decode failed: ciphertext len=%s not multiple of 16", len(ciphertext))
         return None
 
+    _vdebug(verbose, "group crypto: channel_hash=%02X mac=%s cipher_len=%s", channel_hash, mac.hex(), len(ciphertext))
     for channel in channels:
+        _vdebug(verbose, "checking channel=%s candidates=%s", channel.name, len(channel.candidates))
         for cand in channel.candidates:
-            if _channel_hash_byte(cand.secret32, cand.hash_len) != channel_hash:
+            expected_hash = _channel_hash_byte(cand.secret32, cand.hash_len)
+            if expected_hash != channel_hash:
+                _vdebug(
+                    verbose,
+                    "candidate miss channel=%s source=%s expected_hash=%02X",
+                    channel.name,
+                    cand.source,
+                    expected_hash,
+                )
                 continue
 
             calc_mac = hmac.new(cand.secret32, ciphertext, hashlib.sha256).digest()[:CIPHER_MAC_SIZE]
             if calc_mac != mac:
+                _vdebug(
+                    verbose,
+                    "candidate mac mismatch channel=%s source=%s calc=%s msg=%s",
+                    channel.name,
+                    cand.source,
+                    calc_mac.hex(),
+                    mac.hex(),
+                )
                 continue
 
             plain = AES.new(cand.secret32[:CIPHER_KEY_SIZE], AES.MODE_ECB).decrypt(ciphertext)
             if len(plain) < 5:
+                _vdebug(verbose, "candidate decrypt too short channel=%s source=%s", channel.name, cand.source)
                 continue
 
             mesh_ts = struct.unpack_from("<I", plain, 0)[0]
             txt_type = plain[4]
             text_bytes = plain[5:]
             text = text_bytes.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+            _vdebug(
+                verbose,
+                "decrypt success channel=%s source=%s mesh_ts=%s text_type=%s flags=%s text=%r",
+                channel.name,
+                cand.source,
+                mesh_ts,
+                (txt_type >> 2),
+                (txt_type & 0x03),
+                _shorten(text),
+            )
 
             return {
                 "channel": channel.name,
@@ -243,6 +306,7 @@ def _decode_group_text(raw_hex: str, channels: Sequence[ChannelConfig]) -> Optio
                 "key_source": cand.source,
             }
 
+    _vdebug(verbose, "group decode failed: no channel/key candidate matched")
     return None
 
 
@@ -314,13 +378,15 @@ def _first_present(mapping: dict, keys: Sequence[str]):
     return None
 
 
-def _parse_tracker_json(body: str) -> Optional[dict]:
+def _parse_tracker_json(body: str, verbose: bool = False) -> Optional[dict]:
     try:
         payload = json.loads(body)
     except (TypeError, json.JSONDecodeError):
+        _vdebug(verbose, "tracker json parse failed: invalid json body=%r", _shorten(body))
         return None
 
     if not isinstance(payload, dict):
+        _vdebug(verbose, "tracker json parse failed: payload type=%s is not object", type(payload).__name__)
         return None
 
     tracker_obj = payload
@@ -373,20 +439,24 @@ def _parse_tracker_json(body: str) -> Optional[dict]:
 
     # Position report: require lat/lon.
     if "lat" in out and "lon" in out:
+        _vdebug(verbose, "tracker json parsed as position: %s", out)
         return out
     # Tracker event without coordinates (timeout, gps_unavailable, ...).
     if out.get("type") == "tracker" and ("event" in out or "reason" in out):
+        _vdebug(verbose, "tracker json parsed as event: %s", out)
         return out
+    _vdebug(verbose, "tracker json parse rejected: missing lat/lon and no tracker event fields")
     return None
 
 
-def _parse_tracker(body: str) -> Optional[dict]:
-    json_tracker = _parse_tracker_json(body)
+def _parse_tracker(body: str, verbose: bool = False) -> Optional[dict]:
+    json_tracker = _parse_tracker_json(body, verbose=verbose)
     if json_tracker:
         return json_tracker
 
     m = TRACKER_RE.search(body)
     if not m:
+        _vdebug(verbose, "tracker regex parse failed body=%r", _shorten(body))
         return None
 
     out = {
@@ -403,6 +473,7 @@ def _parse_tracker(body: str) -> Optional[dict]:
         out["heading_deg"] = float(m.group("dir"))
     if m.group("fix") is not None:
         out["fix"] = m.group("fix")
+    _vdebug(verbose, "tracker regex parsed: %s", out)
     return out
 
 
@@ -411,6 +482,7 @@ def _decode_packet_message(
     payload: dict,
     channels: Sequence[ChannelConfig],
     received_at: Optional[int] = None,
+    verbose: bool = False,
 ) -> Optional[dict]:
     packet_type_raw = payload.get("packet_type", payload.get("payload_type", payload.get("type")))
     packet_type: Optional[int] = None
@@ -428,6 +500,7 @@ def _decode_packet_message(
         elif s in {"grp_txt", "group_text", "group-txt"}:
             packet_type = PAYLOAD_TYPE_GRP_TXT
 
+    _vdebug(verbose, "packet inspection topic=%s packet_type_raw=%r resolved=%r", topic, packet_type_raw, packet_type)
     if packet_type != PAYLOAD_TYPE_GRP_TXT:
         logging.debug("skip packet: unsupported packet_type=%r topic=%s", packet_type_raw, topic)
         return None
@@ -440,14 +513,26 @@ def _decode_packet_message(
     if not raw_hex:
         logging.debug("skip packet: missing raw hex topic=%s keys=%s", topic, sorted(payload.keys()))
         return None
+    if not isinstance(raw_hex, str):
+        _vdebug(verbose, "raw frame ignored topic=%s: raw type=%s is not string", topic, type(raw_hex).__name__)
+        return None
 
-    decoded = _decode_group_text(raw_hex, channels)
+    _vdebug(verbose, "raw frame candidate located topic=%s hex_len=%s", topic, len(raw_hex))
+    decoded = _decode_group_text(raw_hex, channels, verbose=verbose)
     if not decoded:
         logging.debug("skip packet: group decrypt failed topic=%s", topic)
         return None
 
     sender, body = _extract_sender_and_body(decoded["text"])
-    tracker = _parse_tracker(body)
+    _vdebug(
+        verbose,
+        "decoded text topic=%s channel=%s sender=%r body=%r",
+        topic,
+        decoded.get("channel"),
+        sender,
+        _shorten(body),
+    )
+    tracker = _parse_tracker(body, verbose=verbose)
 
     parts = topic.split("/")
     iata = parts[1] if len(parts) > 1 else "UNK"
@@ -467,9 +552,11 @@ def _decode_packet_message(
         "received_at": int(time.time()) if received_at is None else received_at,
     }
     if tracker:
+        _vdebug(verbose, "tracker payload extracted topic=%s keys=%s", topic, sorted(tracker.keys()))
         base["tracker"] = tracker
     else:
         logging.debug("decoded text but no tracker payload topic=%s text=%r", topic, decoded["text"])
+        _vdebug(verbose, "decoded message has no tracker payload topic=%s", topic)
     return base
 
 
@@ -488,6 +575,18 @@ class BridgeApp:
         self._mqtt_ok_rc = getattr(mqtt, "MQTT_ERR_SUCCESS", 0)
         self._reconnect_min = max(1, int(args.reconnect_min_seconds))
         self._reconnect_max = max(self._reconnect_min, int(args.reconnect_max_seconds))
+        self._verbose_debug = bool(args.verbose_debug)
+        if self._verbose_debug:
+            for ch in self.channels:
+                details = ", ".join(
+                    f"{cand.source}:{_channel_hash_byte(cand.secret32, cand.hash_len):02X}" for cand in ch.candidates
+                )
+                _vdebug(
+                    True,
+                    "channel config name=%s candidate_hashes=[%s]",
+                    ch.name,
+                    details or "none",
+                )
         self.client = self._create_mqtt_client(args.client_id)
         if args.username:
             self.client.username_pw_set(args.username, args.password)
@@ -637,14 +736,22 @@ class BridgeApp:
 
     def _on_message(self, client, userdata, msg):
         topic = msg.topic
+        _vdebug(self._verbose_debug, "mqtt rx topic=%s payload_bytes=%s", topic, len(msg.payload or b""))
 
         try:
             payload = json.loads(msg.payload.decode("utf-8", errors="replace"))
         except json.JSONDecodeError:
+            _vdebug(
+                self._verbose_debug,
+                "mqtt rx ignored: invalid json topic=%s payload=%r",
+                topic,
+                _shorten(msg.payload.decode("utf-8", errors="replace")),
+            )
             return
 
         try:
-            base = _decode_packet_message(topic, payload, self.channels)
+            _vdebug(self._verbose_debug, "mqtt json parsed topic=%s keys=%s", topic, sorted(payload.keys()))
+            base = _decode_packet_message(topic, payload, self.channels, verbose=self._verbose_debug)
             if not base:
                 return
             if self._is_duplicate(base):
@@ -657,6 +764,13 @@ class BridgeApp:
 
             iata = base["iata"]
             device_id = base["device_id"]
+            _vdebug(
+                self._verbose_debug,
+                "publishing decoded payload iata=%s device_id=%s has_tracker=%s",
+                iata,
+                device_id,
+                "tracker" in base,
+            )
             if self.args.publish_text:
                 text_topic = f"{self.args.out_prefix}/{iata}/{device_id}/text"
                 # Keep text topic focused on decrypted textual content only.
@@ -745,13 +859,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--client-id", default=os.getenv("MESHCORE_MQTT_CLIENT_ID", "meshcore-tracker-bridge"))
     p.add_argument("--debug", action="store_true", default=_parse_bool(os.getenv("MESHCORE_DEBUG"), False))
+    p.add_argument(
+        "--verbose-debug",
+        action="store_true",
+        default=_parse_bool(os.getenv("MESHCORE_VERBOSE_DEBUG"), False),
+        help="Enable very detailed debug logs for packet decode, channel/key checks, and tracker parsing",
+    )
     return p
 
 
 def main() -> int:
     args = build_arg_parser().parse_args()
+    debug_enabled = args.debug or args.verbose_debug
     logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
+        level=logging.DEBUG if debug_enabled else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
