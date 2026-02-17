@@ -226,17 +226,12 @@ void loop() {
     if (!the_mesh.hasPendingWork()) {
       board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
     }
-#elif defined(RP2040_PLATFORM) && defined(MLK_RP2040_LOWPOWER)
-    // Sleep is intentionally disabled on RP2040 low-power runtime profile.
-    lastActive = millis();
 #elif defined(RP2040_PLATFORM)
     if (the_mesh.hasPendingWork()) {
       // Keep postponing sleep while work is pending.
       lastActive = millis();
     } else if (the_mesh.millisHasNowPassed(lastActive + nextSleepinSecs * 1000)) {
-      Serial.println("Entering sleep mode...");
       board.sleep(1800); // Wake after 30 minutes or when receiving a LoRa packet
-      Serial.println("Awake!");
       lastActive = millis();
       nextSleepinSecs = 5; // Work for 5 seconds before sleeping again
     }
