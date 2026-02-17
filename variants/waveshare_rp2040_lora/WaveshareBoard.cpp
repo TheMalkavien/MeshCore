@@ -86,13 +86,12 @@ void WaveshareBoard::begin() {
 
 
 void WaveshareBoard::sleep(uint32_t secs) {
-#if defined(ARDUINO_ARCH_RP2040)
-  (void)secs;
-  // Explicit sleep/wake handling is disabled for this variant.
+  // if MLK_RP2040_LOWPOWER is defined, we will disable usb insted of sleeping, as RP2040 doesn't have a real sleep mode, and disabling USB can save power significantly.
+  #if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
+    Serial.println("Disabling USB for low power sleep. Use commd usb on to re-enable.");
+    meshcore_board_usb_off_demand();
+  #endif
   return;
-#else
-  delay(secs * 1000);
-#endif
 }
 
 bool WaveshareBoard::startOTAUpdate(const char *id, char reply[]) {
