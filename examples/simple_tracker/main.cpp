@@ -734,6 +734,7 @@ private:
     char sats_txt[12];
     char speed_txt[16];
     char course_txt[16];
+    char batt_txt[12];
 
     if (sats >= 0) {
       snprintf(sats_txt, sizeof(sats_txt), "%d", sats);
@@ -753,30 +754,60 @@ private:
       StrHelper::strncpy(course_txt, "null", sizeof(course_txt));
     }
 
+    const uint16_t batt_mv = board.getBattMilliVolts();
+    int batt_pct = -1;
+    if (batt_mv > 0) {
+      if (batt_mv <= 3300) batt_pct = 0;
+      else if (batt_mv >= 4200) batt_pct = 100;
+      else batt_pct = (int)(((uint32_t)(batt_mv - 3300) * 100UL) / 900UL);
+    }
+    if (batt_pct >= 0) {
+      snprintf(batt_txt, sizeof(batt_txt), "%d", batt_pct);
+    } else {
+      StrHelper::strncpy(batt_txt, "null", sizeof(batt_txt));
+    }
+
     char text[TRACKER_GROUP_TEXT_BUFFER];
     snprintf(text, sizeof(text),
-      "{\"t\":\"tracker\",\"v\":1,\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,\"sat\":%s,\"spd\":%s,\"dir\":%s,\"fix\":\"%s\"}",
+      "{\"t\":\"tracker\",\"v\":1,\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,\"sat\":%s,\"spd\":%s,\"dir\":%s,\"fix\":\"%s\",\"bat\":%s}",
       lat,
       lon,
       alt,
       sats_txt,
       speed_txt,
       course_txt,
-      (fix_mode && fix_mode[0]) ? fix_mode : "unknown");
+      (fix_mode && fix_mode[0]) ? fix_mode : "unknown",
+      batt_txt);
     sendGroupText(text);
   }
 
   void sendTrackerEventJson(const char* event_name, const char* reason = NULL) {
+    char batt_txt[12];
+    const uint16_t batt_mv = board.getBattMilliVolts();
+    int batt_pct = -1;
+    if (batt_mv > 0) {
+      if (batt_mv <= 3300) batt_pct = 0;
+      else if (batt_mv >= 4200) batt_pct = 100;
+      else batt_pct = (int)(((uint32_t)(batt_mv - 3300) * 100UL) / 900UL);
+    }
+    if (batt_pct >= 0) {
+      snprintf(batt_txt, sizeof(batt_txt), "%d", batt_pct);
+    } else {
+      StrHelper::strncpy(batt_txt, "null", sizeof(batt_txt));
+    }
+
     char text[TRACKER_GROUP_TEXT_BUFFER];
     if (reason && reason[0]) {
       snprintf(text, sizeof(text),
-        "{\"t\":\"tracker\",\"v\":1,\"event\":\"%s\",\"reason\":\"%s\"}",
+        "{\"t\":\"tracker\",\"v\":1,\"event\":\"%s\",\"reason\":\"%s\",\"bat\":%s}",
         event_name,
-        reason);
+        reason,
+        batt_txt);
     } else {
       snprintf(text, sizeof(text),
-        "{\"t\":\"tracker\",\"v\":1,\"event\":\"%s\"}",
-        event_name);
+        "{\"t\":\"tracker\",\"v\":1,\"event\":\"%s\",\"bat\":%s}",
+        event_name,
+        batt_txt);
     }
     sendGroupText(text);
   }
