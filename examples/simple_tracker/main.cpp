@@ -74,21 +74,22 @@
   #define TRACKER_DBG(...) do { } while (0)
 #endif
 
+template <typename T>
+static auto enterBoardDeepSleep(T& b, uint32_t secs, int) -> decltype(b.enterDeepSleep(secs), void()) {
+  b.enterDeepSleep(secs);
+}
+
+template <typename T>
+static auto enterBoardDeepSleep(T& b, uint32_t secs, long) -> decltype(b.enterDeepSleep(secs, -1), void()) {
+  b.enterDeepSleep(secs, -1);
+}
+
+static void enterBoardDeepSleep(mesh::MainBoard& b, uint32_t secs, ...) {
+  b.sleep(secs);
+}
+
 static void enterTimerOnlyDeepSleep(uint32_t secs) {
-#if defined(ESP32)
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-  if (secs > 0) {
-    esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
-  }
-#if defined(P_LORA_NSS)
-  if (rtc_gpio_is_valid_gpio((gpio_num_t)P_LORA_NSS)) {
-    rtc_gpio_hold_en((gpio_num_t)P_LORA_NSS);
-  }
-#endif
-  esp_deep_sleep_start();
-#else
-  board.sleep(secs);
-#endif
+  enterBoardDeepSleep(board, secs, 0);
 }
 
 class TrackerMesh : public SensorMesh {
