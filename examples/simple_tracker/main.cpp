@@ -45,7 +45,7 @@
 #endif
 
 #ifndef TRACKER_BOOT_GRACE_SECS
-  #define TRACKER_BOOT_GRACE_SECS 20
+  #define TRACKER_BOOT_GRACE_SECS 3
 #endif
 
 #ifndef TRACKER_SLEEP_DRAIN_RECHECK_MS
@@ -75,12 +75,17 @@
 #endif
 
 template <typename T>
-static auto enterBoardDeepSleep(T& b, uint32_t secs, int) -> decltype(b.enterDeepSleep(secs), void()) {
+static auto enterBoardDeepSleep(T& b, uint32_t secs, int) -> decltype(b.enterDeepSleep(secs, -2), void()) {
+  b.enterDeepSleep(secs, -2);  // timer-only deep sleep (board-specific sentinel)
+}
+
+template <typename T>
+static auto enterBoardDeepSleep(T& b, uint32_t secs, long) -> decltype(b.enterDeepSleep(secs), void()) {
   b.enterDeepSleep(secs);
 }
 
 template <typename T>
-static auto enterBoardDeepSleep(T& b, uint32_t secs, long) -> decltype(b.enterDeepSleep(secs, -1), void()) {
+static auto enterBoardDeepSleep(T& b, uint32_t secs, char) -> decltype(b.enterDeepSleep(secs, -1), void()) {
   b.enterDeepSleep(secs, -1);
 }
 
@@ -466,13 +471,14 @@ private:
     // Default fallback epoch used by VolatileRTCClock/ESP32RTCClock startup path.
     const uint32_t fallback_epoch = 1715770351UL; // 15 May 2024, 20:52:31 UTC
     bool rtc_is_fallback = (rtc_now >= (fallback_epoch - 86400UL) && rtc_now <= (fallback_epoch + 86400UL));
+    bool rtc_is_invalid = (rtc_now < 1577836800UL); // before 2020-01-01 -> clearly not user-set real time
 
     // Safety: after user/manual time set, do not apply large GPS jumps.
     // Only allow large jumps when the RTC still looks like fallback/default.
     if (abs_drift <= 2) {
       return;
     }
-    if (!rtc_is_fallback && abs_drift > 30) {
+    if (!rtc_is_fallback && !rtc_is_invalid && abs_drift > 30) {
       TRACKER_DBG("rtc gps sync skipped: large drift=%lds rtc=%lu gps=%ld",
         drift,
         (unsigned long)rtc_now,
