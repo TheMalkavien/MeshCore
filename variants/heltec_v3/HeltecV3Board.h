@@ -50,6 +50,9 @@ public:
   }
 
   void enterDeepSleep(uint32_t secs, int pin_wake_btn = -1) {
+    bool timer_only = (pin_wake_btn == -2);
+
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
     esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
 
     // Make sure the DIO1 and NSS GPIOs are hold on required levels during deep sleep
@@ -58,10 +61,12 @@ public:
 
     rtc_gpio_hold_en((gpio_num_t)P_LORA_NSS);
 
-    if (pin_wake_btn < 0) {
-      esp_sleep_enable_ext1_wakeup( (1L << P_LORA_DIO_1), ESP_EXT1_WAKEUP_ANY_HIGH);  // wake up on: recv LoRa packet
-    } else {
-      esp_sleep_enable_ext1_wakeup( (1L << P_LORA_DIO_1) | (1L << pin_wake_btn), ESP_EXT1_WAKEUP_ANY_HIGH);  // wake up on: recv LoRa packet OR wake btn
+    if (!timer_only) {
+      if (pin_wake_btn < 0) {
+        esp_sleep_enable_ext1_wakeup((1L << P_LORA_DIO_1), ESP_EXT1_WAKEUP_ANY_HIGH);  // wake up on: recv LoRa packet
+      } else {
+        esp_sleep_enable_ext1_wakeup((1L << P_LORA_DIO_1) | (1L << pin_wake_btn), ESP_EXT1_WAKEUP_ANY_HIGH);  // wake up on: recv LoRa packet OR wake btn
+      }
     }
 
     if (secs > 0) {
