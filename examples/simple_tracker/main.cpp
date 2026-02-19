@@ -922,7 +922,7 @@ private:
     bool sats_ok = (_min_sats == 0) || (gps_live_with_coords && gps.sats >= (int)_min_sats);
     bool age_ok = (_min_live_fix_age_secs == 0) || (gps_live_with_coords && live_age_secs >= _min_live_fix_age_secs);
     bool gps_cached_fix = (!_require_live_fix) && hasStoredPosition();
-    bool gps_live_accepted = gps_live_with_coords && sats_ok && age_ok;
+    bool gps_live_accepted = gps_live_with_coords && (sats_ok || age_ok);
     if (gps_live_accepted || gps_cached_fix) {
       float lat = gps_live_accepted ? ((float)gps.raw_lat / 1000000.0f) : sensors.node_lat;
       float lon = gps_live_accepted ? ((float)gps.raw_lon / 1000000.0f) : sensors.node_lon;
