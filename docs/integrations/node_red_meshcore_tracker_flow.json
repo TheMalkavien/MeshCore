@@ -1,162 +1,200 @@
 [
-  {
-    "id": "a8f6b2a1e9f64c6f",
-    "type": "tab",
-    "label": "MeshCore Tracker -> HA",
-    "disabled": false,
-    "info": "External decoder mode: subscribe to meshcore/decoded/... and forward tracker positions to Home Assistant."
-  },
-  {
-    "id": "e35f31991a3f07fd",
-    "type": "mqtt in",
-    "z": "a8f6b2a1e9f64c6f",
-    "name": "MeshCore decoded tracker",
-    "topic": "meshcore/decoded/+/+/tracker",
-    "qos": "1",
-    "datatype": "json",
-    "broker": "f2e79c83d8cc3bde",
-    "nl": false,
-    "rap": true,
-    "rh": 0,
-    "inputs": 0,
-    "x": 210,
-    "y": 120,
-    "wires": [
-      [
-        "f0b6f780d3bbcb4b",
-        "6e76064f3f7f15f2"
-      ]
-    ]
-  },
-  {
-    "id": "6e76064f3f7f15f2",
-    "type": "debug",
-    "z": "a8f6b2a1e9f64c6f",
-    "name": "tracker decoded (debug)",
-    "active": true,
-    "tosidebar": true,
-    "console": false,
-    "tostatus": false,
-    "complete": "payload",
-    "targetType": "msg",
-    "statusVal": "",
-    "statusType": "auto",
-    "x": 500,
-    "y": 80,
-    "wires": []
-  },
-  {
-    "id": "f0b6f780d3bbcb4b",
-    "type": "function",
-    "z": "a8f6b2a1e9f64c6f",
-    "name": "Build HA device_tracker payload",
-    "func": "const p = msg.payload || {};\nconst t = (p.tracker && typeof p.tracker === 'object') ? p.tracker : {};\nif (typeof t.lat !== 'number' || typeof t.lon !== 'number') return null;\n\nconst rawId = String(p.device_id || p.origin_id || p.sender || 'mesh_tracker').toLowerCase();\nconst cleaned = rawId.replace(/[^a-z0-9_]/g, '_');\nconst devId = cleaned ? ('mesh_' + cleaned).slice(0, 63) : 'mesh_tracker';\n\nconst sats = Number.isFinite(t.sats) ? t.sats : null;\nlet gpsAccuracy = 50;\nif (sats !== null) {\n  if (sats >= 12) gpsAccuracy = 5;\n  else if (sats >= 8) gpsAccuracy = 10;\n  else if (sats >= 5) gpsAccuracy = 25;\n  else gpsAccuracy = 100;\n}\n\nconst altitudeM = Number.isFinite(t.alt_m) ? t.alt_m : null;\nconst speedKmh = Number.isFinite(t.speed_kmh) ? t.speed_kmh : null;\nconst headingDeg = Number.isFinite(t.heading_deg) ? t.heading_deg : null;\nconst fix = (typeof t.fix === 'string' && t.fix) ? t.fix : null;\n\nconst decoded = (p.decoded && typeof p.decoded === 'object') ? p.decoded : {};\nconst meshChannel = (typeof decoded.channel === 'string' && decoded.channel) ? decoded.channel : null;\nconst meshOrigin = (typeof p.origin === 'string' && p.origin) ? p.origin : ((typeof p.sender === 'string' && p.sender) ? p.sender : null);\nconst meshPacketHash = (typeof p.packet_hash === 'string' && p.packet_hash) ? p.packet_hash : null;\n\nlet packetTsUnix = null;\nlet packetTsIso = null;\nconst rawTs = p.packet_timestamp;\nconst tsNum = (typeof rawTs === 'number') ? rawTs : ((typeof rawTs === 'string') ? Number(rawTs) : NaN);\nif (Number.isFinite(tsNum) && tsNum > 0) {\n  const tsSec = tsNum > 1000000000000 ? Math.floor(tsNum / 1000) : Math.floor(tsNum);\n  packetTsUnix = tsSec;\n  packetTsIso = new Date(tsSec * 1000).toISOString();\n}\n\nlet receivedTsUnix = null;\nlet receivedTsIso = null;\nlet receivedTsHuman = null;\nconst rawReceivedTs = p.received_at;\nconst receivedNum = (typeof rawReceivedTs === 'number') ? rawReceivedTs : ((typeof rawReceivedTs === 'string') ? Number(rawReceivedTs) : NaN);\nif (Number.isFinite(receivedNum) && receivedNum > 0) {\n  const recvSec = receivedNum > 1000000000000 ? Math.floor(receivedNum / 1000) : Math.floor(receivedNum);\n  const recvDate = new Date(recvSec * 1000);\n  receivedTsUnix = recvSec;\n  receivedTsIso = recvDate.toISOString();\n  const y = recvDate.getFullYear();\n  const mo = String(recvDate.getMonth() + 1).padStart(2, '0');\n  const d = String(recvDate.getDate()).padStart(2, '0');\n  const h = String(recvDate.getHours()).padStart(2, '0');\n  const mi = String(recvDate.getMinutes()).padStart(2, '0');\n  const s = String(recvDate.getSeconds()).padStart(2, '0');\n  receivedTsHuman = `${y}-${mo}-${d} ${h}:${mi}:${s}`;\n}\n\nconst attrs = {\n  gps_accuracy_m: gpsAccuracy\n};\nif (altitudeM !== null) attrs.altitude_m = altitudeM;\nif (speedKmh !== null) attrs.speed_kmh = speedKmh;\nif (headingDeg !== null) attrs.heading_deg = headingDeg;\nif (sats !== null) attrs.sats = sats;\nif (fix) attrs.fix = fix;\nif (meshChannel) attrs.mesh_channel = meshChannel;\nif (meshOrigin) attrs.mesh_origin = meshOrigin;\nif (meshPacketHash) attrs.mesh_packet_hash = meshPacketHash;\nif (packetTsUnix !== null) attrs.mesh_packet_timestamp = packetTsUnix;\nif (packetTsIso) attrs.mesh_packet_timestamp_iso = packetTsIso;\nif (receivedTsUnix !== null) attrs.mesh_received_at = receivedTsUnix;\nif (receivedTsIso) attrs.mesh_received_at_iso = receivedTsIso;\nif (receivedTsHuman) attrs.mesh_received_at_human = receivedTsHuman;\n\nmsg.payload = {\n  dev_id: devId,\n  gps: [t.lat, t.lon],\n  gps_accuracy: gpsAccuracy,\n  source_type: 'gps',\n  attributes: attrs\n};\n\nif (p.sender || p.origin) {\n  msg.payload.host_name = String(p.sender || p.origin);\n}\n\nreturn msg;",
-    "outputs": 1,
-    "timeout": 0,
-    "noerr": 0,
-    "initialize": "",
-    "finalize": "",
-    "libs": [],
-    "x": 530,
-    "y": 120,
-    "wires": [
-      [
-        "ea4c2ff41f66d8d1",
-        "fd6de7cfa8ecba4d"
-      ]
-    ]
-  },
-  {
-    "id": "fd6de7cfa8ecba4d",
-    "type": "debug",
-    "z": "a8f6b2a1e9f64c6f",
-    "name": "HA payload (debug)",
-    "active": true,
-    "tosidebar": true,
-    "console": false,
-    "tostatus": false,
-    "complete": "payload",
-    "targetType": "msg",
-    "statusVal": "",
-    "statusType": "auto",
-    "x": 800,
-    "y": 80,
-    "wires": []
-  },
-  {
-    "id": "ea4c2ff41f66d8d1",
-    "type": "api-call-service",
-    "z": "a8f6b2a1e9f64c6f",
-    "name": "HA call service",
-    "server": "REPLACE_WITH_HA_SERVER_ID",
-    "version": 7,
-    "debugenabled": false,
-    "action": "device_tracker.see",
-    "floorId": [],
-    "areaId": [],
-    "deviceId": [],
-    "entityId": [],
-    "labelId": [],
-    "data": "{\"dev_id\": payload.dev_id, \"gps\": payload.gps, \"gps_accuracy\": payload.gps_accuracy, \"source_type\": payload.source_type, \"host_name\": payload.host_name, \"attributes\": payload.attributes}",
-    "dataType": "jsonata",
-    "mergeContext": "",
-    "mustacheAltTags": false,
-    "outputProperties": [],
-    "queue": "none",
-    "x": 780,
-    "y": 140,
-    "wires": [
-      [
-        "e007ca6dd7ded286"
-      ]
-    ]
-  },
-  {
-    "id": "e007ca6dd7ded286",
-    "type": "debug",
-    "z": "a8f6b2a1e9f64c6f",
-    "name": "HA call result",
-    "active": false,
-    "tosidebar": true,
-    "console": false,
-    "tostatus": false,
-    "complete": "true",
-    "targetType": "full",
-    "statusVal": "",
-    "statusType": "auto",
-    "x": 1010,
-    "y": 140,
-    "wires": []
-  },
-  {
-    "id": "f2e79c83d8cc3bde",
-    "type": "mqtt-broker",
-    "name": "REPLACE_MQTT_BROKER",
-    "broker": "127.0.0.1",
-    "port": "1883",
-    "clientid": "",
-    "autoConnect": true,
-    "usetls": false,
-    "protocolVersion": "4",
-    "keepalive": "60",
-    "cleansession": true,
-    "autoUnsubscribe": true,
-    "birthTopic": "",
-    "birthQos": "0",
-    "birthRetain": "false",
-    "birthPayload": "",
-    "birthMsg": {},
-    "closeTopic": "",
-    "closeQos": "0",
-    "closeRetain": "false",
-    "closePayload": "",
-    "closeMsg": {},
-    "willTopic": "",
-    "willQos": "0",
-    "willRetain": "false",
-    "willPayload": "",
-    "willMsg": {},
-    "userProps": "",
-    "sessionExpiry": ""
-  }
+    {
+        "id": "a8f6b2a1e9f64c6f",
+        "type": "tab",
+        "label": "MeshCore Tracker -> HA",
+        "disabled": false,
+        "info": "External decoder mode: subscribe to meshcore/decoded/... and forward tracker positions to Home Assistant."
+    },
+    {
+        "id": "e35f31991a3f07fd",
+        "type": "mqtt in",
+        "z": "a8f6b2a1e9f64c6f",
+        "name": "MeshCore decoded tracker",
+        "topic": "meshcore/decoded/+/+/tracker",
+        "qos": "1",
+        "datatype": "json",
+        "broker": "809552169a5f545c",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 210,
+        "y": 120,
+        "wires": [
+            [
+                "f0b6f780d3bbcb4b",
+                "6e76064f3f7f15f2"
+            ]
+        ]
+    },
+    {
+        "id": "6e76064f3f7f15f2",
+        "type": "debug",
+        "z": "a8f6b2a1e9f64c6f",
+        "name": "tracker decoded (debug)",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 500,
+        "y": 80,
+        "wires": []
+    },
+    {
+        "id": "f0b6f780d3bbcb4b",
+        "type": "function",
+        "z": "a8f6b2a1e9f64c6f",
+        "name": "Build HA device_tracker payload",
+        "func": "const p = msg.payload || {};\nconst t = (p.tracker && typeof p.tracker === 'object') ? p.tracker : {};\nif (typeof t.lat !== 'number' || typeof t.lon !== 'number') return null;\n\nconst hostName = String(p.sender || p.origin || 'mesh_tracker');\nconst hostSlug = hostName\n  .toLowerCase()\n  .replace(/[^a-z0-9]+/g, '_')\n  .replace(/^_+|_+$/g, '')\n  .replace(/_+/g, '_');\nconst devId = hostSlug || 'mesh_tracker';\n\nconst sats = Number.isFinite(t.sats) ? t.sats : null;\nlet gpsAccuracy = 50;\nif (sats !== null) {\n  if (sats >= 12) gpsAccuracy = 5;\n  else if (sats >= 8) gpsAccuracy = 10;\n  else if (sats >= 5) gpsAccuracy = 25;\n  else gpsAccuracy = 100;\n}\n\nconst altitudeM = Number.isFinite(t.alt_m) ? t.alt_m : null;\nconst speedKmh = Number.isFinite(t.speed_kmh) ? t.speed_kmh : null;\nconst headingDeg = Number.isFinite(t.heading_deg) ? t.heading_deg : null;\nconst fix = (typeof t.fix === 'string' && t.fix) ? t.fix : null;\nconst batteryPctRaw = Number.isFinite(t.battery_pct) ? t.battery_pct : (Number.isFinite(t.battery) ? t.battery : (Number.isFinite(t.batt) ? t.batt : (Number.isFinite(t.bat) ? t.bat : null)));\nconst batteryPct = (batteryPctRaw !== null) ? Math.max(0, Math.min(100, Math.round(batteryPctRaw))) : null;\n\nconst decoded = (p.decoded && typeof p.decoded === 'object') ? p.decoded : {};\nconst meshChannel = (typeof decoded.channel === 'string' && decoded.channel) ? decoded.channel : null;\nconst meshOrigin = (typeof p.origin === 'string' && p.origin) ? p.origin : ((typeof p.sender === 'string' && p.sender) ? p.sender : null);\nconst meshPacketHash = (typeof p.packet_hash === 'string' && p.packet_hash) ? p.packet_hash : null;\n\nlet packetTsUnix = null;\nlet packetTsIso = null;\nconst rawTs = p.packet_timestamp;\nconst tsNum = (typeof rawTs === 'number') ? rawTs : ((typeof rawTs === 'string') ? Number(rawTs) : NaN);\nif (Number.isFinite(tsNum) && tsNum > 0) {\n  const tsSec = tsNum > 1000000000000 ? Math.floor(tsNum / 1000) : Math.floor(tsNum);\n  packetTsUnix = tsSec;\n  packetTsIso = new Date(tsSec * 1000).toISOString();\n}\n\nlet receivedTsUnix = null;\nlet receivedTsIso = null;\nlet receivedTsHuman = null;\nconst rawReceivedTs = p.received_at;\nconst receivedNum = (typeof rawReceivedTs === 'number') ? rawReceivedTs : ((typeof rawReceivedTs === 'string') ? Number(rawReceivedTs) : NaN);\nif (Number.isFinite(receivedNum) && receivedNum > 0) {\n  const recvSec = receivedNum > 1000000000000 ? Math.floor(receivedNum / 1000) : Math.floor(receivedNum);\n  const recvDate = new Date(recvSec * 1000);\n  receivedTsUnix = recvSec;\n  receivedTsIso = recvDate.toISOString();\n  const y = recvDate.getFullYear();\n  const mo = String(recvDate.getMonth() + 1).padStart(2, '0');\n  const d = String(recvDate.getDate()).padStart(2, '0');\n  const h = String(recvDate.getHours()).padStart(2, '0');\n  const mi = String(recvDate.getMinutes()).padStart(2, '0');\n  const s = String(recvDate.getSeconds()).padStart(2, '0');\n  receivedTsHuman = `${y}-${mo}-${d} ${h}:${mi}:${s}`;\n}\n\nconst attrs = {\n  gps_accuracy_m: gpsAccuracy\n};\nif (altitudeM !== null) attrs.altitude_m = altitudeM;\nif (speedKmh !== null) attrs.speed_kmh = speedKmh;\nif (headingDeg !== null) attrs.heading_deg = headingDeg;\nif (sats !== null) attrs.sats = sats;\nif (fix) attrs.fix = fix;\nif (meshChannel) attrs.mesh_channel = meshChannel;\nif (meshOrigin) attrs.mesh_origin = meshOrigin;\nif (meshPacketHash) attrs.mesh_packet_hash = meshPacketHash;\nif (packetTsUnix !== null) attrs.mesh_packet_timestamp = packetTsUnix;\nif (packetTsIso) attrs.mesh_packet_timestamp_iso = packetTsIso;\nif (receivedTsUnix !== null) attrs.mesh_received_at = receivedTsUnix;\nif (receivedTsIso) attrs.mesh_received_at_iso = receivedTsIso;\nif (receivedTsHuman) attrs.mesh_received_at_human = receivedTsHuman;\nif (batteryPct !== null) attrs.battery_pct = batteryPct;\n\nmsg.payload = {\n  dev_id: devId,\n  host_name: hostName,\n  gps: [t.lat, t.lon],\n  gps_accuracy: gpsAccuracy,\n  source_type: 'gps',\n  attributes: attrs\n};\n\nif (batteryPct !== null) {\n  msg.payload.battery = batteryPct;\n}\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 530,
+        "y": 120,
+        "wires": [
+            [
+                "ea4c2ff41f66d8d1",
+                "fd6de7cfa8ecba4d"
+            ]
+        ]
+    },
+    {
+        "id": "fd6de7cfa8ecba4d",
+        "type": "debug",
+        "z": "a8f6b2a1e9f64c6f",
+        "name": "HA payload (debug)",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 800,
+        "y": 80,
+        "wires": []
+    },
+    {
+        "id": "ea4c2ff41f66d8d1",
+        "type": "api-call-service",
+        "z": "a8f6b2a1e9f64c6f",
+        "name": "HA call service",
+        "server": "ha_server",
+        "version": 7,
+        "debugenabled": true,
+        "action": "device_tracker.see",
+        "floorId": [],
+        "areaId": [],
+        "deviceId": [],
+        "entityId": [],
+        "labelId": [],
+        "data": "{\"dev_id\": payload.dev_id, \"host_name\": payload.host_name, \"gps\": payload.gps, \"gps_accuracy\": payload.gps_accuracy, \"battery\": payload.battery, \"source_type\": payload.source_type, \"attributes\": payload.attributes}",
+        "dataType": "jsonata",
+        "mergeContext": "",
+        "mustacheAltTags": false,
+        "outputProperties": [],
+        "queue": "none",
+        "blockInputOverrides": false,
+        "domain": "device_tracker",
+        "service": "see",
+        "x": 780,
+        "y": 140,
+        "wires": [
+            [
+                "e007ca6dd7ded286"
+            ]
+        ]
+    },
+    {
+        "id": "e007ca6dd7ded286",
+        "type": "debug",
+        "z": "a8f6b2a1e9f64c6f",
+        "name": "HA call result",
+        "active": false,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1010,
+        "y": 140,
+        "wires": []
+    },
+    {
+        "id": "809552169a5f545c",
+        "type": "mqtt-broker",
+        "name": "MQTT",
+        "broker": "192.168.0.30",
+        "port": "1883",
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": "4",
+        "keepalive": 15,
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "ha_server",
+        "type": "server",
+        "name": "Home Assistant",
+        "addon": false,
+        "rejectUnauthorizedCerts": false,
+        "ha_boolean": [
+            "y",
+            "|",
+            "e",
+            "s",
+            "t",
+            "r",
+            "u",
+            "o",
+            "n",
+            "h",
+            "m",
+            "p"
+        ],
+        "connectionDelay": true,
+        "cacheJson": true,
+        "heartbeat": true,
+        "heartbeatInterval": "30",
+        "statusSeparator": "",
+        "enableGlobalContextStore": false
+    },
+    {
+        "id": "346df793cfcec9ef",
+        "type": "global-config",
+        "env": [],
+        "modules": {
+            "node-red-contrib-home-assistant-websocket": "0.80.3"
+        }
+    }
 ]
+
+
+
+

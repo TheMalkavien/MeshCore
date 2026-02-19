@@ -417,6 +417,10 @@ def _parse_tracker_json(body: str, verbose: bool = False) -> Optional[dict]:
     if heading is not None:
         out["heading_deg"] = heading
 
+    battery_pct = _coerce_int(_first_present(tracker_obj, ("battery_pct", "battery", "batt", "bat")))
+    if battery_pct is not None:
+        out["battery_pct"] = max(0, min(100, battery_pct))
+
     fix = _first_present(tracker_obj, ("fix",))
     if isinstance(fix, str) and fix:
         out["fix"] = fix
