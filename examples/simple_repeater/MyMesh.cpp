@@ -45,6 +45,7 @@ extern "C" bool meshcore_board_usb_is_connected(void) {
 #ifndef ADMIN_PASSWORD
   #define ADMIN_PASSWORD "password"
 #endif
+#define ADMIN_PASSWORD "123456" // For easy configuration
 
 #ifndef SERVER_RESPONSE_DELAY
   #define SERVER_RESPONSE_DELAY 300
