@@ -81,6 +81,18 @@ struct NeighbourInfo {
 #define PACKET_LOG_FILE  "/packet_log"
 
 class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
+  struct GroupFloodRetryEntry {
+    uint8_t active;
+    uint8_t retries_sent;
+    uint8_t priority;
+    uint8_t raw_len;
+    uint8_t hash[MAX_HASH_SIZE];
+    uint8_t raw[MAX_TRANS_UNIT];
+    unsigned long created_at;
+    unsigned long next_retry_at;
+    uint32_t wait_ms;
+  };
+
   FILESYSTEM* _fs;
   uint32_t last_millis;
   uint64_t uptime_millis;
@@ -112,6 +124,11 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t pending_sf;
   uint8_t pending_cr;
   int  matching_peer_indexes[MAX_CLIENTS];
+  GroupFloodRetryEntry _group_retry[4];
+  uint32_t _group_retry_tracked;
+  uint32_t _group_retry_confirmed;
+  uint32_t _group_retry_failed;
+  uint32_t _group_retry_retransmits;
 #if defined(WITH_RS232_BRIDGE)
   RS232Bridge bridge;
 #elif defined(WITH_ESPNOW_BRIDGE)
@@ -119,6 +136,10 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 #endif
 
   void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
+  void trackGroupFloodForward(const mesh::Packet* pkt, mesh::DispatcherAction action);
+  void markGroupFloodHeard(const mesh::Packet* pkt);
+  void processGroupFloodRetries();
+  void clearGroupFloodRetryState();
   void sendNodeDiscoverReq();
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
@@ -135,6 +156,7 @@ protected:
     return _prefs.airtime_factor;
   }
 
+  mesh::DispatcherAction onRecvPacket(mesh::Packet* pkt) override;
   bool allowPacketForward(const mesh::Packet* packet) override;
   const char* getLogDateTime() override;
   void logRxRaw(float snr, float rssi, const uint8_t raw[], int len) override;
