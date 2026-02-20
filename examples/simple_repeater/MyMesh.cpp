@@ -55,6 +55,31 @@ extern "C" bool meshcore_board_usb_is_connected(void) {
   #define TXT_ACK_DELAY 200
 #endif
 
+// Optional reliability helper: if no other repeater is heard forwarding the same
+// flood group packet, re-send our already-forwarded packet up to N times.
+#ifndef ENABLE_GROUP_FLOOD_CONDITIONAL_RETRY
+  #define ENABLE_GROUP_FLOOD_CONDITIONAL_RETRY 1
+#endif
+#ifndef GROUP_FLOOD_RETRY_MAX_RETRANSMITS
+  #define GROUP_FLOOD_RETRY_MAX_RETRANSMITS 3
+#endif
+#ifndef GROUP_FLOOD_RETRY_CONFIRM_WINDOW_MS
+  #define GROUP_FLOOD_RETRY_CONFIRM_WINDOW_MS 1800
+#endif
+#ifndef GROUP_FLOOD_RETRY_GAP_MIN_MS
+  #define GROUP_FLOOD_RETRY_GAP_MIN_MS 350
+#endif
+#ifndef GROUP_FLOOD_RETRY_GAP_MAX_MS
+  #define GROUP_FLOOD_RETRY_GAP_MAX_MS 1200
+#endif
+#ifndef GROUP_FLOOD_RETRY_AIRTIME_FACTOR
+  #define GROUP_FLOOD_RETRY_AIRTIME_FACTOR 6
+#endif
+
+static bool readPacketWireExact(mesh::Packet* dst, const uint8_t raw[], uint8_t raw_len) {
+  return dst->readFrom(raw, raw_len);
+}
+
 #define FIRMWARE_VER_LEVEL       2
 
 #define REQ_TYPE_GET_STATUS         0x01 // same as _GET_STATS
@@ -73,6 +98,145 @@ extern "C" bool meshcore_board_usb_is_connected(void) {
 #define CLI_REPLY_DELAY_MILLIS      600
 
 #define LAZY_CONTACTS_WRITE_DELAY    5000
+
+mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
+  mesh::DispatcherAction action = mesh::Mesh::onRecvPacket(pkt);
+
+#if ENABLE_GROUP_FLOOD_CONDITIONAL_RETRY == 1
+  if (pkt->isRouteFlood() &&
+      (pkt->getPayloadType() == PAYLOAD_TYPE_GRP_TXT || pkt->getPayloadType() == PAYLOAD_TYPE_GRP_DATA)) {
+    if (action > ACTION_MANUAL_HOLD) {
+      trackGroupFloodForward(pkt, action);
+    }
+    markGroupFloodHeard(pkt);
+  }
+#endif
+
+  return action;
+}
+
+void MyMesh::clearGroupFloodRetryState() {
+  memset(_group_retry, 0, sizeof(_group_retry));
+  _group_retry_tracked = 0;
+  _group_retry_confirmed = 0;
+  _group_retry_failed = 0;
+  _group_retry_retransmits = 0;
+}
+
+void MyMesh::trackGroupFloodForward(const mesh::Packet* pkt, mesh::DispatcherAction action) {
+#if ENABLE_GROUP_FLOOD_CONDITIONAL_RETRY == 1
+  uint8_t hash[MAX_HASH_SIZE];
+  pkt->calculatePacketHash(hash);
+
+  int use_idx = -1;
+  for (int i = 0; i < (int)(sizeof(_group_retry) / sizeof(_group_retry[0])); i++) {
+    if (_group_retry[i].active && memcmp(_group_retry[i].hash, hash, MAX_HASH_SIZE) == 0) {
+      use_idx = i;
+      break;
+    }
+    if (!_group_retry[i].active && use_idx < 0) {
+      use_idx = i;
+    }
+  }
+  if (use_idx < 0) {
+    // No free slot; replace oldest.
+    use_idx = 0;
+    for (int i = 1; i < (int)(sizeof(_group_retry) / sizeof(_group_retry[0])); i++) {
+      if (_group_retry[i].created_at < _group_retry[use_idx].created_at) {
+        use_idx = i;
+      }
+    }
+  }
+
+  auto& slot = _group_retry[use_idx];
+  slot.raw_len = pkt->writeTo(slot.raw);
+  if (slot.raw_len == 0) {
+    slot.active = 0;
+    return;
+  }
+
+  memcpy(slot.hash, hash, MAX_HASH_SIZE);
+  slot.active = 1;
+  slot.retries_sent = 0;
+  slot.priority = (action >> 24) - 1;
+  slot.created_at = millis();
+
+  uint32_t base_delay = action & 0xFFFFFF;
+  uint32_t est_airtime = _radio->getEstAirtimeFor(pkt->getRawLength());
+  uint32_t wait_ms = est_airtime * (uint32_t)GROUP_FLOOD_RETRY_AIRTIME_FACTOR;
+  if (wait_ms < (uint32_t)GROUP_FLOOD_RETRY_CONFIRM_WINDOW_MS) {
+    wait_ms = (uint32_t)GROUP_FLOOD_RETRY_CONFIRM_WINDOW_MS;
+  }
+  slot.wait_ms = wait_ms;
+  slot.next_retry_at = futureMillis(base_delay + wait_ms);
+
+  _group_retry_tracked++;
+#else
+  (void)pkt;
+  (void)action;
+#endif
+}
+
+void MyMesh::markGroupFloodHeard(const mesh::Packet* pkt) {
+#if ENABLE_GROUP_FLOOD_CONDITIONAL_RETRY == 1
+  uint8_t hash[MAX_HASH_SIZE];
+  pkt->calculatePacketHash(hash);
+
+  for (int i = 0; i < (int)(sizeof(_group_retry) / sizeof(_group_retry[0])); i++) {
+    auto& slot = _group_retry[i];
+    if (!slot.active || memcmp(slot.hash, hash, MAX_HASH_SIZE) != 0) {
+      continue;
+    }
+
+    bool heard_other_repeater = false;
+    if (pkt->path_len >= PATH_HASH_SIZE) {
+      uint8_t self_hash[PATH_HASH_SIZE];
+      self_id.copyHashTo(self_hash);
+      heard_other_repeater = memcmp(&pkt->path[pkt->path_len - PATH_HASH_SIZE], self_hash, PATH_HASH_SIZE) != 0;
+    }
+
+    if (heard_other_repeater) {
+      slot.active = 0;
+      _group_retry_confirmed++;
+    }
+    break;
+  }
+#else
+  (void)pkt;
+#endif
+}
+
+void MyMesh::processGroupFloodRetries() {
+#if ENABLE_GROUP_FLOOD_CONDITIONAL_RETRY == 1
+  for (int i = 0; i < (int)(sizeof(_group_retry) / sizeof(_group_retry[0])); i++) {
+    auto& slot = _group_retry[i];
+    if (!slot.active || !millisHasNowPassed(slot.next_retry_at)) {
+      continue;
+    }
+
+    if (slot.retries_sent >= GROUP_FLOOD_RETRY_MAX_RETRANSMITS) {
+      slot.active = 0;
+      _group_retry_failed++;
+      continue;
+    }
+
+    mesh::Packet* retry = obtainNewPacket();
+    if (retry && readPacketWireExact(retry, slot.raw, slot.raw_len)) {
+      sendPacket(retry, slot.priority, 0);
+      slot.retries_sent++;
+      _group_retry_retransmits++;
+    } else if (retry) {
+      releasePacket(retry);
+    }
+
+    uint32_t gap = GROUP_FLOOD_RETRY_GAP_MIN_MS;
+    if (GROUP_FLOOD_RETRY_GAP_MAX_MS > GROUP_FLOOD_RETRY_GAP_MIN_MS) {
+      gap = getRNG()->nextInt(GROUP_FLOOD_RETRY_GAP_MIN_MS, GROUP_FLOOD_RETRY_GAP_MAX_MS + 1);
+    }
+    slot.next_retry_at = futureMillis(slot.wait_ms + gap);
+  }
+#endif
+}
 
 void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
 #if MAX_NEIGHBOURS // check if neighbours enabled
@@ -775,6 +939,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   set_radio_at = revert_radio_at = 0;
   _logging = false;
   region_load_active = false;
+  clearGroupFloodRetryState();
 
 #if MAX_NEIGHBOURS
   memset(neighbours, 0, sizeof(neighbours));
@@ -983,6 +1148,17 @@ void MyMesh::formatRadioStatsReply(char *reply) {
 void MyMesh::formatPacketStatsReply(char *reply) {
   StatsFormatHelper::formatPacketStats(reply, radio_driver, getNumSentFlood(), getNumSentDirect(), 
                                        getNumRecvFlood(), getNumRecvDirect());
+#if ENABLE_GROUP_FLOOD_CONDITIONAL_RETRY == 1
+  uint32_t loss_permille = (_group_retry_tracked == 0) ? 0 : (_group_retry_failed * 1000UL) / _group_retry_tracked;
+  sprintf(&reply[strlen(reply)],
+          "\nrelay.grp trk=%lu ok=%lu fail=%lu retry=%lu loss=%lu.%lu%%",
+          _group_retry_tracked,
+          _group_retry_confirmed,
+          _group_retry_failed,
+          _group_retry_retransmits,
+          loss_permille / 10,
+          loss_permille % 10);
+#endif
 }
 
 void MyMesh::saveIdentity(const mesh::LocalIdentity &new_id) {
@@ -1002,6 +1178,7 @@ void MyMesh::clearStats() {
   radio_driver.resetStats();
   resetStats();
   ((SimpleMeshTables *)getTables())->resetStats();
+  clearGroupFloodRetryState();
 }
 
 void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply) {
@@ -1207,6 +1384,7 @@ void MyMesh::loop() {
 #endif
 
   mesh::Mesh::loop();
+  processGroupFloodRetries();
 
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
     mesh::Packet *pkt = createSelfAdvert();
