@@ -80,6 +80,15 @@ extern uint32_t t1000e_get_light(void);
 #ifndef TRACKER_GROUP_TEXT_BUFFER
   #define TRACKER_GROUP_TEXT_BUFFER 176
 #endif
+// Group text payload must fit Mesh::createGroupDatagram() constraint:
+// data_len <= MAX_PACKET_PAYLOAD - CIPHER_BLOCK_SIZE, and our data_len is 5 + text_len.
+#ifndef TRACKER_GROUP_TEXT_MAX_LEN
+  #if defined(MAX_PACKET_PAYLOAD) && defined(CIPHER_BLOCK_SIZE)
+    #define TRACKER_GROUP_TEXT_MAX_LEN (MAX_PACKET_PAYLOAD - CIPHER_BLOCK_SIZE - 5)
+  #else
+    #define TRACKER_GROUP_TEXT_MAX_LEN 163
+  #endif
+#endif
 
 #ifndef TRACKER_POWER_BUTTON_HOLD_MS
   #define TRACKER_POWER_BUTTON_HOLD_MS 3000
@@ -1030,6 +1039,7 @@ private:
     const char* fix_mode,
     uint32_t fix_secs
   ) {
+    (void)fix_mode;
     char sats_txt[12];
     char speed_txt[16];
     char course_txt[16];
@@ -1066,14 +1076,13 @@ private:
 
     char text[TRACKER_GROUP_TEXT_BUFFER];
     snprintf(text, sizeof(text),
-      "{\"t\":\"tracker\",\"v\":1,\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,\"sat\":%s,\"spd\":%s,\"dir\":%s,\"fix\":\"%s\",\"fix_s\":%lu,\"bat\":%s%s}",
+      "{\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,\"sat\":%s,\"spd\":%s,\"dir\":%s,\"fix_s\":%lu,\"bat\":%s%s}",
       lat,
       lon,
       alt,
       sats_txt,
       speed_txt,
       course_txt,
-      (fix_mode && fix_mode[0]) ? fix_mode : "unknown",
       (unsigned long)fix_secs,
       batt_txt,
       extras_json);
@@ -1096,14 +1105,14 @@ private:
     char text[TRACKER_GROUP_TEXT_BUFFER];
     if (reason && reason[0]) {
       snprintf(text, sizeof(text),
-        "{\"t\":\"tracker\",\"v\":1,\"event\":\"%s\",\"reason\":\"%s\",\"bat\":%s%s}",
+        "{\"event\":\"%s\",\"reason\":\"%s\",\"bat\":%s%s}",
         event_name,
         reason,
         batt_txt,
         extras_json);
     } else {
       snprintf(text, sizeof(text),
-        "{\"t\":\"tracker\",\"v\":1,\"event\":\"%s\",\"bat\":%s%s}",
+        "{\"event\":\"%s\",\"bat\":%s%s}",
         event_name,
         batt_txt,
         extras_json);
@@ -1111,7 +1120,7 @@ private:
     sendGroupText(text);
   }
 
-  void sendGroupText(const char* text, bool include_sender = true) {
+  void sendGroupText(const char* text) {
     if (!_group_ready) {
       TRACKER_DBG("skip group send: group not ready for '%s' (set tracker group.psk ...)", _group_name);
       return;
@@ -1127,12 +1136,7 @@ private:
     memcpy(data, &timestamp, 4);
     data[4] = 0;
 
-    int written = 0;
-    if (include_sender) {
-      written = snprintf((char*)&data[5], TRACKER_GROUP_TEXT_BUFFER, "%s: %s", sender_name, text);
-    } else {
-      written = snprintf((char*)&data[5], TRACKER_GROUP_TEXT_BUFFER, "%s", text);
-    }
+    int written = snprintf((char*)&data[5], TRACKER_GROUP_TEXT_BUFFER, "%s: %s", sender_name, text);
     if (written < 0) {
       TRACKER_DBG("group text format failed");
       return;
@@ -1141,6 +1145,11 @@ private:
       TRACKER_DBG("group text truncated (%d/%u)", written, (unsigned)TRACKER_GROUP_TEXT_BUFFER);
     }
     int text_len = strlen((char*)&data[5]);
+    if (text_len > TRACKER_GROUP_TEXT_MAX_LEN) {
+      TRACKER_DBG("group text too long for packet (%d/%d), dropping",
+        text_len, (int)TRACKER_GROUP_TEXT_MAX_LEN);
+      return;
+    }
 
     auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _group_channel, data, 5 + text_len);
     if (pkt) {
