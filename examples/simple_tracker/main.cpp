@@ -6,6 +6,10 @@
   #include <esp_sleep.h>
   #include <driver/rtc_io.h>
 #endif
+#if defined(NRF52_PLATFORM)
+  #include <nrf_soc.h>
+  #include <nrf.h>
+#endif
 
 #ifdef DISPLAY_CLASS
   #include "../simple_sensor/UITask.h"
@@ -72,6 +76,18 @@
   #define TRACKER_GROUP_TEXT_BUFFER 176
 #endif
 
+#ifndef TRACKER_POWER_BUTTON_HOLD_MS
+  #define TRACKER_POWER_BUTTON_HOLD_MS 3000
+#endif
+
+#ifndef TRACKER_POWER_BUTTON_SHORT_MIN_MS
+  #define TRACKER_POWER_BUTTON_SHORT_MIN_MS 40
+#endif
+
+#ifndef TRACKER_TX_LED_PULSE_MS
+  #define TRACKER_TX_LED_PULSE_MS 80
+#endif
+
 #ifndef BATT_MIN_MILLIVOLTS
   #define BATT_MIN_MILLIVOLTS 3000
 #endif
@@ -118,6 +134,111 @@ static void enterTimerOnlyDeepSleep(uint32_t secs) {
   enterBoardDeepSleep(board, secs, 0);
 }
 
+static unsigned long tracker_tx_led_until = 0;
+static bool tracker_now_requested = false;
+
+static void trackerSetStatusLed(bool on) {
+#if defined(LED_PIN)
+  #ifdef LED_STATE_ON
+  digitalWrite(LED_PIN, on ? LED_STATE_ON : ((LED_STATE_ON == HIGH) ? LOW : HIGH));
+  #else
+  digitalWrite(LED_PIN, on ? HIGH : LOW);
+  #endif
+#else
+  (void)on;
+#endif
+}
+
+static void trackerPulseTxLed() {
+  trackerSetStatusLed(true);
+  tracker_tx_led_until = millis() + TRACKER_TX_LED_PULSE_MS;
+}
+
+static void handleTrackerTxLedPulse() {
+  if (tracker_tx_led_until != 0 && (int32_t)(millis() - tracker_tx_led_until) >= 0) {
+    tracker_tx_led_until = 0;
+    trackerSetStatusLed(false);
+  }
+}
+
+static void trackerForceSystemOffIfSupported() {
+#if defined(NRF52_PLATFORM)
+  uint8_t sd_enabled = 0;
+  if (sd_softdevice_is_enabled(&sd_enabled) == NRF_SUCCESS && sd_enabled) {
+    uint32_t err = sd_power_system_off();
+    if (err == NRF_SUCCESS) {
+      return;  // should never return from SYSTEMOFF
+    }
+  }
+  NRF_POWER->SYSTEMOFF = POWER_SYSTEMOFF_SYSTEMOFF_Enter;
+  NVIC_SystemReset();
+#endif
+}
+
+static bool trackerPowerButtonPressed() {
+#if defined(PIN_USER_BTN)
+  int v = digitalRead(PIN_USER_BTN);
+  #ifdef USER_BTN_PRESSED
+  return v == USER_BTN_PRESSED;
+  #else
+  return v == LOW;
+  #endif
+#elif defined(BUTTON_PIN)
+  int v = digitalRead(BUTTON_PIN);
+  #ifdef USER_BTN_PRESSED
+  return v == USER_BTN_PRESSED;
+  #else
+  return v == LOW;
+  #endif
+#else
+  return false;
+#endif
+}
+
+static void handleTrackerPowerButton() {
+#if defined(PIN_USER_BTN) || defined(BUTTON_PIN)
+  static bool inited = false;
+  static bool prev_pressed = false;
+  static bool long_sent = false;
+  static unsigned long pressed_since = 0;
+
+  bool pressed = trackerPowerButtonPressed();
+  if (!inited) {
+    inited = true;
+    prev_pressed = pressed;
+    pressed_since = millis();
+    return;
+  }
+
+  if (pressed && !prev_pressed) {
+    pressed_since = millis();
+    long_sent = false;
+  } else if (!pressed && prev_pressed) {
+    uint32_t press_ms = (uint32_t)(millis() - pressed_since);
+    if (!long_sent &&
+        press_ms >= TRACKER_POWER_BUTTON_SHORT_MIN_MS &&
+        press_ms < TRACKER_POWER_BUTTON_HOLD_MS) {
+      TRACKER_DBG("power button short press -> tracker now");
+      tracker_now_requested = true;
+    }
+    long_sent = false;
+  }
+
+  if (pressed && !long_sent && (uint32_t)(millis() - pressed_since) >= TRACKER_POWER_BUTTON_HOLD_MS) {
+    long_sent = true;
+    TRACKER_DBG("power button long press -> power off");
+    radio_driver.powerOff();
+    board.powerOff();
+#if defined(NRF52_PLATFORM)
+    TRACKER_DBG("board.powerOff returned, forcing nRF52 SYSTEMOFF");
+    trackerForceSystemOffIfSupported();
+#endif
+  }
+
+  prev_pressed = pressed;
+#endif
+}
+
 class TrackerMesh : public SensorMesh {
 public:
   TrackerMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::MillisecondClock& ms, mesh::RNG& rng, mesh::RTCClock& rtc, mesh::MeshTables& tables)
@@ -144,6 +265,13 @@ public:
       TRACKER_DBG("wake from deep sleep: schedule next cycle in %ums", (unsigned)TRACKER_SLEEP_DRAIN_RECHECK_MS);
     }
 #endif
+  }
+
+  void queueImmediateCycle(const char* origin = "manual") {
+    _sleep_waiting_for_queue_drain = false;
+    _sleep_drain_started_millis = 0;
+    _next_measure_millis = millis();
+    TRACKER_DBG("immediate cycle queued (%s)", origin ? origin : "unknown");
   }
 
   void loop() {
@@ -334,9 +462,7 @@ protected:
     }
 
     if (strcmp(command, "tracker send") == 0 || strcmp(command, "tracker now") == 0) {
-      _sleep_waiting_for_queue_drain = false;
-      _sleep_drain_started_millis = 0;
-      _next_measure_millis = millis();
+      queueImmediateCycle("cmd");
       strcpy(reply, "queued");
       return true;
     }
@@ -875,6 +1001,7 @@ private:
         sender_name,
         (unsigned long)timestamp,
         (char*)&data[5]);
+      trackerPulseTxLed();
       sendFlood(pkt);
     } else {
       TRACKER_DBG("group packet alloc failed");
@@ -1198,5 +1325,11 @@ void loop() {
 #ifdef DISPLAY_CLASS
   ui_task.loop();
 #endif
+  handleTrackerTxLedPulse();
+  handleTrackerPowerButton();
+  if (tracker_now_requested) {
+    tracker_now_requested = false;
+    the_mesh.queueImmediateCycle("button");
+  }
   rtc_clock.tick();
 }
