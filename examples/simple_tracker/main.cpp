@@ -130,18 +130,19 @@ static int batteryPercentFromMilliVolts(uint16_t batteryMilliVolts) {
 }
 
 template <typename T>
-static auto enterBoardDeepSleep(T& b, uint32_t secs, int) -> decltype(b.enterDeepSleep(secs, -2), void()) {
-  b.enterDeepSleep(secs, -2);  // timer-only deep sleep (board-specific sentinel)
+static auto enterBoardDeepSleep(T& b, uint32_t secs, int) -> decltype(b.enterDeepSleep(secs, 0), void()) {
+#if defined(PIN_USER_BTN) && (PIN_USER_BTN >= 0)
+  b.enterDeepSleep(secs, PIN_USER_BTN);  // wake by timer or user button
+#elif defined(BUTTON_PIN) && (BUTTON_PIN >= 0)
+  b.enterDeepSleep(secs, BUTTON_PIN);    // wake by timer or user button
+#else
+  b.enterDeepSleep(secs, -1);            // board default wake sources
+#endif
 }
 
 template <typename T>
 static auto enterBoardDeepSleep(T& b, uint32_t secs, long) -> decltype(b.enterDeepSleep(secs), void()) {
   b.enterDeepSleep(secs);
-}
-
-template <typename T>
-static auto enterBoardDeepSleep(T& b, uint32_t secs, char) -> decltype(b.enterDeepSleep(secs, -1), void()) {
-  b.enterDeepSleep(secs, -1);
 }
 
 static void enterBoardDeepSleep(mesh::MainBoard& b, uint32_t secs, ...) {
@@ -156,11 +157,17 @@ static unsigned long tracker_tx_led_until = 0;
 static bool tracker_now_requested = false;
 
 static void trackerSetStatusLed(bool on) {
-#if defined(LED_PIN)
+#if defined(LED_PIN) && (LED_PIN >= 0)
   #ifdef LED_STATE_ON
   digitalWrite(LED_PIN, on ? LED_STATE_ON : ((LED_STATE_ON == HIGH) ? LOW : HIGH));
   #else
   digitalWrite(LED_PIN, on ? HIGH : LOW);
+  #endif
+#elif defined(P_LORA_TX_LED) && (P_LORA_TX_LED >= 0)
+  #ifdef P_LORA_TX_LED_ON
+  digitalWrite(P_LORA_TX_LED, on ? P_LORA_TX_LED_ON : ((P_LORA_TX_LED_ON == HIGH) ? LOW : HIGH));
+  #else
+  digitalWrite(P_LORA_TX_LED, on ? HIGH : LOW);
   #endif
 #else
   (void)on;
@@ -194,7 +201,7 @@ static void handleTrackerTxLedPulse() {
 }
 
 static void trackerInitPowerButtonPin() {
-#if defined(PIN_USER_BTN)
+#if defined(PIN_USER_BTN) && (PIN_USER_BTN >= 0)
   #ifdef USER_BTN_PRESSED
     #if USER_BTN_PRESSED == HIGH
   pinMode(PIN_USER_BTN, INPUT_PULLDOWN);
@@ -204,7 +211,7 @@ static void trackerInitPowerButtonPin() {
   #else
   pinMode(PIN_USER_BTN, INPUT_PULLUP);
   #endif
-#elif defined(BUTTON_PIN)
+#elif defined(BUTTON_PIN) && (BUTTON_PIN >= 0)
   #ifdef USER_BTN_PRESSED
     #if USER_BTN_PRESSED == HIGH
   pinMode(BUTTON_PIN, INPUT_PULLDOWN);
@@ -232,14 +239,14 @@ static void trackerForceSystemOffIfSupported() {
 }
 
 static bool trackerPowerButtonPressed() {
-#if defined(PIN_USER_BTN)
+#if defined(PIN_USER_BTN) && (PIN_USER_BTN >= 0)
   int v = digitalRead(PIN_USER_BTN);
   #ifdef USER_BTN_PRESSED
   return v == USER_BTN_PRESSED;
   #else
   return v == LOW;
   #endif
-#elif defined(BUTTON_PIN)
+#elif defined(BUTTON_PIN) && (BUTTON_PIN >= 0)
   int v = digitalRead(BUTTON_PIN);
   #ifdef USER_BTN_PRESSED
   return v == USER_BTN_PRESSED;
@@ -252,7 +259,7 @@ static bool trackerPowerButtonPressed() {
 }
 
 static void handleTrackerPowerButton() {
-#if defined(PIN_USER_BTN) || defined(BUTTON_PIN)
+#if (defined(PIN_USER_BTN) && (PIN_USER_BTN >= 0)) || (defined(BUTTON_PIN) && (BUTTON_PIN >= 0))
   static bool inited = false;
   static bool prev_pressed = false;
   static bool long_sent = false;
@@ -341,6 +348,19 @@ public:
   }
 
   void loop() {
+#if defined(NRF52_PLATFORM)
+    // nRF52 light sleep mode: keep running state (including GPS backup-assisted flow)
+    // while idling between tracker cycles.
+    if (_sleep_enabled &&
+        !_tracking_in_progress &&
+        !_sleep_waiting_for_queue_drain &&
+        _next_measure_millis &&
+        !millisHasNowPassed(_next_measure_millis)) {
+      board.sleep(0);
+      return;
+    }
+#endif
+
     SensorMesh::loop();
 
     if (_tracking_in_progress) {
@@ -1081,6 +1101,12 @@ private:
 
   void scheduleNextCycle() {
     if (_sleep_enabled) {
+#if defined(NRF52_PLATFORM)
+      _sleep_waiting_for_queue_drain = false;
+      _sleep_drain_started_millis = 0;
+      _next_measure_millis = millis() + _interval_secs * 1000UL;
+      TRACKER_DBG("schedule: sleep=light next in %lus", (unsigned long)_interval_secs);
+#else
       uint32_t pending = _mgr->getOutboundCount(0xFFFFFFFF);
       TRACKER_DBG("schedule: sleep=on pending=%lu interval=%lus",
         (unsigned long)pending,
@@ -1097,6 +1123,7 @@ private:
       }
       _next_measure_millis = millis() + TRACKER_SLEEP_DRAIN_RECHECK_MS;
       TRACKER_DBG("post-sleep wake window in %ums", (unsigned)TRACKER_SLEEP_DRAIN_RECHECK_MS);
+#endif
     } else {
       _sleep_waiting_for_queue_drain = false;
       _sleep_drain_started_millis = 0;
