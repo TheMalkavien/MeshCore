@@ -88,6 +88,14 @@
   #define TRACKER_TX_LED_PULSE_MS 80
 #endif
 
+#ifndef TRACKER_BOOT_LED_PULSE_MS
+  #define TRACKER_BOOT_LED_PULSE_MS 150
+#endif
+
+#ifndef TRACKER_BUTTON_LED_PULSE_MS
+  #define TRACKER_BUTTON_LED_PULSE_MS 80
+#endif
+
 #ifndef BATT_MIN_MILLIVOLTS
   #define BATT_MIN_MILLIVOLTS 3000
 #endif
@@ -97,7 +105,17 @@
 #endif
 
 #if TRACKER_SERIAL_DEBUG == 1
-  #define TRACKER_DBG(fmt, ...) Serial.printf("[tracker %10lu] " fmt "\r\n", millis(), ##__VA_ARGS__)
+  static bool trackerDebugSerialReady() {
+    if (!Serial) {
+      return false;
+    }
+    return Serial.availableForWrite() >= 16;
+  }
+  #define TRACKER_DBG(fmt, ...) do { \
+    if (trackerDebugSerialReady()) { \
+      Serial.printf("[tracker %10lu] " fmt "\r\n", millis(), ##__VA_ARGS__); \
+    } \
+  } while (0)
 #else
   #define TRACKER_DBG(...) do { } while (0)
 #endif
@@ -149,9 +167,23 @@ static void trackerSetStatusLed(bool on) {
 #endif
 }
 
-static void trackerPulseTxLed() {
+static void trackerPulseStatusLed(uint16_t duration_ms) {
   trackerSetStatusLed(true);
-  tracker_tx_led_until = millis() + TRACKER_TX_LED_PULSE_MS;
+  tracker_tx_led_until = millis() + duration_ms;
+}
+
+static void trackerPulseTxLed() {
+  trackerPulseStatusLed(TRACKER_TX_LED_PULSE_MS);
+}
+
+static void trackerPulseButtonLed() {
+  trackerPulseStatusLed(TRACKER_BUTTON_LED_PULSE_MS);
+}
+
+static void trackerFlashBootLed() {
+  trackerSetStatusLed(true);
+  delay(TRACKER_BOOT_LED_PULSE_MS);
+  trackerSetStatusLed(false);
 }
 
 static void handleTrackerTxLedPulse() {
@@ -159,6 +191,30 @@ static void handleTrackerTxLedPulse() {
     tracker_tx_led_until = 0;
     trackerSetStatusLed(false);
   }
+}
+
+static void trackerInitPowerButtonPin() {
+#if defined(PIN_USER_BTN)
+  #ifdef USER_BTN_PRESSED
+    #if USER_BTN_PRESSED == HIGH
+  pinMode(PIN_USER_BTN, INPUT_PULLDOWN);
+    #else
+  pinMode(PIN_USER_BTN, INPUT_PULLUP);
+    #endif
+  #else
+  pinMode(PIN_USER_BTN, INPUT_PULLUP);
+  #endif
+#elif defined(BUTTON_PIN)
+  #ifdef USER_BTN_PRESSED
+    #if USER_BTN_PRESSED == HIGH
+  pinMode(BUTTON_PIN, INPUT_PULLDOWN);
+    #else
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+    #endif
+  #else
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  #endif
+#endif
 }
 
 static void trackerForceSystemOffIfSupported() {
@@ -200,32 +256,42 @@ static void handleTrackerPowerButton() {
   static bool inited = false;
   static bool prev_pressed = false;
   static bool long_sent = false;
+  static bool press_armed = false;
   static unsigned long pressed_since = 0;
 
   bool pressed = trackerPowerButtonPressed();
   if (!inited) {
     inited = true;
     prev_pressed = pressed;
-    pressed_since = millis();
+    pressed_since = 0;
+    press_armed = false;
     return;
   }
 
   if (pressed && !prev_pressed) {
+    trackerPulseButtonLed();
     pressed_since = millis();
     long_sent = false;
+    press_armed = true;
   } else if (!pressed && prev_pressed) {
-    uint32_t press_ms = (uint32_t)(millis() - pressed_since);
-    if (!long_sent &&
-        press_ms >= TRACKER_POWER_BUTTON_SHORT_MIN_MS &&
-        press_ms < TRACKER_POWER_BUTTON_HOLD_MS) {
-      TRACKER_DBG("power button short press -> tracker now");
-      tracker_now_requested = true;
+    if (press_armed) {
+      uint32_t press_ms = (uint32_t)(millis() - pressed_since);
+      if (!long_sent &&
+          press_ms >= TRACKER_POWER_BUTTON_SHORT_MIN_MS &&
+          press_ms < TRACKER_POWER_BUTTON_HOLD_MS) {
+        TRACKER_DBG("power button short press -> tracker now");
+        tracker_now_requested = true;
+      }
     }
+    press_armed = false;
     long_sent = false;
+    pressed_since = 0;
   }
 
-  if (pressed && !long_sent && (uint32_t)(millis() - pressed_since) >= TRACKER_POWER_BUTTON_HOLD_MS) {
+  if (pressed && press_armed && !long_sent &&
+      (uint32_t)(millis() - pressed_since) >= TRACKER_POWER_BUTTON_HOLD_MS) {
     long_sent = true;
+    press_armed = false;
     TRACKER_DBG("power button long press -> power off");
     radio_driver.powerOff();
     board.powerOff();
@@ -1211,6 +1277,10 @@ void setup() {
 
   board.begin();
   TRACKER_DBG("board.begin done");
+  trackerInitPowerButtonPin();
+  TRACKER_DBG("button pin configured");
+  trackerFlashBootLed();
+  TRACKER_DBG("boot led pulse");
 
 #ifdef DISPLAY_CLASS
   if (display.begin()) {
