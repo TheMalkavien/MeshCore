@@ -13,6 +13,23 @@ VolatileRTCClock rtc_clock;
 MicroNMEALocationProvider nmea = MicroNMEALocationProvider(Serial1, &rtc_clock);
 T1000SensorManager sensors = T1000SensorManager(nmea);
 
+static uint32_t gps_powered_at = 0;
+static uint32_t gps_bytes_seen = 0;
+static uint8_t gps_baud_phase = 0; // 0=115200, 1=9600 fallback
+static bool gps_uart_started = false;
+
+static void gps_uart_begin(uint32_t baud) {
+#if defined(NRF52_PLATFORM) && defined(GPS_RX_PIN) && defined(GPS_TX_PIN)
+  ((Uart *)&Serial1)->setPins(GPS_RX_PIN, GPS_TX_PIN);
+#endif
+  if (gps_uart_started) {
+    Serial1.end();
+    delay(10);
+  }
+  Serial1.begin(baud);
+  gps_uart_started = true;
+}
+
 #ifdef DISPLAY_CLASS
   NullDisplayDriver display;
 #endif
@@ -95,7 +112,14 @@ mesh::LocalIdentity radio_new_identity() {
 }
 
 void T1000SensorManager::start_gps() {
+  if (gps_active) {
+    return;
+  }
   gps_active = true;
+  gps_powered_at = millis();
+  gps_bytes_seen = 0;
+  gps_baud_phase = 0;
+  gps_uart_begin(115200);
   //_nmea->begin();
   // this init sequence should be better 
   // comes from seeed examples and deals with all gps pins
@@ -119,6 +143,9 @@ void T1000SensorManager::start_gps() {
 }
 
 void T1000SensorManager::sleep_gps() {
+  if (!gps_active) {
+    return;
+  }
   gps_active = false;
   digitalWrite(GPS_VRTC_EN, HIGH);
   digitalWrite(GPS_EN, LOW);
@@ -131,6 +158,9 @@ void T1000SensorManager::sleep_gps() {
 }
 
 void T1000SensorManager::stop_gps() {
+  if (!gps_active) {
+    return;
+  }
   gps_active = false;
   digitalWrite(GPS_VRTC_EN, LOW);
   digitalWrite(GPS_EN, LOW);
@@ -145,7 +175,7 @@ void T1000SensorManager::stop_gps() {
 
 bool T1000SensorManager::begin() {
   // init GPS
-  Serial1.begin(115200);
+  gps_uart_begin(115200);
   return true;
 }
 
@@ -164,7 +194,33 @@ bool T1000SensorManager::querySensors(uint8_t requester_permissions, CayenneLPP&
 void T1000SensorManager::loop() {
   static long next_gps_update = 0;
 
+  int avail = Serial1.available();
+  if (gps_active && avail > 0) {
+    gps_bytes_seen += (uint32_t)avail;
+  }
+
   _nmea->loop();
+
+  // Some T1000-E units may retain a different GNSS UART baud.
+  // If no NMEA bytes arrive, try a 9600 fallback then restore 115200.
+  if (gps_active && gps_bytes_seen == 0) {
+    uint32_t elapsed = (uint32_t)(millis() - gps_powered_at);
+    if (gps_baud_phase == 0 && elapsed > 15000UL) {
+      gps_baud_phase = 1;
+      gps_powered_at = millis();
+      gps_uart_begin(9600);
+      digitalWrite(GPS_RESET, HIGH);
+      delay(10);
+      digitalWrite(GPS_RESET, LOW);
+    } else if (gps_baud_phase == 1 && elapsed > 20000UL) {
+      gps_baud_phase = 0;
+      gps_powered_at = millis();
+      gps_uart_begin(115200);
+      digitalWrite(GPS_RESET, HIGH);
+      delay(10);
+      digitalWrite(GPS_RESET, LOW);
+    }
+  }
 
   if (millis() > next_gps_update) {
     if (gps_active && _nmea->isValid()) {
