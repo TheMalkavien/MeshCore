@@ -20,6 +20,10 @@
   #define TRACKER_DEFAULT_GPS_TIMEOUT_SECS 180
 #endif
 
+#ifndef TRACKER_GPS_TIMEOUT_MAX_SECS
+  #define TRACKER_GPS_TIMEOUT_MAX_SECS 900
+#endif
+
 #ifndef TRACKER_DEFAULT_REQUIRE_LIVE_FIX
   #define TRACKER_DEFAULT_REQUIRE_LIVE_FIX 1
 #endif
@@ -68,11 +72,28 @@
   #define TRACKER_GROUP_TEXT_BUFFER 176
 #endif
 
+#ifndef BATT_MIN_MILLIVOLTS
+  #define BATT_MIN_MILLIVOLTS 3000
+#endif
+
+#ifndef BATT_MAX_MILLIVOLTS
+  #define BATT_MAX_MILLIVOLTS 4200
+#endif
+
 #if TRACKER_SERIAL_DEBUG == 1
   #define TRACKER_DBG(fmt, ...) Serial.printf("[tracker %10lu] " fmt "\r\n", millis(), ##__VA_ARGS__)
 #else
   #define TRACKER_DBG(...) do { } while (0)
 #endif
+
+static int batteryPercentFromMilliVolts(uint16_t batteryMilliVolts) {
+  const int minMilliVolts = BATT_MIN_MILLIVOLTS;
+  const int maxMilliVolts = BATT_MAX_MILLIVOLTS;
+  int batteryPercentage = ((batteryMilliVolts - minMilliVolts) * 100) / (maxMilliVolts - minMilliVolts);
+  if (batteryPercentage < 0) batteryPercentage = 0;
+  if (batteryPercentage > 100) batteryPercentage = 100;
+  return batteryPercentage;
+}
 
 template <typename T>
 static auto enterBoardDeepSleep(T& b, uint32_t secs, int) -> decltype(b.enterDeepSleep(secs, -2), void()) {
@@ -195,8 +216,8 @@ protected:
 
     if (memcmp(command, "tracker timeout ", 16) == 0) {
       uint32_t secs = atoi(&command[16]);
-      if (secs < 30 || secs > 180) {
-        strcpy(reply, "Error: timeout range is 30-180 seconds");
+      if (secs < 30 || secs > TRACKER_GPS_TIMEOUT_MAX_SECS) {
+        snprintf(reply, 80, "Error: timeout range is 30-%u seconds", (unsigned)TRACKER_GPS_TIMEOUT_MAX_SECS);
       } else {
         _gps_timeout_secs = secs;
         persistTrackerConfig();
@@ -540,6 +561,8 @@ private:
     StrHelper::strncpy(cfg.group_name, _group_name, sizeof(cfg.group_name));
     StrHelper::strncpy(cfg.group_psk, _group_psk, sizeof(cfg.group_psk));
 
+    // Ensure we overwrite prior content instead of appending stale records.
+    _cfg_fs->remove(TRACKER_CONFIG_PATH);
     File file = openConfigForWrite();
     if (!file) {
       TRACKER_DBG("config save failed: open write");
@@ -585,7 +608,7 @@ private:
     if (cfg.interval_secs >= 30 && cfg.interval_secs <= 86400) {
       _interval_secs = cfg.interval_secs;
     }
-    if (cfg.gps_timeout_secs >= 30 && cfg.gps_timeout_secs <= 180) {
+    if (cfg.gps_timeout_secs >= 30 && cfg.gps_timeout_secs <= TRACKER_GPS_TIMEOUT_MAX_SECS) {
       _gps_timeout_secs = cfg.gps_timeout_secs;
     }
     if (cfg.reserved <= 3600) {
@@ -736,7 +759,8 @@ private:
     float speed_kmh,
     bool course_ok,
     float course_deg,
-    const char* fix_mode
+    const char* fix_mode,
+    uint32_t fix_secs
   ) {
     char sats_txt[12];
     char speed_txt[16];
@@ -762,12 +786,7 @@ private:
     }
 
     const uint16_t batt_mv = board.getBattMilliVolts();
-    int batt_pct = -1;
-    if (batt_mv > 0) {
-      if (batt_mv <= 3300) batt_pct = 0;
-      else if (batt_mv >= 4200) batt_pct = 100;
-      else batt_pct = (int)(((uint32_t)(batt_mv - 3300) * 100UL) / 900UL);
-    }
+    int batt_pct = batt_mv > 0 ? batteryPercentFromMilliVolts(batt_mv) : -1;
     if (batt_pct >= 0) {
       snprintf(batt_txt, sizeof(batt_txt), "%d", batt_pct);
     } else {
@@ -776,7 +795,7 @@ private:
 
     char text[TRACKER_GROUP_TEXT_BUFFER];
     snprintf(text, sizeof(text),
-      "{\"t\":\"tracker\",\"v\":1,\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,\"sat\":%s,\"spd\":%s,\"dir\":%s,\"fix\":\"%s\",\"bat\":%s}",
+      "{\"t\":\"tracker\",\"v\":1,\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,\"sat\":%s,\"spd\":%s,\"dir\":%s,\"fix\":\"%s\",\"fix_s\":%lu,\"bat\":%s}",
       lat,
       lon,
       alt,
@@ -784,6 +803,7 @@ private:
       speed_txt,
       course_txt,
       (fix_mode && fix_mode[0]) ? fix_mode : "unknown",
+      (unsigned long)fix_secs,
       batt_txt);
     sendGroupText(text);
   }
@@ -791,12 +811,7 @@ private:
   void sendTrackerEventJson(const char* event_name, const char* reason = NULL) {
     char batt_txt[12];
     const uint16_t batt_mv = board.getBattMilliVolts();
-    int batt_pct = -1;
-    if (batt_mv > 0) {
-      if (batt_mv <= 3300) batt_pct = 0;
-      else if (batt_mv >= 4200) batt_pct = 100;
-      else batt_pct = (int)(((uint32_t)(batt_mv - 3300) * 100UL) / 900UL);
-    }
+    int batt_pct = batt_mv > 0 ? batteryPercentFromMilliVolts(batt_mv) : -1;
     if (batt_pct >= 0) {
       snprintf(batt_txt, sizeof(batt_txt), "%d", batt_pct);
     } else {
@@ -962,6 +977,7 @@ private:
     bool gps_cached_fix = (!_require_live_fix) && hasStoredPosition();
     bool gps_live_accepted = gps_live_with_coords && (sats_ok || age_ok);
     if (gps_live_accepted || gps_cached_fix) {
+      uint32_t fix_elapsed_s = (uint32_t)((millis() - _tracking_started_millis) / 1000UL);
       float lat = gps_live_accepted ? ((float)gps.raw_lat / 1000000.0f) : sensors.node_lat;
       float lon = gps_live_accepted ? ((float)gps.raw_lon / 1000000.0f) : sensors.node_lon;
       float alt = gps_live_accepted ? ((float)gps.raw_alt / 1000.0f) : sensors.node_altitude;
@@ -999,7 +1015,8 @@ private:
         speed_kmh,
         course_ok,
         course_deg,
-        gps_live_accepted ? "live" : "cached");
+        gps_live_accepted ? "live" : "cached",
+        fix_elapsed_s);
       completeTrackingCycle();
       return;
     }

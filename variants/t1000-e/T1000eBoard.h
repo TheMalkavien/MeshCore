@@ -15,6 +15,9 @@ public:
   uint16_t getBattMilliVolts() override {
   #ifdef BATTERY_PIN
    #ifdef PIN_3V3_EN
+    int prev_3v3 = digitalRead(PIN_3V3_EN);
+   #endif
+   #ifdef PIN_3V3_EN
     digitalWrite(PIN_3V3_EN, HIGH);
    #endif
     analogReference(AR_INTERNAL_3_0);
@@ -22,7 +25,7 @@ public:
     delay(10);
     float volts = (analogRead(BATTERY_PIN) * ADC_MULTIPLIER * AREF_VOLTAGE) / 4096;
    #ifdef PIN_3V3_EN
-    digitalWrite(PIN_3V3_EN, LOW);
+    digitalWrite(PIN_3V3_EN, prev_3v3 ? HIGH : LOW);
    #endif
 
     analogReference(AR_DEFAULT);  // put back to default
