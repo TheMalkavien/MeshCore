@@ -2,6 +2,7 @@
 #include "../simple_sensor/SensorMesh.h"
 #include <base64.hpp>
 #include <limits.h>
+#include <math.h>
 #if defined(ESP32)
   #include <esp_sleep.h>
   #include <driver/rtc_io.h>
@@ -9,6 +10,10 @@
 #if defined(NRF52_PLATFORM)
   #include <nrf_soc.h>
   #include <nrf.h>
+#endif
+#if defined(T1000_E)
+extern float t1000e_get_temperature(void);
+extern uint32_t t1000e_get_light(void);
 #endif
 
 #ifdef DISPLAY_CLASS
@@ -310,6 +315,57 @@ static void handleTrackerPowerButton() {
 
   prev_pressed = pressed;
 #endif
+}
+
+struct TrackerEnvExtras {
+  bool has_temperature = false;
+  float temperature_c = 0.0f;
+  bool has_light = false;
+  uint32_t light_level = 0;  // board-defined scale
+};
+
+static TrackerEnvExtras readTrackerEnvExtras() {
+  TrackerEnvExtras extras;
+#if defined(T1000_E)
+  float temp = t1000e_get_temperature();
+  if (!isnan(temp) && !isinf(temp)) {
+    extras.has_temperature = true;
+    extras.temperature_c = temp;
+  }
+  extras.has_light = true;
+  extras.light_level = t1000e_get_light();
+#endif
+  return extras;
+}
+
+static void buildTrackerEnvExtrasJson(char* out, size_t out_len) {
+  if (!out || out_len == 0) {
+    return;
+  }
+  out[0] = 0;
+
+  TrackerEnvExtras extras = readTrackerEnvExtras();
+  size_t used = 0;
+
+  if (extras.has_temperature) {
+    int n = snprintf(out + used, out_len - used, ",\"temp\":%.1f", extras.temperature_c);
+    if (n > 0 && (size_t)n < (out_len - used)) {
+      used += (size_t)n;
+    } else {
+      out[out_len - 1] = 0;
+      return;
+    }
+  }
+
+  if (extras.has_light) {
+    int n = snprintf(out + used, out_len - used, ",\"light\":%lu", (unsigned long)extras.light_level);
+    if (n > 0 && (size_t)n < (out_len - used)) {
+      used += (size_t)n;
+    } else {
+      out[out_len - 1] = 0;
+      return;
+    }
+  }
 }
 
 class TrackerMesh : public SensorMesh {
@@ -1005,9 +1061,12 @@ private:
       StrHelper::strncpy(batt_txt, "null", sizeof(batt_txt));
     }
 
+    char extras_json[64];
+    buildTrackerEnvExtrasJson(extras_json, sizeof(extras_json));
+
     char text[TRACKER_GROUP_TEXT_BUFFER];
     snprintf(text, sizeof(text),
-      "{\"t\":\"tracker\",\"v\":1,\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,\"sat\":%s,\"spd\":%s,\"dir\":%s,\"fix\":\"%s\",\"fix_s\":%lu,\"bat\":%s}",
+      "{\"t\":\"tracker\",\"v\":1,\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,\"sat\":%s,\"spd\":%s,\"dir\":%s,\"fix\":\"%s\",\"fix_s\":%lu,\"bat\":%s%s}",
       lat,
       lon,
       alt,
@@ -1016,7 +1075,8 @@ private:
       course_txt,
       (fix_mode && fix_mode[0]) ? fix_mode : "unknown",
       (unsigned long)fix_secs,
-      batt_txt);
+      batt_txt,
+      extras_json);
     sendGroupText(text);
   }
 
@@ -1030,18 +1090,23 @@ private:
       StrHelper::strncpy(batt_txt, "null", sizeof(batt_txt));
     }
 
+    char extras_json[64];
+    buildTrackerEnvExtrasJson(extras_json, sizeof(extras_json));
+
     char text[TRACKER_GROUP_TEXT_BUFFER];
     if (reason && reason[0]) {
       snprintf(text, sizeof(text),
-        "{\"t\":\"tracker\",\"v\":1,\"event\":\"%s\",\"reason\":\"%s\",\"bat\":%s}",
+        "{\"t\":\"tracker\",\"v\":1,\"event\":\"%s\",\"reason\":\"%s\",\"bat\":%s%s}",
         event_name,
         reason,
-        batt_txt);
+        batt_txt,
+        extras_json);
     } else {
       snprintf(text, sizeof(text),
-        "{\"t\":\"tracker\",\"v\":1,\"event\":\"%s\",\"bat\":%s}",
+        "{\"t\":\"tracker\",\"v\":1,\"event\":\"%s\",\"bat\":%s%s}",
         event_name,
-        batt_txt);
+        batt_txt,
+        extras_json);
     }
     sendGroupText(text);
   }
