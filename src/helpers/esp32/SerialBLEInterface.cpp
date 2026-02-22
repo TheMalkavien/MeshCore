@@ -1,5 +1,7 @@
 #include "SerialBLEInterface.h"
 #include "esp_mac.h"
+#include <esp_bt.h>
+#include <esp_gap_ble_api.h>
 
 // See the following for generating UUIDs:
 // https://www.uuidgenerator.net/
@@ -23,8 +25,21 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
   char dev_name[32+16];
   sprintf(dev_name, "%s%s", prefix, name);
 
+  // Keep only BLE stack (drop Classic BT memory) for lower idle power and RAM usage.
+#ifdef ESP_BT_MODE_CLASSIC_BT
+  (void) esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+#endif
+
   // Create the BLE Device
   BLEDevice::init(dev_name);
+  esp_err_t bt_sleep_err = ESP_ERR_NOT_SUPPORTED;
+#if defined(CONFIG_BT_CTRL_MODEM_SLEEP) || defined(CONFIG_BTDM_CTRL_MODEM_SLEEP) || defined(CONFIG_BT_LE_SLEEP_ENABLE)
+  bt_sleep_err = esp_bt_sleep_enable();
+#endif
+#ifdef BLE_TX_PWR_LEVEL
+  BLEDevice::setPower((esp_power_level_t)BLE_TX_PWR_LEVEL);
+#endif
+  BLE_DEBUG_PRINTLN("bt_sleep_enable err=%d", bt_sleep_err);
   BLEDevice::setSecurityCallbacks(this);
   BLEDevice::setMTU(MAX_FRAME_SIZE);
 
@@ -95,6 +110,15 @@ void SerialBLEInterface::onConnect(BLEServer* pServer) {
 void SerialBLEInterface::onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) {
   BLE_DEBUG_PRINTLN("onConnect(), conn_id=%d, mtu=%d", param->connect.conn_id, pServer->getPeerMTU(param->connect.conn_id));
   last_conn_id = param->connect.conn_id;
+#ifdef BLE_CONN_MIN_INTERVAL
+  esp_ble_conn_update_params_t conn_params = {0};
+  memcpy(conn_params.bda, param->connect.remote_bda, sizeof(conn_params.bda));
+  conn_params.min_int = BLE_CONN_MIN_INTERVAL;
+  conn_params.max_int = BLE_CONN_MAX_INTERVAL;
+  conn_params.latency = BLE_CONN_LATENCY;
+  conn_params.timeout = BLE_CONN_TIMEOUT;
+  esp_ble_gap_update_conn_params(&conn_params);
+#endif
 }
 
 void SerialBLEInterface::onMtuChanged(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) {
@@ -139,9 +163,12 @@ void SerialBLEInterface::enable() {
   pService->start();
 
   // Start advertising
-
-  //pServer->getAdvertising()->setMinInterval(500);
-  //pServer->getAdvertising()->setMaxInterval(1000);
+#ifdef BLE_ADV_MIN_INTERVAL
+  pServer->getAdvertising()->setMinInterval(BLE_ADV_MIN_INTERVAL);
+#endif
+#ifdef BLE_ADV_MAX_INTERVAL
+  pServer->getAdvertising()->setMaxInterval(BLE_ADV_MAX_INTERVAL);
+#endif
 
   pServer->getAdvertising()->start();
   adv_restart_time = 0;

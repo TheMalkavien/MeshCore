@@ -2,6 +2,14 @@
 #include <Mesh.h>
 #include "MyMesh.h"
 
+#ifndef COMPANION_IDLE_SLEEP_BOOT_GRACE_MILLIS
+  #define COMPANION_IDLE_SLEEP_BOOT_GRACE_MILLIS 15000UL
+#endif
+
+#ifndef COMPANION_IDLE_YIELD_MILLIS
+  #define COMPANION_IDLE_YIELD_MILLIS 1
+#endif
+
 // Believe it or not, this std C function is busted on some platforms!
 static uint32_t _atoi(const char* sp) {
   uint32_t n = 0;
@@ -106,7 +114,9 @@ void halt() {
 }
 
 void setup() {
+#if !defined(COMPANION_SUPPRESS_SERIAL) || (COMPANION_SUPPRESS_SERIAL == 0)
   Serial.begin(115200);
+#endif
 
   board.begin();
 
@@ -225,4 +235,24 @@ void loop() {
   ui_task.loop();
 #endif
   rtc_clock.tick();
+#if defined(ESP32) && defined(ESP32_IDLE_LIGHT_SLEEP_MILLIS)
+  static unsigned long sleep_armed_after = 0;
+  if (sleep_armed_after == 0) {
+    sleep_armed_after = millis() + COMPANION_IDLE_SLEEP_BOOT_GRACE_MILLIS;
+  }
+  bool can_idle_sleep = !serial_interface.isWriteBusy();
+#if defined(BLE_PIN_CODE)
+  #if defined(COMPANION_BLE_FORCE_LOOP_SLEEP) && (defined(CONFIG_BT_CTRL_MODEM_SLEEP) || defined(CONFIG_BTDM_CTRL_MODEM_SLEEP) || defined(CONFIG_BTDM_CONTROLLER_MODEM_SLEEP))
+  can_idle_sleep = can_idle_sleep && serial_interface.isConnected();
+  #else
+  can_idle_sleep = false;
+  #endif
+#endif
+  if (can_idle_sleep && millis() > sleep_armed_after) {
+    board.sleep(0);
+  }
+#endif
+#if COMPANION_IDLE_YIELD_MILLIS > 0
+  delay(COMPANION_IDLE_YIELD_MILLIS);
+#endif
 }
