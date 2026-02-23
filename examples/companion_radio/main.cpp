@@ -169,11 +169,11 @@ static bool tryManualLightSleep(uint32_t sleep_ms) {
 #endif
 
 #ifndef LOOP_BUSY_DELAY_MS
-  #define LOOP_BUSY_DELAY_MS 3
+  #define LOOP_BUSY_DELAY_MS 6
 #endif
 
 #ifndef LOOP_IDLE_DELAY_MS
-  #define LOOP_IDLE_DELAY_MS 15
+  #define LOOP_IDLE_DELAY_MS 30
 #endif
 
 void setup() {

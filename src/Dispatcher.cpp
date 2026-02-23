@@ -13,7 +13,7 @@ namespace mesh {
 #define MIN_TX_BUDGET_AIRTIME_DIV  2      // require at least 1/N of estimated airtime as budget before TX
 
 #ifndef NOISE_FLOOR_CALIB_INTERVAL
-  #define NOISE_FLOOR_CALIB_INTERVAL   2000     // 2 seconds
+  #define NOISE_FLOOR_CALIB_INTERVAL   20000     // 20 seconds
 #endif
 
 void Dispatcher::begin() {
