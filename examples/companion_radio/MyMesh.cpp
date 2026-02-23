@@ -2002,6 +2002,16 @@ void MyMesh::checkSerialInterface() {
   }
 }
 
+bool MyMesh::hasPendingWork() const {
+  if (_mgr->getOutboundCount(0xFFFFFFFF) > 0) return true;
+  if (_iter_started || _cli_rescue) return true;
+  if (offline_queue_len > 0) return true;
+  if (dirty_contacts_expiry) return true;
+  if (pending_login || pending_status || pending_telemetry || pending_discovery || pending_req) return true;
+  if (_serial && _serial->isWriteBusy()) return true;
+  return false;
+}
+
 void MyMesh::loop() {
   BaseChatMesh::loop();
 

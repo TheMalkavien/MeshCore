@@ -1,5 +1,8 @@
 #include "SerialBLEInterface.h"
 #include "esp_mac.h"
+#if defined(ESP_PLATFORM)
+  #include "esp_bt.h"
+#endif
 
 // See the following for generating UUIDs:
 // https://www.uuidgenerator.net/
@@ -9,6 +12,8 @@
 #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 #define ADVERT_RESTART_DELAY  1000   // millis
+#define BLE_ADV_INTERVAL_MIN  160    // 100ms (units: 0.625ms)
+#define BLE_ADV_INTERVAL_MAX  320    // 200ms (units: 0.625ms)
 
 void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code) {
   _pin_code = pin_code;
@@ -51,6 +56,11 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
   pRxCharacteristic->setCallbacks(this);
 
   pServer->getAdvertising()->addServiceUUID(SERVICE_UUID);
+
+#if defined(ESP_PLATFORM) && defined(CONFIG_BT_CTRL_MODEM_SLEEP)
+  // Let the BT controller use modem sleep when idle.
+  (void)esp_bt_sleep_enable();
+#endif
 }
 
 // -------- BLESecurityCallbacks methods
@@ -139,9 +149,8 @@ void SerialBLEInterface::enable() {
   pService->start();
 
   // Start advertising
-
-  //pServer->getAdvertising()->setMinInterval(500);
-  //pServer->getAdvertising()->setMaxInterval(1000);
+  pServer->getAdvertising()->setMinInterval(BLE_ADV_INTERVAL_MIN);
+  pServer->getAdvertising()->setMaxInterval(BLE_ADV_INTERVAL_MAX);
 
   pServer->getAdvertising()->start();
   adv_restart_time = 0;
@@ -241,6 +250,8 @@ size_t SerialBLEInterface::checkRecvFrame(uint8_t dest[]) {
   if (adv_restart_time && millis() >= adv_restart_time) {
     if (pServer->getConnectedCount() == 0) {
       BLE_DEBUG_PRINTLN("SerialBLEInterface -> re-starting advertising");
+      pServer->getAdvertising()->setMinInterval(BLE_ADV_INTERVAL_MIN);
+      pServer->getAdvertising()->setMaxInterval(BLE_ADV_INTERVAL_MAX);
       pServer->getAdvertising()->start();  // re-Start advertising
     }
     adv_restart_time = 0;
