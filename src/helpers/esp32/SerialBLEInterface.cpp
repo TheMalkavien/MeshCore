@@ -12,8 +12,12 @@
 #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 #define ADVERT_RESTART_DELAY  1000   // millis
-#define BLE_ADV_INTERVAL_MIN  160    // 100ms (units: 0.625ms)
-#define BLE_ADV_INTERVAL_MAX  320    // 200ms (units: 0.625ms)
+#ifndef BLE_ADV_INTERVAL_MIN
+  #define BLE_ADV_INTERVAL_MIN  160    // 100ms (units: 0.625ms)
+#endif
+#ifndef BLE_ADV_INTERVAL_MAX
+  #define BLE_ADV_INTERVAL_MAX  320    // 200ms (units: 0.625ms)
+#endif
 
 void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code) {
   _pin_code = pin_code;
@@ -27,6 +31,11 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
   }
   char dev_name[32+16];
   sprintf(dev_name, "%s%s", prefix, name);
+
+#if defined(ESP_PLATFORM)
+  // Ensure Classic BT resources are released; this firmware only needs BLE.
+  (void)esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+#endif
 
   // Create the BLE Device
   BLEDevice::init(dev_name);
@@ -100,11 +109,19 @@ void SerialBLEInterface::onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) {
 // -------- BLEServerCallbacks methods
 
 void SerialBLEInterface::onConnect(BLEServer* pServer) {
+  if (_isEnabled) {
+    pServer->getAdvertising()->stop();
+    adv_restart_time = 0;
+  }
 }
 
 void SerialBLEInterface::onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) {
   BLE_DEBUG_PRINTLN("onConnect(), conn_id=%d, mtu=%d", param->connect.conn_id, pServer->getPeerMTU(param->connect.conn_id));
   last_conn_id = param->connect.conn_id;
+  if (_isEnabled) {
+    pServer->getAdvertising()->stop();
+    adv_restart_time = 0;
+  }
 }
 
 void SerialBLEInterface::onMtuChanged(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) {
