@@ -96,6 +96,7 @@ public:
   uint32_t getBLEPin();
 
   void loop();
+  bool hasPendingWork() const;
   void handleCmdFrame(size_t len);
   bool advert();
   void enterCLIRescue();

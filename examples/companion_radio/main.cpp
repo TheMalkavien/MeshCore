@@ -2,6 +2,17 @@
 #include <Mesh.h>
 #include "MyMesh.h"
 
+#if defined(ESP32)
+  #include <freertos/FreeRTOS.h>
+  #include <freertos/task.h>
+  #if defined(ESP_PLATFORM)
+    #include <esp_sleep.h>
+    #if defined(CONFIG_PM_ENABLE)
+      #include <esp_pm.h>
+    #endif
+  #endif
+#endif
+
 // Believe it or not, this std C function is busted on some platforms!
 static uint32_t _atoi(const char* sp) {
   uint32_t n = 0;
@@ -105,10 +116,35 @@ void halt() {
   while (1) ;
 }
 
+#if defined(ESP32) && defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
+static void configureESP32PowerManagement() {
+  // Keep CPU scaling dynamic but capped at 80 MHz for low-power operation.
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  esp_pm_config_esp32s3_t pm_config = {};
+#elif defined(CONFIG_IDF_TARGET_ESP32S2)
+  esp_pm_config_esp32s2_t pm_config = {};
+#elif defined(CONFIG_IDF_TARGET_ESP32C3)
+  esp_pm_config_esp32c3_t pm_config = {};
+#elif defined(CONFIG_IDF_TARGET_ESP32)
+  esp_pm_config_esp32_t pm_config = {};
+#else
+  return;
+#endif
+  pm_config.max_freq_mhz = 80;
+  pm_config.min_freq_mhz = 40;
+  pm_config.light_sleep_enable = true;
+  (void)esp_pm_configure(&pm_config);
+}
+#endif
+
 void setup() {
   Serial.begin(115200);
 
   board.begin();
+
+#if defined(ESP32) && defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
+  configureESP32PowerManagement();
+#endif
 
 #ifdef DISPLAY_CLASS
   DisplayDriver* disp = NULL;
@@ -225,4 +261,11 @@ void loop() {
   ui_task.loop();
 #endif
   rtc_clock.tick();
+
+#if defined(ESP32)
+  // Yield CPU so IDF DFS + tickless idle can enter modem/light sleep automatically.
+  const bool busy = the_mesh.hasPendingWork() || serial_interface.isWriteBusy() || serial_interface.isConnected();
+  const TickType_t idle_ticks = busy ? pdMS_TO_TICKS(1) : pdMS_TO_TICKS(8);
+  vTaskDelay((idle_ticks > 0) ? idle_ticks : 1);
+#endif
 }
