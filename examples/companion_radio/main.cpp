@@ -132,7 +132,7 @@ static void configureESP32PowerManagement() {
   return;
 #endif
   pm_config.max_freq_mhz = 80;
-  pm_config.min_freq_mhz = 80;
+  pm_config.min_freq_mhz = 40;
   pm_config.light_sleep_enable = false;
   (void)esp_pm_configure(&pm_config);
 }
@@ -166,6 +166,14 @@ static bool tryManualLightSleep(uint32_t sleep_ms) {
 
 #ifndef MANUAL_LIGHT_SLEEP_CONNECTED_MS
   #define MANUAL_LIGHT_SLEEP_CONNECTED_MS 0
+#endif
+
+#ifndef LOOP_BUSY_DELAY_MS
+  #define LOOP_BUSY_DELAY_MS 3
+#endif
+
+#ifndef LOOP_IDLE_DELAY_MS
+  #define LOOP_IDLE_DELAY_MS 15
 #endif
 
 void setup() {
@@ -303,20 +311,20 @@ void loop() {
     const bool allow_manual_sleep = true;
   #endif
   if (busy) {
-    const TickType_t busy_ticks = pdMS_TO_TICKS(1);
+    const TickType_t busy_ticks = pdMS_TO_TICKS(LOOP_BUSY_DELAY_MS);
     vTaskDelay((busy_ticks > 0) ? busy_ticks : 1);
   } else {
   #if defined(ESP_PLATFORM) && !defined(WIFI_SSID)
     const uint32_t sleep_ms = allow_manual_sleep ? (link_connected ? MANUAL_LIGHT_SLEEP_CONNECTED_MS : MANUAL_LIGHT_SLEEP_IDLE_MS) : 0;
     if (sleep_ms > 0 && !tryManualLightSleep(sleep_ms)) {
-      const TickType_t idle_ticks = pdMS_TO_TICKS(8);
+      const TickType_t idle_ticks = pdMS_TO_TICKS(LOOP_IDLE_DELAY_MS);
       vTaskDelay((idle_ticks > 0) ? idle_ticks : 1);
     } else if (sleep_ms == 0) {
-      const TickType_t idle_ticks = pdMS_TO_TICKS(8);
+      const TickType_t idle_ticks = pdMS_TO_TICKS(LOOP_IDLE_DELAY_MS);
       vTaskDelay((idle_ticks > 0) ? idle_ticks : 1);
     }
   #else
-    const TickType_t idle_ticks = pdMS_TO_TICKS(8);
+    const TickType_t idle_ticks = pdMS_TO_TICKS(LOOP_IDLE_DELAY_MS);
     vTaskDelay((idle_ticks > 0) ? idle_ticks : 1);
   #endif
   }
