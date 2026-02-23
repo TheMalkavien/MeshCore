@@ -402,7 +402,7 @@ public:
         display.drawTextCentered(display.width() / 2, 64 - 11, "hibernate:" PRESS_LABEL);
       }
     }
-    return 5000;   // next render after 5000 ms
+    return 15000;   // next render after 5000 ms
   }
 
   bool handleInput(char c) override {
@@ -843,7 +843,7 @@ void UITask::loop() {
       shutdown();
 
     }
-    next_batt_chck = millis() + 8000;
+    next_batt_chck = millis() + 60000;
   }
 #endif
 }

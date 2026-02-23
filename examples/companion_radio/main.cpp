@@ -133,7 +133,7 @@ static void configureESP32PowerManagement() {
 #endif
   pm_config.max_freq_mhz = 80;
   pm_config.min_freq_mhz = 40;
-  pm_config.light_sleep_enable = false;
+  pm_config.light_sleep_enable = true;
   (void)esp_pm_configure(&pm_config);
 }
 #endif
