@@ -10,6 +10,11 @@ CONFIG_PM_ENABLE=y
 CONFIG_PM_DFS_INIT_AUTO=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=3
+# NOTE:
+# On ESP32-S3, ESP-IDF enables ESP_SLEEP_GPIO_RESET_WORKAROUND by default,
+# which selects PM_SLP_DISABLE_GPIO when tickless idle is active.
+# We keep that safety workaround and exempt required pins in code
+# (see RefCountedDigitalPin::begin()).
 
 # BLE controller low-power features (strict profile with reliable advertising).
 CONFIG_BT_CTRL_MODEM_SLEEP=y

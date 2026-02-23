@@ -7,6 +7,7 @@
   #include <freertos/task.h>
   #if defined(ESP_PLATFORM)
     #include <esp_sleep.h>
+    #include <driver/rtc_io.h>
     #if defined(CONFIG_PM_ENABLE)
       #include <esp_pm.h>
     #endif
@@ -131,10 +132,40 @@ static void configureESP32PowerManagement() {
   return;
 #endif
   pm_config.max_freq_mhz = 80;
-  pm_config.min_freq_mhz = 40;
-  pm_config.light_sleep_enable = true;
+  pm_config.min_freq_mhz = 80;
+  pm_config.light_sleep_enable = false;
   (void)esp_pm_configure(&pm_config);
 }
+#endif
+
+#if defined(ESP32) && defined(ESP_PLATFORM)
+static bool tryManualLightSleep(uint32_t sleep_ms) {
+#if defined(P_LORA_DIO_1)
+  if (sleep_ms == 0) return false;
+  if (!rtc_gpio_is_valid_gpio((gpio_num_t)P_LORA_DIO_1)) return false;
+
+  // Keep LoRa DIO wake capability while sleeping.
+  (void)esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+  (void)esp_sleep_enable_ext1_wakeup((1ULL << P_LORA_DIO_1), ESP_EXT1_WAKEUP_ANY_HIGH);
+  (void)esp_sleep_enable_timer_wakeup((uint64_t)sleep_ms * 1000ULL);
+  return esp_light_sleep_start() == ESP_OK;
+#else
+  (void)sleep_ms;
+  return false;
+#endif
+}
+#endif
+
+#ifndef MANUAL_LIGHT_SLEEP_IDLE_MS
+  #if defined(BLE_PIN_CODE)
+    #define MANUAL_LIGHT_SLEEP_IDLE_MS 0
+  #else
+    #define MANUAL_LIGHT_SLEEP_IDLE_MS 5
+  #endif
+#endif
+
+#ifndef MANUAL_LIGHT_SLEEP_CONNECTED_MS
+  #define MANUAL_LIGHT_SLEEP_CONNECTED_MS 0
 #endif
 
 void setup() {
@@ -263,9 +294,31 @@ void loop() {
   rtc_clock.tick();
 
 #if defined(ESP32)
-  // Yield CPU so IDF DFS + tickless idle can enter modem/light sleep automatically.
-  const bool busy = the_mesh.hasPendingWork() || serial_interface.isWriteBusy() || serial_interface.isConnected();
-  const TickType_t idle_ticks = busy ? pdMS_TO_TICKS(1) : pdMS_TO_TICKS(8);
-  vTaskDelay((idle_ticks > 0) ? idle_ticks : 1);
+  // Manual low-power policy: short light-sleep windows when idle.
+  const bool link_connected = serial_interface.isConnected();
+  const bool busy = the_mesh.hasPendingWork() || serial_interface.isWriteBusy();
+  #if defined(BLE_PIN_CODE)
+    const bool allow_manual_sleep = false; // BLE advertising/stack can become unstable with aggressive manual light sleep
+  #else
+    const bool allow_manual_sleep = true;
+  #endif
+  if (busy) {
+    const TickType_t busy_ticks = pdMS_TO_TICKS(1);
+    vTaskDelay((busy_ticks > 0) ? busy_ticks : 1);
+  } else {
+  #if defined(ESP_PLATFORM) && !defined(WIFI_SSID)
+    const uint32_t sleep_ms = allow_manual_sleep ? (link_connected ? MANUAL_LIGHT_SLEEP_CONNECTED_MS : MANUAL_LIGHT_SLEEP_IDLE_MS) : 0;
+    if (sleep_ms > 0 && !tryManualLightSleep(sleep_ms)) {
+      const TickType_t idle_ticks = pdMS_TO_TICKS(8);
+      vTaskDelay((idle_ticks > 0) ? idle_ticks : 1);
+    } else if (sleep_ms == 0) {
+      const TickType_t idle_ticks = pdMS_TO_TICKS(8);
+      vTaskDelay((idle_ticks > 0) ? idle_ticks : 1);
+    }
+  #else
+    const TickType_t idle_ticks = pdMS_TO_TICKS(8);
+    vTaskDelay((idle_ticks > 0) ? idle_ticks : 1);
+  #endif
+  }
 #endif
 }
