@@ -524,7 +524,7 @@ public:
 #if AUTO_OFF_MILLIS==0 // probably e-ink
     return 10000; // 10 s
 #else
-    return 1000;  // next render after 1000 ms
+    return 3000;  // next render after 3000 ms
 #endif
   }
 

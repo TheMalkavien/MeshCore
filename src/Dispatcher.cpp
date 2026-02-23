@@ -11,7 +11,7 @@ namespace mesh {
 #define MAX_RX_DELAY_MILLIS   32000  // 32 seconds
 
 #ifndef NOISE_FLOOR_CALIB_INTERVAL
-  #define NOISE_FLOOR_CALIB_INTERVAL   2000     // 2 seconds
+  #define NOISE_FLOOR_CALIB_INTERVAL   20000     // 20 seconds
 #endif
 
 void Dispatcher::begin() {
