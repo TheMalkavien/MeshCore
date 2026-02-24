@@ -1,4 +1,5 @@
 #include "EnvironmentSensorManager.h"
+#include <Wire.h>
 
 #include <Wire.h>
 
