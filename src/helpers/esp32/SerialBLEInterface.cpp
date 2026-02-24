@@ -18,6 +18,24 @@
 #ifndef BLE_ADV_INTERVAL_MAX
   #define BLE_ADV_INTERVAL_MAX  320    // 200ms (units: 0.625ms)
 #endif
+#ifndef BLE_TX_POWER
+  #define BLE_TX_POWER ESP_PWR_LVL_P3
+#endif
+#ifndef BLE_CONN_INTERVAL_MIN
+  #define BLE_CONN_INTERVAL_MIN 96    // 120ms (units: 1.25ms)
+#endif
+#ifndef BLE_CONN_INTERVAL_MAX
+  #define BLE_CONN_INTERVAL_MAX 160   // 200ms (units: 1.25ms)
+#endif
+#ifndef BLE_CONN_LATENCY
+  #define BLE_CONN_LATENCY 4
+#endif
+#ifndef BLE_CONN_TIMEOUT
+  #define BLE_CONN_TIMEOUT 600        // 6s (units: 10ms)
+#endif
+#ifndef BLE_WRITE_MIN_INTERVAL
+  #define BLE_WRITE_MIN_INTERVAL 60
+#endif
 
 void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code) {
   _pin_code = pin_code;
@@ -39,14 +57,13 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
 
   // Create the BLE Device
   BLEDevice::init(dev_name);
+  BLEDevice::setPower((esp_power_level_t)BLE_TX_POWER);
   BLEDevice::setSecurityCallbacks(this);
   BLEDevice::setMTU(MAX_FRAME_SIZE);
 
   BLESecurity  sec;
   sec.setStaticPIN(pin_code);
   sec.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
-
-  //BLEDevice::setPower(ESP_PWR_LVL_N8);
 
   // Create the BLE Server
   pServer = BLEDevice::createServer();
@@ -118,6 +135,16 @@ void SerialBLEInterface::onConnect(BLEServer* pServer) {
 void SerialBLEInterface::onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) {
   BLE_DEBUG_PRINTLN("onConnect(), conn_id=%d, mtu=%d", param->connect.conn_id, pServer->getPeerMTU(param->connect.conn_id));
   last_conn_id = param->connect.conn_id;
+
+  // Request low-power connection parameters for established links.
+  pServer->updateConnParams(
+    param->connect.remote_bda,
+    BLE_CONN_INTERVAL_MIN,
+    BLE_CONN_INTERVAL_MAX,
+    BLE_CONN_LATENCY,
+    BLE_CONN_TIMEOUT
+  );
+
   if (_isEnabled) {
     pServer->getAdvertising()->stop();
     adv_restart_time = 0;
@@ -205,8 +232,6 @@ size_t SerialBLEInterface::writeFrame(const uint8_t src[], size_t len) {
   }
   return 0;
 }
-
-#define  BLE_WRITE_MIN_INTERVAL   60
 
 bool SerialBLEInterface::isWriteBusy() const {
   return millis() < _last_write + BLE_WRITE_MIN_INTERVAL;   // still too soon to start another write?
