@@ -29,9 +29,20 @@ protected:
 
   #if ENV_INCLUDE_GPS
   LocationProvider* _location;
+  uint32_t next_gps_update_ms = 0;
+  bool gps_fix_window_active = false;
+  uint32_t gps_fix_window_deadline_ms = 0;
   void start_gps();
   void stop_gps();
   void initBasicGPS();
+  void updateLocationFromFix();
+  void beginGPSFixWindow();
+  void endGPSFixWindow(bool fixed);
+  bool isGPSFixWindowExpired(uint32_t now_ms) const;
+  #if defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
+  bool gps_pm_lock_active = false;
+  void setGPSPMLightSleep(bool enable);
+  #endif
   #ifdef RAK_BOARD
   void rakGPSInit();
   bool gpsIsAwake(uint8_t ioPin);
