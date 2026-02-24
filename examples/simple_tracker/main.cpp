@@ -776,7 +776,7 @@ private:
     if (abs_drift <= 2) {
       return;
     }
-    if (!rtc_is_fallback && !rtc_is_invalid && abs_drift > 30) {
+    if (!rtc_is_fallback && !rtc_is_invalid && abs_drift > 3600) {
       TRACKER_DBG("rtc gps sync skipped: large drift=%lds rtc=%lu gps=%ld",
         drift,
         (unsigned long)rtc_now,
