@@ -1,7 +1,41 @@
 #include "EnvironmentSensorManager.h"
 #include <Wire.h>
 
-#include <Wire.h>
+#if ENV_INCLUDE_GPS
+  #if defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
+    #include <esp_pm.h>
+  #endif
+
+  #ifndef GPS_FIX_TIMEOUT_SEC
+    #define GPS_FIX_TIMEOUT_SEC 120
+  #endif
+
+  #ifndef GPS_FORCE_COLD_RESET_ON_INTERVAL
+    #define GPS_FORCE_COLD_RESET_ON_INTERVAL 0
+  #endif
+
+  #ifndef GPS_RESET_ON_START
+    #define GPS_RESET_ON_START 1
+  #endif
+
+  #ifndef GPS_SLEEP_BETWEEN_UPDATES
+    #define GPS_SLEEP_BETWEEN_UPDATES 0
+  #endif
+
+  #if GPS_FORCE_COLD_RESET_ON_INTERVAL
+    #define GPS_INTERVAL_START_MODE "cold"
+  #else
+    #define GPS_INTERVAL_START_MODE "hot"
+  #endif
+
+static inline bool isTimeReached(uint32_t now_ms, uint32_t target_ms) {
+  return (int32_t)(now_ms - target_ms) >= 0;
+}
+
+  #if defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
+static esp_pm_lock_handle_t s_gps_no_light_sleep_lock = nullptr;
+  #endif
+#endif
 
 #if ENV_PIN_SDA && ENV_PIN_SCL
 #define TELEM_WIRE &Wire1  // Use Wire1 as the I2C bus for Environment Sensors
@@ -861,8 +895,116 @@ bool EnvironmentSensorManager::gpsIsAwake(uint8_t ioPin){
 }
 #endif
 
+#if defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
+void EnvironmentSensorManager::setGPSPMLightSleep(bool enable) {
+  if (enable) {
+    if (gps_pm_lock_active && s_gps_no_light_sleep_lock != nullptr) {
+      esp_err_t err = esp_pm_lock_release(s_gps_no_light_sleep_lock);
+      if (err == ESP_OK) {
+        gps_pm_lock_active = false;
+      } else {
+        MESH_DEBUG_PRINTLN("GPS PM lock release failed: %d", (int)err);
+      }
+    }
+    return;
+  }
+
+  if (s_gps_no_light_sleep_lock == nullptr) {
+    esp_err_t err = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "gps_fix", &s_gps_no_light_sleep_lock);
+    if (err != ESP_OK) {
+      MESH_DEBUG_PRINTLN("GPS PM lock create failed: %d", (int)err);
+      return;
+    }
+  }
+
+  if (!gps_pm_lock_active && s_gps_no_light_sleep_lock != nullptr) {
+    esp_err_t err = esp_pm_lock_acquire(s_gps_no_light_sleep_lock);
+    if (err == ESP_OK) {
+      gps_pm_lock_active = true;
+    } else {
+      MESH_DEBUG_PRINTLN("GPS PM lock acquire failed: %d", (int)err);
+    }
+  }
+}
+#endif
+
+void EnvironmentSensorManager::updateLocationFromFix() {
+#ifdef RAK_WISBLOCK_GPS
+  if (!(i2cGPSFlag || serialGPSFlag)) {
+    return;
+  }
+#endif
+
+  if (_location->isValid()) {
+    node_lat = ((double)_location->getLatitude())/1000000.;
+    node_lon = ((double)_location->getLongitude())/1000000.;
+    MESH_DEBUG_PRINTLN("lat %f lon %f", node_lat, node_lon);
+    node_altitude = ((double)_location->getAltitude()) / 1000.0;
+    MESH_DEBUG_PRINTLN("lat %f lon %f alt %f", node_lat, node_lon, node_altitude);
+  }
+}
+
+void EnvironmentSensorManager::beginGPSFixWindow() {
+  if (gps_fix_window_active) {
+    return;
+  }
+
+  gps_fix_window_active = true;
+  gps_fix_window_deadline_ms = millis() + (GPS_FIX_TIMEOUT_SEC * 1000UL);
+
+#if defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
+  setGPSPMLightSleep(false);
+#endif
+
+  if (!_location->isEnabled()) {
+    _location->begin();
+  }
+
+  // Clear previous parser state so stale fix cannot satisfy this window immediately.
+  _location->syncTime();
+
+#if GPS_FORCE_COLD_RESET_ON_INTERVAL
+  _location->reset();
+#endif
+
+  MESH_DEBUG_PRINTLN("GPS fix window started (%s start, timeout=%us)",
+      GPS_INTERVAL_START_MODE, (unsigned)GPS_FIX_TIMEOUT_SEC);
+}
+
+void EnvironmentSensorManager::endGPSFixWindow(bool fixed) {
+  if (!gps_fix_window_active) {
+    return;
+  }
+  gps_fix_window_active = false;
+
+#if defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
+  setGPSPMLightSleep(true);
+#endif
+
+  if (fixed) {
+    MESH_DEBUG_PRINTLN("GPS fix acquired");
+  } else {
+    MESH_DEBUG_PRINTLN("GPS fix timeout");
+  }
+
+#if GPS_SLEEP_BETWEEN_UPDATES
+  _location->stop();  // keep GNSS in standby between scheduled updates
+#endif
+}
+
+bool EnvironmentSensorManager::isGPSFixWindowExpired(uint32_t now_ms) const {
+  return isTimeReached(now_ms, gps_fix_window_deadline_ms);
+}
+
 void EnvironmentSensorManager::start_gps() {
   gps_active = true;
+  gps_fix_window_active = false;
+  next_gps_update_ms = 0;
+
+  #if defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
+    setGPSPMLightSleep(true);
+  #endif
+
   #ifdef RAK_WISBLOCK_GPS
     pinMode(gpsResetPin, OUTPUT);
     digitalWrite(gpsResetPin, HIGH);
@@ -870,7 +1012,14 @@ void EnvironmentSensorManager::start_gps() {
   #endif
 
   _location->begin();
+
+#if GPS_RESET_ON_START
   _location->reset();
+#endif
+
+#if GPS_SLEEP_BETWEEN_UPDATES
+  _location->stop();
+#endif
 
 #ifndef PIN_GPS_EN
   MESH_DEBUG_PRINTLN("Start GPS is N/A on this board. Actual GPS state unchanged");
@@ -879,6 +1028,12 @@ void EnvironmentSensorManager::start_gps() {
 
 void EnvironmentSensorManager::stop_gps() {
   gps_active = false;
+  gps_fix_window_active = false;
+
+  #if defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
+    setGPSPMLightSleep(true);
+  #endif
+
   #ifdef RAK_WISBLOCK_GPS
     pinMode(gpsResetPin, OUTPUT);
     digitalWrite(gpsResetPin, LOW);
@@ -895,34 +1050,36 @@ void EnvironmentSensorManager::stop_gps() {
 
 #if ENV_INCLUDE_GPS || defined(ENV_INCLUDE_BME680_BSEC)
 void EnvironmentSensorManager::loop() {
-
   #if ENV_INCLUDE_GPS
-  static unsigned long next_gps_update = 0;
-  if (gps_active) {
-    _location->loop();
-  }
-  if ((long)(millis() - next_gps_update) > 0) {
+  _location->loop();
+  const uint32_t now_ms = millis();
 
-    if(gps_active){
-    #ifdef RAK_WISBLOCK_GPS
-    if ((i2cGPSFlag || serialGPSFlag) && _location->isValid()) {
-      node_lat = ((double)_location->getLatitude())/1000000.;
-      node_lon = ((double)_location->getLongitude())/1000000.;
-      MESH_DEBUG_PRINTLN("lat %f lon %f", node_lat, node_lon);
-      node_altitude = ((double)_location->getAltitude()) / 1000.0;
-      MESH_DEBUG_PRINTLN("lat %f lon %f alt %f", node_lat, node_lon, node_altitude);
-    }
-    #else
+  bool gps_ready = gps_active;
+
+#ifdef RAK_WISBLOCK_GPS
+  gps_ready = gps_ready && (i2cGPSFlag || serialGPSFlag);
+#endif
+
+  if (gps_ready && gps_fix_window_active) {
     if (_location->isValid()) {
-      node_lat = ((double)_location->getLatitude())/1000000.;
-      node_lon = ((double)_location->getLongitude())/1000000.;
-      MESH_DEBUG_PRINTLN("lat %f lon %f", node_lat, node_lon);
-      node_altitude = ((double)_location->getAltitude()) / 1000.0;
-      MESH_DEBUG_PRINTLN("lat %f lon %f alt %f", node_lat, node_lon, node_altitude);
+      updateLocationFromFix();
+      endGPSFixWindow(true);
+      next_gps_update_ms = now_ms + (gps_update_interval_sec * 1000UL);
+    } else if (isGPSFixWindowExpired(now_ms)) {
+      endGPSFixWindow(false);
+      next_gps_update_ms = now_ms + (gps_update_interval_sec * 1000UL);
     }
-    #endif
+  } else if (gps_ready && isTimeReached(now_ms, next_gps_update_ms)) {
+#if GPS_SLEEP_BETWEEN_UPDATES
+    beginGPSFixWindow();
+#else
+    if (_location->isValid()) {
+      updateLocationFromFix();
+      next_gps_update_ms = now_ms + (gps_update_interval_sec * 1000UL);
+    } else {
+      beginGPSFixWindow();
     }
-    next_gps_update = millis() + (gps_update_interval_sec * 1000);
+#endif
   }
   #endif
   #if ENV_INCLUDE_BME680_BSEC
