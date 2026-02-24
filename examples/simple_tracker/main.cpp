@@ -784,7 +784,17 @@ private:
       return;
     }
 
-    if (drift > 2 || drift < -2) {
+    // Never move RTC backward from GPS here: after sleep/wake the GPS timestamp
+    // can be stale for a while and would reintroduce large negative drift.
+    if (drift < -2) {
+      TRACKER_DBG("rtc gps sync skipped: backward/stale gps_ts=%ld rtc=%lu drift=%lds",
+        gps.timestamp,
+        (unsigned long)rtc_now,
+        drift);
+      return;
+    }
+
+    if (drift > 2) {
       getRTCClock()->setCurrentTime((uint32_t)gps.timestamp);
       TRACKER_DBG("rtc synced from gps: gps_ts=%ld rtc_prev=%lu drift=%lds",
         gps.timestamp,
@@ -1260,7 +1270,6 @@ private:
   void pollTrackingCycle() {
 #if ENV_INCLUDE_GPS == 1
     GPSState gps = getGPSState();
-    syncRTCFromGPS(gps);
     bool gps_live_fix = gps.valid;
     bool live_coords_ok = !(gps.raw_lat == 0 && gps.raw_lon == 0);
     bool gps_live_with_coords = gps_live_fix && live_coords_ok;
@@ -1300,6 +1309,9 @@ private:
         report_sats,
         speed_txt,
         course_txt);
+      if (gps_live_accepted) {
+        syncRTCFromGPS(gps);
+      }
       sendTrackerFixJson(
         lat,
         lon,
@@ -1335,7 +1347,7 @@ private:
       } else {
         StrHelper::strncpy(reason, "unknown", sizeof(reason));
       }
-      TRACKER_DBG("waiting gps fix... elapsed=%lus timeout=%lus reason=%s enabled=%d valid=%d cached=%d sats=%d raw_lat=%ld raw_lon=%ld min=%u age=%lus min_age=%us mode=%s",
+      TRACKER_DBG("waiting gps fix... elapsed=%lus timeout=%lus reason=%s enabled=%d valid=%d cached=%d sats=%d raw_lat=%ld raw_lon=%ld ts=%ld min=%u age=%lus min_age=%us mode=%s",
         (unsigned long)((millis() - _tracking_started_millis) / 1000UL),
         (unsigned long)_gps_timeout_secs,
         reason,
@@ -1345,6 +1357,7 @@ private:
         gps.sats,
         gps.raw_lat,
         gps.raw_lon,
+        gps.timestamp,
         (unsigned)_min_sats,
         (unsigned long)live_age_secs,
         (unsigned)_min_live_fix_age_secs,
