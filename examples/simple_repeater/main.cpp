@@ -154,7 +154,7 @@ void loop() {
 
   if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
 #if defined(NRF52_PLATFORM)
-    board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
+    board.sleep(1800); // Sleep in low power mode; wake periodically or on radio IRQ
 #else
     if (the_mesh.millisHasNowPassed(POWERSAVING_FIRSTSLEEP_SECS * 1000)) { // To check if it is time to sleep
       board.sleep(30); // Sleep. Wake up after a while or when receiving a LoRa packet
