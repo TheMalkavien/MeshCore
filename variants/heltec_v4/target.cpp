@@ -24,14 +24,15 @@ AutoDiscoverRTCClock rtc_clock(fallback_clock);
 #endif
 
 #ifdef DISPLAY_CLASS
-  DISPLAY_CLASS display(NULL);
-  MomentaryButton user_btn(PIN_USER_BTN, 1000, true);
+  DISPLAY_CLASS display(&(board.periph_power));
+  // Heltec V4 user button is active-low on GPIO0; keep an internal pull-up enabled.
+  MomentaryButton user_btn(PIN_USER_BTN, 1000, true, true);
 #endif
 
 bool radio_init() {
   fallback_clock.begin();
   rtc_clock.begin(Wire);
-  
+
 #if defined(P_LORA_SCLK)
   return radio.std_init(&spi);
 #else
@@ -56,6 +57,6 @@ void radio_set_tx_power(int8_t dbm) {
 
 mesh::LocalIdentity radio_new_identity() {
   RadioNoiseListener rng(radio);
-  return mesh::LocalIdentity(&rng);  // create new random identity
+  return mesh::LocalIdentity(&rng);
 }
 
