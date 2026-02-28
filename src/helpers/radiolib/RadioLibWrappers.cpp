@@ -40,6 +40,19 @@ void RadioLibWrapper::begin() {
   _floor_sample_sum = 0;
 }
 
+void RadioLibWrapper::powerOff() {
+  _radio->sleep();
+  // Keep wrapper state coherent so next recv loop re-arms RX after wake.
+  state = STATE_IDLE;
+}
+
+void RadioLibWrapper::wakeFromSleep() {
+  // Bring transceiver back to active state and force RX re-arm on next loop.
+  _radio->standby();
+  _radio->setPacketReceivedAction(setFlag);
+  state = STATE_IDLE;
+}
+
 void RadioLibWrapper::idle() {
   _radio->standby();
   state = STATE_IDLE;   // need another startReceive()
@@ -149,6 +162,11 @@ bool RadioLibWrapper::isSendComplete() {
     return true;
   }
   return false;
+}
+
+bool RadioLibWrapper::isTxPending() const {
+  const uint8_t phase = (state & ~STATE_INT_READY);
+  return (phase == STATE_TX_WAIT) || (phase == STATE_TX_DONE) || ((state & STATE_INT_READY) != 0);
 }
 
 void RadioLibWrapper::onSendFinished() {

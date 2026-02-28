@@ -21,12 +21,14 @@ public:
   RadioLibWrapper(PhysicalLayer& radio, mesh::MainBoard& board) : _radio(&radio), _board(&board) { n_recv = n_sent = 0; }
 
   void begin() override;
-  virtual void powerOff() { _radio->sleep(); }
+  virtual void powerOff();
+  virtual void wakeFromSleep();
   int recvRaw(uint8_t* bytes, int sz) override;
   uint32_t getEstAirtimeFor(int len_bytes) override;
   bool startSendRaw(const uint8_t* bytes, int len) override;
   bool isSendComplete() override;
   void onSendFinished() override;
+  bool isTxPending() const;
   bool isInRecvMode() const override;
   bool isChannelActive();
 

@@ -2,6 +2,8 @@
 #include "NRF52Board.h"
 
 #include <bluefruit.h>
+#include <nrf.h>
+#include <nrf_gpio.h>
 #include <nrf_soc.h>
 
 static BLEDfu bledfu;
@@ -18,13 +20,121 @@ static void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
   MESH_DEBUG_PRINTLN("BLE client disconnected");
 }
 
+#if defined(NRF_RTC2) && defined(RTC2_IRQn)
+namespace {
+volatile bool g_nrf52_sleep_rtc_fired = false;
+bool g_nrf52_sleep_rtc_initialized = false;
+
+bool nrf52_softdevice_enabled() {
+  uint8_t sd_enabled = 0;
+  sd_softdevice_is_enabled(&sd_enabled);
+  return sd_enabled != 0;
+}
+
+void nrf52_sleep_timer_init() {
+  if (g_nrf52_sleep_rtc_initialized) return;
+
+  NRF_RTC2->TASKS_STOP = 1;
+  NRF_RTC2->TASKS_CLEAR = 1;
+  NRF_RTC2->PRESCALER = 32767;  // 32.768 kHz / (32767+1) = 1 Hz
+  NRF_RTC2->EVTENCLR = 0xFFFFFFFF;
+  NRF_RTC2->INTENCLR = 0xFFFFFFFF;
+  NRF_RTC2->EVENTS_COMPARE[0] = 0;
+
+  const uint32_t lowest_irq_prio = ((1UL << __NVIC_PRIO_BITS) - 1UL);
+  if (nrf52_softdevice_enabled()) {
+    (void)sd_nvic_ClearPendingIRQ(RTC2_IRQn);
+    (void)sd_nvic_SetPriority(RTC2_IRQn, lowest_irq_prio);
+    (void)sd_nvic_EnableIRQ(RTC2_IRQn);
+  } else {
+    NVIC_ClearPendingIRQ(RTC2_IRQn);
+    NVIC_SetPriority(RTC2_IRQn, lowest_irq_prio);
+    NVIC_EnableIRQ(RTC2_IRQn);
+  }
+
+  NRF_RTC2->TASKS_START = 1;
+  g_nrf52_sleep_rtc_initialized = true;
+}
+
+void nrf52_sleep_timer_arm(uint32_t secs) {
+  if (secs == 0) return;
+  nrf52_sleep_timer_init();
+
+  uint32_t ticks = secs;
+  if (ticks > (RTC_COUNTER_COUNTER_Msk - 1UL)) ticks = RTC_COUNTER_COUNTER_Msk - 1UL;
+  if (ticks == 0) ticks = 1;  // ensure compare is in the future
+
+  const uint32_t now = (NRF_RTC2->COUNTER & RTC_COUNTER_COUNTER_Msk);
+  const uint32_t target = ((now + ticks) & RTC_COUNTER_COUNTER_Msk);
+
+  g_nrf52_sleep_rtc_fired = false;
+  NRF_RTC2->EVENTS_COMPARE[0] = 0;
+  NRF_RTC2->CC[0] = target;
+  NRF_RTC2->EVTENSET = RTC_EVTENSET_COMPARE0_Msk;
+  NRF_RTC2->INTENSET = RTC_INTENSET_COMPARE0_Msk;
+
+  if (nrf52_softdevice_enabled()) {
+    (void)sd_nvic_ClearPendingIRQ(RTC2_IRQn);
+  } else {
+    NVIC_ClearPendingIRQ(RTC2_IRQn);
+  }
+
+  if (NRF_RTC2->EVENTS_COMPARE[0]) {
+    NRF_RTC2->EVENTS_COMPARE[0] = 0;
+    g_nrf52_sleep_rtc_fired = true;
+  }
+}
+
+void nrf52_sleep_timer_disarm() {
+  if (!g_nrf52_sleep_rtc_initialized) return;
+
+  NRF_RTC2->EVTENCLR = RTC_EVTENCLR_COMPARE0_Msk;
+  NRF_RTC2->INTENCLR = RTC_INTENCLR_COMPARE0_Msk;
+  NRF_RTC2->EVENTS_COMPARE[0] = 0;
+
+  if (nrf52_softdevice_enabled()) {
+    (void)sd_nvic_ClearPendingIRQ(RTC2_IRQn);
+  } else {
+    NVIC_ClearPendingIRQ(RTC2_IRQn);
+  }
+
+  g_nrf52_sleep_rtc_fired = false;
+}
+}  // namespace
+
+extern "C" void RTC2_IRQHandler(void) {
+  if (NRF_RTC2->EVENTS_COMPARE[0]) {
+    NRF_RTC2->EVENTS_COMPARE[0] = 0;
+    g_nrf52_sleep_rtc_fired = true;
+  }
+}
+#endif
+
+#if defined(NRF52_SLEEP_STRICT_WAKE) && defined(NRF52_SLEEP_WAKE_BTN_PIN) && (NRF52_SLEEP_WAKE_BTN_PIN >= 0)
+namespace {
+bool nrf52_sleep_button_pressed() {
+  #if defined(NRF52_SLEEP_WAKE_BTN_ACTIVE)
+    return digitalRead(NRF52_SLEEP_WAKE_BTN_PIN) == NRF52_SLEEP_WAKE_BTN_ACTIVE;
+  #else
+    return digitalRead(NRF52_SLEEP_WAKE_BTN_PIN) == LOW;
+  #endif
+}
+
+void nrf52_sleep_button_prepare() {
+  #if defined(NRF52_SLEEP_WAKE_BTN_ACTIVE) && (NRF52_SLEEP_WAKE_BTN_ACTIVE == HIGH)
+  nrf_gpio_cfg_sense_input(NRF52_SLEEP_WAKE_BTN_PIN, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_SENSE_HIGH);
+  #else
+  nrf_gpio_cfg_sense_input(NRF52_SLEEP_WAKE_BTN_PIN, NRF_GPIO_PIN_PULLUP, NRF_GPIO_PIN_SENSE_LOW);
+  #endif
+}
+}  // namespace
+#endif
+
 void NRF52Board::begin() {
   startup_reason = BD_STARTUP_NORMAL;
 }
 
 #ifdef NRF52_POWER_MANAGEMENT
-#include "nrf.h"
-
 // Power Management global variables
 uint32_t g_nrf52_reset_reason = 0;     // Reset/Startup reason
 uint8_t g_nrf52_shutdown_reason = 0;   // Shutdown reason
@@ -260,21 +370,64 @@ void NRF52Board::sleep(uint32_t secs) {
   NVIC_ClearPendingIRQ(FPU_IRQn);
   #endif
 
-  // On nRF52, we use event-driven sleep instead of timed sleep
-  // The 'secs' parameter is ignored - we wake on any interrupt
+  // nRF52 sleeps in SYSTEM_ON and wakes on any interrupt.
+  // If secs > 0 and RTC2 is available, we also arm a periodic RTC wake-up.
   uint8_t sd_enabled = 0;
   sd_softdevice_is_enabled(&sd_enabled);
 
-  if (sd_enabled) {
-    // first call processes pending softdevice events, second call sleeps.
-    sd_app_evt_wait();
-    sd_app_evt_wait();
-  } else {
-    // softdevice is disabled, use raw WFE
-    __SEV();
-    __WFE();
-    __WFE();
+  uint32_t wake_deadline_ms = 0;
+  if (secs > 0) {
+    uint64_t delta_ms = (uint64_t)secs * 1000ULL;
+    if (delta_ms > 0xFFFFFFFFULL) delta_ms = 0xFFFFFFFFULL;
+    wake_deadline_ms = millis() + (uint32_t)delta_ms;
   }
+
+  #if defined(NRF_RTC2) && defined(RTC2_IRQn)
+  if (secs > 0) nrf52_sleep_timer_arm(secs);
+  #endif
+
+  #if defined(NRF52_SLEEP_STRICT_WAKE)
+    #if defined(NRF52_SLEEP_WAKE_BTN_PIN) && (NRF52_SLEEP_WAKE_BTN_PIN >= 0)
+  nrf52_sleep_button_prepare();
+    #endif
+  for (;;) {
+  #endif
+    if (sd_enabled) {
+      // In strict-wake mode, use a single wait call per loop iteration:
+      // a second immediate wait can re-sleep after a valid timer wake.
+      #if defined(NRF52_SLEEP_STRICT_WAKE)
+      sd_app_evt_wait();
+      #else
+      // first call processes pending softdevice events, second call sleeps.
+      sd_app_evt_wait();
+      sd_app_evt_wait();
+      #endif
+    } else {
+      // softdevice is disabled, use raw WFE
+      __SEV();
+      __WFE();
+      __WFE();
+    }
+  #if defined(NRF52_SLEEP_STRICT_WAKE)
+      bool wake_from_timer = false;
+      bool wake_from_deadline = false;
+      bool wake_from_button = false;
+    #if defined(NRF_RTC2) && defined(RTC2_IRQn)
+      wake_from_timer = (secs > 0) && g_nrf52_sleep_rtc_fired;
+    #endif
+      wake_from_deadline = (secs > 0) && ((int32_t)(millis() - wake_deadline_ms) >= 0);
+    #if defined(NRF52_SLEEP_WAKE_BTN_PIN) && (NRF52_SLEEP_WAKE_BTN_PIN >= 0)
+      wake_from_button = nrf52_sleep_button_pressed();
+    #endif
+      if ((secs == 0) || wake_from_timer || wake_from_deadline || wake_from_button) {
+        break;
+      }
+  }
+  #endif
+
+  #if defined(NRF_RTC2) && defined(RTC2_IRQn)
+  if (secs > 0) nrf52_sleep_timer_disarm();
+  #endif
 }
 
 // Temperature from NRF52 MCU
