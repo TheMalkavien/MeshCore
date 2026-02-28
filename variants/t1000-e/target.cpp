@@ -29,6 +29,36 @@ static bool gps_uart_started = false;
   #define T1000_GPS_BAUD_FALLBACK_SECOND_MS 20000UL
 #endif
 
+#ifndef T1000_GPS_RESET_ON_WAKE
+  // 0 = keep GNSS context for warm/hot resume, 1 = force reset pulse at wake.
+  #define T1000_GPS_RESET_ON_WAKE 0
+#endif
+
+#ifndef T1000_GPS_HOLD_RESET_IN_SLEEP
+  // 0 = keep GNSS out of reset while sleeping (preferred for warm/hot start).
+  // 1 = hold reset asserted during sleep (legacy behaviour, higher TTFF on wake).
+  #define T1000_GPS_HOLD_RESET_IN_SLEEP 0
+#endif
+
+#ifndef T1000_GPS_HOLD_RESETB_LOW_IN_SLEEP
+  // 0 = release RESETB during sleep, 1 = drive RESETB low during sleep (legacy).
+  #define T1000_GPS_HOLD_RESETB_LOW_IN_SLEEP 0
+#endif
+
+#ifndef T1000_GPS_KEEP_MAIN_POWER_IN_SLEEP
+  // 1 = keep GPS_EN asserted in sleep_gps() to favor hot resume (higher idle current).
+  // 0 = cut GPS_EN in sleep_gps() for lower power (typically longer TTFF on wake).
+  #define T1000_GPS_KEEP_MAIN_POWER_IN_SLEEP 1
+#endif
+
+#ifndef T1000_GPS_SLEEP_INT_WAKE_LEVEL
+  #define T1000_GPS_SLEEP_INT_WAKE_LEVEL HIGH
+#endif
+
+#ifndef T1000_GPS_SLEEP_INT_SLEEP_LEVEL
+  #define T1000_GPS_SLEEP_INT_SLEEP_LEVEL LOW
+#endif
+
 #if T1000_GPS_BAUD_FALLBACK == 1
 static uint8_t gps_baud_phase = 0; // 0=115200, 1=9600 fallback
 #endif
@@ -43,6 +73,12 @@ static void gps_uart_begin(uint32_t baud) {
   }
   Serial1.begin(baud);
   gps_uart_started = true;
+}
+
+static void gps_uart_drain_rx() {
+  while (Serial1.available() > 0) {
+    Serial1.read();
+  }
 }
 
 #ifdef DISPLAY_CLASS
@@ -137,6 +173,9 @@ void T1000SensorManager::start_gps() {
   gps_baud_phase = 0;
 #endif
   gps_uart_begin(115200);
+  gps_uart_drain_rx();
+  // Drop any previously parsed fix so wake cycles require fresh GNSS sentences.
+  _nmea->syncTime();
   //_nmea->begin();
   // this init sequence should be better 
   // comes from seeed examples and deals with all gps pins
@@ -148,12 +187,16 @@ void T1000SensorManager::start_gps() {
   delay(10);
        
   pinMode(GPS_RESET, OUTPUT);
+#if T1000_GPS_RESET_ON_WAKE == 1
   digitalWrite(GPS_RESET, HIGH);
   delay(10);
   digitalWrite(GPS_RESET, LOW);
+#else
+  digitalWrite(GPS_RESET, LOW);
+#endif
        
   pinMode(GPS_SLEEP_INT, OUTPUT);
-  digitalWrite(GPS_SLEEP_INT, HIGH);
+  digitalWrite(GPS_SLEEP_INT, T1000_GPS_SLEEP_INT_WAKE_LEVEL);
   pinMode(GPS_RTC_INT, OUTPUT);
   digitalWrite(GPS_RTC_INT, LOW);
   pinMode(GPS_RESETB, INPUT_PULLUP);
@@ -164,13 +207,27 @@ void T1000SensorManager::sleep_gps() {
     return;
   }
   gps_active = false;
+  gps_bytes_seen = 0;
+  _nmea->syncTime();
   digitalWrite(GPS_VRTC_EN, HIGH);
+#if T1000_GPS_KEEP_MAIN_POWER_IN_SLEEP == 1
+  digitalWrite(GPS_EN, HIGH);
+#else
   digitalWrite(GPS_EN, LOW);
+#endif
+#if T1000_GPS_HOLD_RESET_IN_SLEEP == 1
   digitalWrite(GPS_RESET, HIGH);
-  digitalWrite(GPS_SLEEP_INT, HIGH);
+#else
+  digitalWrite(GPS_RESET, LOW);
+#endif
+  digitalWrite(GPS_SLEEP_INT, T1000_GPS_SLEEP_INT_SLEEP_LEVEL);
   digitalWrite(GPS_RTC_INT, LOW);
+#if T1000_GPS_HOLD_RESETB_LOW_IN_SLEEP == 1
   pinMode(GPS_RESETB, OUTPUT);
   digitalWrite(GPS_RESETB, LOW);
+#else
+  pinMode(GPS_RESETB, INPUT_PULLUP);
+#endif
   //_nmea->stop();
 }
 
@@ -179,6 +236,8 @@ void T1000SensorManager::stop_gps() {
     return;
   }
   gps_active = false;
+  gps_bytes_seen = 0;
+  _nmea->syncTime();
   digitalWrite(GPS_VRTC_EN, LOW);
   digitalWrite(GPS_EN, LOW);
   digitalWrite(GPS_RESET, HIGH);
@@ -226,23 +285,33 @@ void T1000SensorManager::loop() {
     if (gps_baud_phase == 0 && elapsed > T1000_GPS_BAUD_FALLBACK_FIRST_MS) {
       gps_baud_phase = 1;
       gps_powered_at = millis();
+      gps_bytes_seen = 0;
       gps_uart_begin(9600);
+      gps_uart_drain_rx();
+      _nmea->syncTime();
+#if T1000_GPS_RESET_ON_WAKE == 1
       digitalWrite(GPS_RESET, HIGH);
       delay(10);
       digitalWrite(GPS_RESET, LOW);
+#endif
     } else if (gps_baud_phase == 1 && elapsed > T1000_GPS_BAUD_FALLBACK_SECOND_MS) {
       gps_baud_phase = 0;
       gps_powered_at = millis();
+      gps_bytes_seen = 0;
       gps_uart_begin(115200);
+      gps_uart_drain_rx();
+      _nmea->syncTime();
+#if T1000_GPS_RESET_ON_WAKE == 1
       digitalWrite(GPS_RESET, HIGH);
       delay(10);
       digitalWrite(GPS_RESET, LOW);
+#endif
     }
   }
   #endif
 
   if (millis() > next_gps_update) {
-    if (gps_active && _nmea->isValid()) {
+    if (gps_active && gps_bytes_seen > 0 && _nmea->isValid()) {
       node_lat = ((double)_nmea->getLatitude())/1000000.;
       node_lon = ((double)_nmea->getLongitude())/1000000.;
       node_altitude = ((double)_nmea->getAltitude()) / 1000.0;
