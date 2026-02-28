@@ -6,6 +6,7 @@
 #include <driver/rtc_io.h>
 
 class HeltecV4Board : public ESP32Board {
+  void configureLowPowerPins();
 
 public:
   RefCountedDigitalPin periph_power;

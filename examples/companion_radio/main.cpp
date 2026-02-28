@@ -8,6 +8,11 @@
   #if defined(ESP_PLATFORM)
     #include <esp_sleep.h>
     #include <driver/rtc_io.h>
+    #if defined(CONFIG_IDF_TARGET_ESP32S3)
+      #include <soc/soc.h>
+      #include <soc/usb_serial_jtag_reg.h>
+      #include <soc/rtc_cntl_reg.h>
+    #endif
     #if defined(CONFIG_PM_ENABLE)
       #include <esp_pm.h>
     #endif
@@ -138,6 +143,18 @@ static void configureESP32PowerManagement() {
 }
 #endif
 
+#if defined(ESP32) && defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32S3)
+static void disableESP32S3USBSerialJTAG() {
+#if defined(DISABLE_SERIAL_CONSOLE)
+  // Hard-disconnect USB Serial/JTAG from D+/D- so host COM port disappears at runtime.
+  CLEAR_PERI_REG_MASK(USB_SERIAL_JTAG_CONF0_REG, USB_SERIAL_JTAG_DP_PULLUP);
+  CLEAR_PERI_REG_MASK(USB_SERIAL_JTAG_CONF0_REG, USB_SERIAL_JTAG_USB_PAD_ENABLE);
+  SET_PERI_REG_MASK(RTC_CNTL_USB_CONF_REG, RTC_CNTL_USB_PAD_ENABLE_OVERRIDE);
+  CLEAR_PERI_REG_MASK(RTC_CNTL_USB_CONF_REG, RTC_CNTL_USB_PAD_ENABLE);
+#endif
+}
+#endif
+
 #if defined(ESP32) && defined(ESP_PLATFORM)
 static bool tryManualLightSleep(uint32_t sleep_ms) {
 #if defined(P_LORA_DIO_1)
@@ -177,7 +194,13 @@ static bool tryManualLightSleep(uint32_t sleep_ms) {
 #endif
 
 void setup() {
+#if defined(ESP32) && defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32S3)
+  disableESP32S3USBSerialJTAG();
+#endif
+
+#ifndef DISABLE_SERIAL_CONSOLE
   Serial.begin(115200);
+#endif
 
   board.begin();
 

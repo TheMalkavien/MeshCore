@@ -25,7 +25,8 @@ AutoDiscoverRTCClock rtc_clock(fallback_clock);
 
 #ifdef DISPLAY_CLASS
   DISPLAY_CLASS display(&(board.periph_power));
-  MomentaryButton user_btn(PIN_USER_BTN, 1000, true);
+  // Heltec V4 user button is active-low on GPIO0; keep an internal pull-up enabled.
+  MomentaryButton user_btn(PIN_USER_BTN, 1000, true, true);
 #endif
 
 bool radio_init() {
