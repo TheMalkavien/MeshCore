@@ -57,6 +57,16 @@ extern uint32_t t1000e_get_light(void);
   #define TRACKER_DEFAULT_SLEEP_ENABLED 0
 #endif
 
+#ifndef TRACKER_SLEEP_RADIO_POWEROFF
+  #if defined(T1000_E)
+    // T1000-E: LR1110 deep sleep can interact badly with GNSS behaviour on some units.
+    // Keep radio awake by default during SYSTEM_ON sleep windows unless explicitly enabled.
+    #define TRACKER_SLEEP_RADIO_POWEROFF 0
+  #else
+    #define TRACKER_SLEEP_RADIO_POWEROFF 1
+  #endif
+#endif
+
 #ifndef TRACKER_BOOT_GRACE_SECS
   #define TRACKER_BOOT_GRACE_SECS 3
 #endif
@@ -165,6 +175,25 @@ static void enterBoardDeepSleep(mesh::MainBoard& b, uint32_t secs, ...) {
 
 static void enterTimerOnlyDeepSleep(uint32_t secs) {
   enterBoardDeepSleep(board, secs, 0);
+}
+
+template <typename T>
+static auto trackerRadioTxPending(T& radio, int) -> decltype(radio.isTxPending(), bool()) {
+  return radio.isTxPending();
+}
+
+template <typename T>
+static bool trackerRadioTxPending(T&, long) {
+  return false;
+}
+
+template <typename T>
+static auto trackerRadioWakeFromSleep(T& radio, int) -> decltype(radio.wakeFromSleep(), void()) {
+  radio.wakeFromSleep();
+}
+
+template <typename T>
+static void trackerRadioWakeFromSleep(T&, long) {
 }
 
 static unsigned long tracker_tx_led_until = 0;
@@ -416,13 +445,48 @@ public:
 #if defined(NRF52_PLATFORM)
     // nRF52 light sleep mode: keep running state (including GPS backup-assisted flow)
     // while idling between tracker cycles.
+    int32_t remaining_ms_i32 = _next_measure_millis ? (int32_t)(_next_measure_millis - millis()) : 0;
+    bool cycle_due_or_late = (_next_measure_millis == 0) || (remaining_ms_i32 <= 0);
+    const char* gps_state = sensors.getSettingByKey("gps");
+    bool gps_enabled_now = (gps_state != NULL && gps_state[0] == '1');
+    bool tx_led_active = (tracker_tx_led_until != 0) && ((int32_t)(millis() - tracker_tx_led_until) < 0);
+    uint32_t pending_tx = _mgr->getOutboundCount(0xFFFFFFFF);
+    bool radio_tx_active = trackerRadioTxPending(radio_driver, 0);
     if (_sleep_enabled &&
         !_tracking_in_progress &&
         !_sleep_waiting_for_queue_drain &&
         _next_measure_millis &&
-        !millisHasNowPassed(_next_measure_millis)) {
-      board.sleep(0);
-      return;
+        pending_tx == 0 &&
+        !radio_tx_active &&
+        !gps_enabled_now &&
+        !tx_led_active &&
+        !cycle_due_or_late) {
+      uint32_t remaining_ms = (uint32_t)remaining_ms_i32;
+      // RTC sleep timer resolution is 1 second on nRF52.
+      // For sub-second leftovers, avoid repeated immediate wake/re-sleep churn.
+      if (remaining_ms >= 1200UL && !trackerPowerButtonPressed()) {
+        uint32_t sleep_secs = (remaining_ms + 999UL) / 1000UL;  // ceil to next second
+        if (sleep_secs == 0) sleep_secs = 1;
+        bool log_idle_sleep = (sleep_secs >= 2);
+        if (log_idle_sleep) {
+          TRACKER_DBG("idle sleep: remaining=%lums sleep=%lus", (unsigned long)remaining_ms, (unsigned long)sleep_secs);
+        }
+        // Keep LED off while sleeping to avoid persistent glow if a pulse was active.
+        tracker_tx_led_until = 0;
+        trackerSetStatusLed(false);
+        // Reduce SYSTEM_ON idle draw: optionally keep LoRa transceiver in sleep while tracker waits.
+        #if TRACKER_SLEEP_RADIO_POWEROFF == 1
+        radio_driver.powerOff();
+        #endif
+        board.sleep(sleep_secs);
+        #if TRACKER_SLEEP_RADIO_POWEROFF == 1
+        trackerRadioWakeFromSleep(radio_driver, 0);
+        #endif
+        if (log_idle_sleep) {
+          TRACKER_DBG("idle wake");
+        }
+        return;
+      }
     }
 #endif
 
@@ -1247,7 +1311,7 @@ private:
   void startTrackingCycle() {
     _tracking_in_progress = true;
     _tracking_started_millis = millis();
-    _last_wait_log_millis = 0;
+    _last_wait_log_millis = _tracking_started_millis;
     TRACKER_DBG("tracking cycle started");
 #if ENV_INCLUDE_GPS == 1
     sensors.setSettingValue("gps", "1");
@@ -1328,7 +1392,7 @@ private:
     }
 
     const unsigned long timeout_millis = _gps_timeout_secs * 1000UL;
-    if (_last_wait_log_millis == 0 || millisHasNowPassed(_last_wait_log_millis + 5000UL)) {
+    if (_last_wait_log_millis == 0 || (uint32_t)(millis() - _last_wait_log_millis) >= 5000UL) {
       _last_wait_log_millis = millis();
       char reason[64];
       reason[0] = 0;
@@ -1366,6 +1430,7 @@ private:
     if (millisHasNowPassed(_tracking_started_millis + timeout_millis)) {
       sendTrackerEventJson("timeout", "no_qualified_fix");
       completeTrackingCycle();
+      return;
     }
 #else
     sendTrackerEventJson("gps_unavailable", "build_without_gps");

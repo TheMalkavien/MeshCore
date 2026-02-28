@@ -15,8 +15,23 @@ T1000SensorManager sensors = T1000SensorManager(nmea);
 
 static uint32_t gps_powered_at = 0;
 static uint32_t gps_bytes_seen = 0;
-static uint8_t gps_baud_phase = 0; // 0=115200, 1=9600 fallback
 static bool gps_uart_started = false;
+
+#ifndef T1000_GPS_BAUD_FALLBACK
+  #define T1000_GPS_BAUD_FALLBACK 0
+#endif
+
+#ifndef T1000_GPS_BAUD_FALLBACK_FIRST_MS
+  #define T1000_GPS_BAUD_FALLBACK_FIRST_MS 15000UL
+#endif
+
+#ifndef T1000_GPS_BAUD_FALLBACK_SECOND_MS
+  #define T1000_GPS_BAUD_FALLBACK_SECOND_MS 20000UL
+#endif
+
+#if T1000_GPS_BAUD_FALLBACK == 1
+static uint8_t gps_baud_phase = 0; // 0=115200, 1=9600 fallback
+#endif
 
 static void gps_uart_begin(uint32_t baud) {
 #if defined(NRF52_PLATFORM) && defined(GPS_RX_PIN) && defined(GPS_TX_PIN)
@@ -118,7 +133,9 @@ void T1000SensorManager::start_gps() {
   gps_active = true;
   gps_powered_at = millis();
   gps_bytes_seen = 0;
+#if T1000_GPS_BAUD_FALLBACK == 1
   gps_baud_phase = 0;
+#endif
   gps_uart_begin(115200);
   //_nmea->begin();
   // this init sequence should be better 
@@ -201,18 +218,19 @@ void T1000SensorManager::loop() {
 
   _nmea->loop();
 
-  // Some T1000-E units may retain a different GNSS UART baud.
-  // If no NMEA bytes arrive, try a 9600 fallback then restore 115200.
+  #if T1000_GPS_BAUD_FALLBACK == 1
+  // Optional fallback for units configured with non-default GNSS UART baud.
+  // Disabled by default because it resets GNSS during startup and can increase TTFF.
   if (gps_active && gps_bytes_seen == 0) {
     uint32_t elapsed = (uint32_t)(millis() - gps_powered_at);
-    if (gps_baud_phase == 0 && elapsed > 15000UL) {
+    if (gps_baud_phase == 0 && elapsed > T1000_GPS_BAUD_FALLBACK_FIRST_MS) {
       gps_baud_phase = 1;
       gps_powered_at = millis();
       gps_uart_begin(9600);
       digitalWrite(GPS_RESET, HIGH);
       delay(10);
       digitalWrite(GPS_RESET, LOW);
-    } else if (gps_baud_phase == 1 && elapsed > 20000UL) {
+    } else if (gps_baud_phase == 1 && elapsed > T1000_GPS_BAUD_FALLBACK_SECOND_MS) {
       gps_baud_phase = 0;
       gps_powered_at = millis();
       gps_uart_begin(115200);
@@ -221,6 +239,7 @@ void T1000SensorManager::loop() {
       digitalWrite(GPS_RESET, LOW);
     }
   }
+  #endif
 
   if (millis() > next_gps_update) {
     if (gps_active && _nmea->isValid()) {
