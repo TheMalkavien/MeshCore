@@ -4,12 +4,14 @@
 #include <helpers/RefCountedDigitalPin.h>
 #include <helpers/ESP32Board.h>
 #include "LoRaFEMControl.h"
+#include <driver/rtc_io.h>
 
 #ifndef ADC_MULTIPLIER
   #define ADC_MULTIPLIER 5.42
 #endif
 
 class HeltecV4Board : public ESP32Board {
+  void configureLowPowerPins();
 
 protected:
   float adc_mult = ADC_MULTIPLIER;
@@ -17,7 +19,7 @@ protected:
 public:
   RefCountedDigitalPin periph_power;
   LoRaFEMControl loRaFEMControl;
-  HeltecV4Board() : periph_power(PIN_VEXT_EN,PIN_VEXT_EN_ACTIVE) { }
+  HeltecV4Board() : periph_power(PIN_VEXT_EN, PIN_VEXT_EN_ACTIVE) { }
 
   void begin();
   void onBeforeTransmit(void) override;
