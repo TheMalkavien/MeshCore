@@ -20,6 +20,58 @@ class HeltecV3Board : public ESP32Board {
 private:
   bool adc_active_state;
 
+  static inline void biasInputPin(int pin, uint8_t mode) {
+    if (pin < 0) return;
+    pinMode((uint8_t)pin, mode);
+  }
+
+  void configureLowPowerPins() {
+#if defined(PIN_USER_BTN)
+    // Heltec V3 user button is active-low on GPIO0.
+    biasInputPin(PIN_USER_BTN, INPUT_PULLUP);
+#endif
+
+    // Optional user-defined unused GPIO list (bias to GND).
+#ifdef LOW_POWER_UNUSED_GPIO_1
+    biasInputPin(LOW_POWER_UNUSED_GPIO_1, INPUT_PULLDOWN);
+#endif
+#ifdef LOW_POWER_UNUSED_GPIO_2
+    biasInputPin(LOW_POWER_UNUSED_GPIO_2, INPUT_PULLDOWN);
+#endif
+#ifdef LOW_POWER_UNUSED_GPIO_3
+    biasInputPin(LOW_POWER_UNUSED_GPIO_3, INPUT_PULLDOWN);
+#endif
+#ifdef LOW_POWER_UNUSED_GPIO_4
+    biasInputPin(LOW_POWER_UNUSED_GPIO_4, INPUT_PULLDOWN);
+#endif
+#ifdef LOW_POWER_UNUSED_GPIO_5
+    biasInputPin(LOW_POWER_UNUSED_GPIO_5, INPUT_PULLDOWN);
+#endif
+#ifdef LOW_POWER_UNUSED_GPIO_6
+    biasInputPin(LOW_POWER_UNUSED_GPIO_6, INPUT_PULLDOWN);
+#endif
+#ifdef LOW_POWER_UNUSED_GPIO_7
+    biasInputPin(LOW_POWER_UNUSED_GPIO_7, INPUT_PULLDOWN);
+#endif
+#ifdef LOW_POWER_UNUSED_GPIO_8
+    biasInputPin(LOW_POWER_UNUSED_GPIO_8, INPUT_PULLDOWN);
+#endif
+
+    // Optional user-defined GPIOs that should be biased to VCC.
+#ifdef LOW_POWER_UNUSED_PULLUP_GPIO_1
+    biasInputPin(LOW_POWER_UNUSED_PULLUP_GPIO_1, INPUT_PULLUP);
+#endif
+#ifdef LOW_POWER_UNUSED_PULLUP_GPIO_2
+    biasInputPin(LOW_POWER_UNUSED_PULLUP_GPIO_2, INPUT_PULLUP);
+#endif
+#ifdef LOW_POWER_UNUSED_PULLUP_GPIO_3
+    biasInputPin(LOW_POWER_UNUSED_PULLUP_GPIO_3, INPUT_PULLUP);
+#endif
+#ifdef LOW_POWER_UNUSED_PULLUP_GPIO_4
+    biasInputPin(LOW_POWER_UNUSED_PULLUP_GPIO_4, INPUT_PULLUP);
+#endif
+  }
+
 public:
   RefCountedDigitalPin periph_power;
 
@@ -36,6 +88,7 @@ public:
     digitalWrite(PIN_ADC_CTRL, !adc_active_state); // Initially inactive
 
     periph_power.begin();
+    configureLowPowerPins();
 
     esp_reset_reason_t reason = esp_reset_reason();
     if (reason == ESP_RST_DEEPSLEEP) {
