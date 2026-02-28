@@ -482,6 +482,7 @@ public:
         #if TRACKER_SLEEP_RADIO_POWEROFF == 1
         trackerRadioWakeFromSleep(radio_driver, 0);
         #endif
+        queueImmediateCycle("idle-wake");
         if (log_idle_sleep) {
           TRACKER_DBG("idle wake");
         }
@@ -708,6 +709,10 @@ private:
   FILESYSTEM* _cfg_fs = NULL;
   unsigned long _live_fix_since_millis = 0;
   bool _last_live_fix_state = false;
+  bool _cycle_has_gps_snapshot = false;
+  long _cycle_start_gps_ts = LONG_MIN;
+  long _cycle_start_raw_lat = LONG_MIN;
+  long _cycle_start_raw_lon = LONG_MIN;
 
   struct GPSState {
     LocationProvider* location = NULL;
@@ -1314,6 +1319,11 @@ private:
     _last_wait_log_millis = _tracking_started_millis;
     TRACKER_DBG("tracking cycle started");
 #if ENV_INCLUDE_GPS == 1
+    GPSState before_enable = getGPSState();
+    _cycle_has_gps_snapshot = before_enable.has_provider;
+    _cycle_start_gps_ts = before_enable.timestamp;
+    _cycle_start_raw_lat = before_enable.raw_lat;
+    _cycle_start_raw_lon = before_enable.raw_lon;
     sensors.setSettingValue("gps", "1");
     TRACKER_DBG("gps enabled request sent");
 #endif
@@ -1326,6 +1336,10 @@ private:
       TRACKER_DBG("gps disabled for sleep");
     }
 #endif
+    _cycle_has_gps_snapshot = false;
+    _cycle_start_gps_ts = LONG_MIN;
+    _cycle_start_raw_lat = LONG_MIN;
+    _cycle_start_raw_lon = LONG_MIN;
     _tracking_in_progress = false;
     TRACKER_DBG("tracking cycle complete");
     scheduleNextCycle();
@@ -1337,12 +1351,19 @@ private:
     bool gps_live_fix = gps.valid;
     bool live_coords_ok = !(gps.raw_lat == 0 && gps.raw_lon == 0);
     bool gps_live_with_coords = gps_live_fix && live_coords_ok;
+    bool gps_fresh_for_cycle = true;
+    if (_cycle_has_gps_snapshot) {
+      gps_fresh_for_cycle =
+        (gps.timestamp != _cycle_start_gps_ts) ||
+        (gps.raw_lat != _cycle_start_raw_lat) ||
+        (gps.raw_lon != _cycle_start_raw_lon);
+    }
     updateLiveFixState(gps_live_with_coords);
     uint32_t live_age_secs = getLiveFixAgeSecs();
     bool sats_ok = (_min_sats == 0) || (gps_live_with_coords && gps.sats >= (int)_min_sats);
     bool age_ok = (_min_live_fix_age_secs == 0) || (gps_live_with_coords && live_age_secs >= _min_live_fix_age_secs);
     bool gps_cached_fix = (!_require_live_fix) && hasStoredPosition();
-    bool gps_live_accepted = gps_live_with_coords && (sats_ok || age_ok);
+    bool gps_live_accepted = gps_live_with_coords && gps_fresh_for_cycle && (sats_ok || age_ok);
     if (gps_live_accepted || gps_cached_fix) {
       uint32_t fix_elapsed_s = (uint32_t)((millis() - _tracking_started_millis) / 1000UL);
       float lat = gps_live_accepted ? ((float)gps.raw_lat / 1000000.0f) : sensors.node_lat;
@@ -1404,6 +1425,8 @@ private:
         StrHelper::strncpy(reason, "no-fix", sizeof(reason));
       } else if (!live_coords_ok) {
         StrHelper::strncpy(reason, "zero-coords", sizeof(reason));
+      } else if (!gps_fresh_for_cycle) {
+        StrHelper::strncpy(reason, "stale-cycle-fix", sizeof(reason));
       } else if (!sats_ok) {
         StrHelper::strncpy(reason, "low-sats", sizeof(reason));
       } else if (!age_ok) {
@@ -1411,17 +1434,19 @@ private:
       } else {
         StrHelper::strncpy(reason, "unknown", sizeof(reason));
       }
-      TRACKER_DBG("waiting gps fix... elapsed=%lus timeout=%lus reason=%s enabled=%d valid=%d cached=%d sats=%d raw_lat=%ld raw_lon=%ld ts=%ld min=%u age=%lus min_age=%us mode=%s",
+      TRACKER_DBG("waiting gps fix... elapsed=%lus timeout=%lus reason=%s enabled=%d valid=%d fresh=%d cached=%d sats=%d raw_lat=%ld raw_lon=%ld ts=%ld start_ts=%ld min=%u age=%lus min_age=%us mode=%s",
         (unsigned long)((millis() - _tracking_started_millis) / 1000UL),
         (unsigned long)_gps_timeout_secs,
         reason,
         gps.enabled ? 1 : 0,
         gps_live_fix ? 1 : 0,
+        gps_fresh_for_cycle ? 1 : 0,
         hasStoredPosition() ? 1 : 0,
         gps.sats,
         gps.raw_lat,
         gps.raw_lon,
         gps.timestamp,
+        _cycle_start_gps_ts,
         (unsigned)_min_sats,
         (unsigned long)live_age_secs,
         (unsigned)_min_live_fix_age_secs,
