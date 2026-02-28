@@ -95,7 +95,9 @@
 #define FLOOD_SEND_TIMEOUT_FACTOR       16.0f
 #define DIRECT_SEND_PERHOP_FACTOR       6.0f
 #define DIRECT_SEND_PERHOP_EXTRA_MILLIS 250
-#define LAZY_CONTACTS_WRITE_DELAY       5000
+#ifndef LAZY_CONTACTS_WRITE_DELAY
+  #define LAZY_CONTACTS_WRITE_DELAY       5000
+#endif
 
 #define PUBLIC_GROUP_PSK                "izOH6cXN6mrJ5e26oRXNcg=="
 
@@ -2006,7 +2008,8 @@ bool MyMesh::hasPendingWork() const {
   if (_mgr->getOutboundCount(0xFFFFFFFF) > 0) return true;
   if (_iter_started || _cli_rescue) return true;
   if (offline_queue_len > 0) return true;
-  if (dirty_contacts_expiry) return true;
+  // A deferred contacts save does not require "busy" pacing; allow idle/sleep
+  // between checks and commit only when the deadline is reached in loop().
   if (pending_login || pending_status || pending_telemetry || pending_discovery || pending_req) return true;
   if (_serial && _serial->isWriteBusy()) return true;
   return false;

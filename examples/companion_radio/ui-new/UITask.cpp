@@ -402,7 +402,7 @@ public:
         display.drawTextCentered(display.width() / 2, 64 - 11, "hibernate:" PRESS_LABEL);
       }
     }
-    return 15000;   // next render after 5000 ms
+    return 15000;   // next render after 15000 ms
   }
 
   bool handleInput(char c) override {

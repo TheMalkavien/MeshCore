@@ -1,4 +1,15 @@
 #include "SSD1306Display.h"
+#if defined(ESP_PLATFORM) && defined(CONFIG_PM_SLP_DISABLE_GPIO)
+  #include <driver/gpio.h>
+#endif
+
+#if defined(ESP_PLATFORM) && defined(CONFIG_PM_SLP_DISABLE_GPIO)
+static inline void keepPinActiveDuringSleep(int pin) {
+  if (pin >= 0) {
+    gpio_sleep_sel_dis((gpio_num_t)pin);
+  }
+}
+#endif
 
 bool SSD1306Display::i2c_probe(TwoWire& wire, uint8_t addr) {
   wire.beginTransmission(addr);
@@ -11,10 +22,31 @@ bool SSD1306Display::begin() {
     if (_peripher_power) _peripher_power->claim();
     _isOn = true;
   }
+#if defined(ESP_PLATFORM) && defined(CONFIG_PM_SLP_DISABLE_GPIO)
+  // Keep OLED control pins valid while ESP32 auto light-sleep is active.
+  // Without this, RESET can float and blank the panel after boot.
+  #if PIN_OLED_RESET >= 0
+    keepPinActiveDuringSleep(PIN_OLED_RESET);
+  #endif
+  #if defined(PIN_BOARD_SDA) && (PIN_BOARD_SDA >= 0)
+    keepPinActiveDuringSleep(PIN_BOARD_SDA);
+  #endif
+  #if defined(PIN_BOARD_SCL) && (PIN_BOARD_SCL >= 0)
+    keepPinActiveDuringSleep(PIN_BOARD_SCL);
+  #endif
+#endif
   #ifdef DISPLAY_ROTATION
   display.setRotation(DISPLAY_ROTATION);
   #endif
-  return display.begin(SSD1306_SWITCHCAPVCC, DISPLAY_ADDRESS, true, false) && i2c_probe(Wire, DISPLAY_ADDRESS);
+  const bool ok = display.begin(SSD1306_SWITCHCAPVCC, DISPLAY_ADDRESS, true, false) && i2c_probe(Wire, DISPLAY_ADDRESS);
+#ifdef OLED_CONTRAST
+  if (ok) {
+    // Lower panel current while keeping readable UI.
+    display.ssd1306_command(SSD1306_SETCONTRAST);
+    display.ssd1306_command((uint8_t)OLED_CONTRAST);
+  }
+#endif
+  return ok;
 }
 
 void SSD1306Display::turnOn() {
@@ -23,6 +55,11 @@ void SSD1306Display::turnOn() {
     _isOn = true;  // set before begin() to prevent double claim
     if (_peripher_power) begin();  // re-init display after power was cut
   }
+#if defined(ESP_PLATFORM) && defined(CONFIG_PM_SLP_DISABLE_GPIO)
+  #if PIN_OLED_RESET >= 0
+    keepPinActiveDuringSleep(PIN_OLED_RESET);
+  #endif
+#endif
   display.ssd1306_command(SSD1306_DISPLAYON);
 }
 
