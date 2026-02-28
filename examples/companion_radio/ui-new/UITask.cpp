@@ -23,6 +23,14 @@
   #define UI_RECENT_LIST_SIZE 4
 #endif
 
+#ifndef UI_SENSORS_REFRESH_MILLIS
+  #define UI_SENSORS_REFRESH_MILLIS 5000
+#endif
+
+#ifndef UI_MSG_PREVIEW_REFRESH_MILLIS
+  #define UI_MSG_PREVIEW_REFRESH_MILLIS 3000
+#endif
+
 #if UI_HAS_JOYSTICK
   #define PRESS_LABEL "press Enter"
 #else
@@ -161,7 +169,7 @@ class HomeScreen : public UIScreen {
       }
       sensors_scroll = sensors_nb > UI_RECENT_LIST_SIZE;
 #if AUTO_OFF_MILLIS > 0
-      next_sensors_refresh = millis() + 5000; // refresh sensor values every 5 sec
+      next_sensors_refresh = millis() + UI_SENSORS_REFRESH_MILLIS;
 #else
       next_sensors_refresh = millis() + 60000; // refresh sensor values every 1 min
 #endif
@@ -524,7 +532,7 @@ public:
 #if AUTO_OFF_MILLIS==0 // probably e-ink
     return 10000; // 10 s
 #else
-    return 3000;  // next render after 3000 ms
+    return UI_MSG_PREVIEW_REFRESH_MILLIS;
 #endif
   }
 

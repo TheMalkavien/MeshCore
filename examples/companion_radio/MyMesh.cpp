@@ -469,6 +469,7 @@ bool MyMesh::filterRecvFloodPacket(mesh::Packet* packet) {
 }
 
 bool MyMesh::allowPacketForward(const mesh::Packet* packet) {
+  (void)packet;
   return _prefs.client_repeat != 0;
 }
 

@@ -9,6 +9,10 @@
   #define TXT_ACK_DELAY     200
 #endif
 
+#ifndef PATH_RETURN_RETRY_DELAY_MS
+  #define PATH_RETURN_RETRY_DELAY_MS 3000
+#endif
+
 void BaseChatMesh::sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis) {
   sendFlood(pkt, delay_millis);
 }
@@ -328,7 +332,13 @@ void BaseChatMesh::handleReturnPathRetry(const ContactInfo& contact, const uint8
   // NOTE: simplest impl is just to re-send a reciprocal return path to sender (DIRECTLY)
   //        override this method in various firmwares, if there's a better strategy
   mesh::Packet* rpath = createPathReturn(contact.id, contact.getSharedSecret(self_id), path, path_len, 0, NULL, 0);
-  if (rpath) sendDirect(rpath, contact.out_path, contact.out_path_len, 3000);   // 3 second delay
+  if (rpath) {
+#if PATH_RETURN_RETRY_DELAY_MS > 0
+    sendDirect(rpath, contact.out_path, contact.out_path_len, PATH_RETURN_RETRY_DELAY_MS);
+#else
+    releasePacket(rpath); // low-power profile: skip deferred return-path retry traffic
+#endif
+  }
 }
 
 #ifdef MAX_GROUP_CHANNELS
