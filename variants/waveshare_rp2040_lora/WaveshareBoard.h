@@ -28,7 +28,8 @@
 class WaveshareBoard : public mesh::MainBoard {
 protected:
   uint8_t startup_reason;
-  float adc_mult = ADC_MULTIPLIER;  RP2040OTAController ota;
+  float adc_mult = ADC_MULTIPLIER;
+  RP2040OTAController ota;
 
 public:
   void begin();
@@ -83,6 +84,10 @@ public:
   void reboot() override { rp2040.reboot(); }
 
   bool startOTAUpdate(const char *id, char reply[]) override;
+  bool handleOTACommand(const char *command, char reply[]) override { return ota.handleCommand(command, reply); }
+  bool handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) override {
+    return ota.handleBinaryCommand(opcode, payload, payload_len, reply);
+  }
 };
 
 #ifdef MLK_RP2040_LOWPOWER
