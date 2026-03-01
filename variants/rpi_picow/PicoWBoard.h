@@ -2,6 +2,7 @@
 
 #include <MeshCore.h>
 #include <Arduino.h>
+#include <helpers/RP2040OTA.h>
 
 // built-ins
 #define  PIN_VBAT_READ    26
@@ -11,6 +12,7 @@
 class PicoWBoard : public mesh::MainBoard {
 protected:
   uint8_t startup_reason;
+  RP2040OTAController ota;
 
 public:
   void begin();
@@ -48,4 +50,5 @@ public:
   }
 
   bool startOTAUpdate(const char* id, char reply[]) override;
+  bool handleOTACommand(const char *command, char reply[]) override { return ota.handleCommand(command, reply); }
 };
