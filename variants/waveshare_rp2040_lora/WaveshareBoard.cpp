@@ -103,7 +103,6 @@ bool WaveshareBoard::startOTAUpdate(const char *id, char reply[]) {
     sprintf(reply, "Waking UP ESP32Flasher to flash the firmware.");
   return true;
   #else
-    sprintf(reply, "OTA update not supported on this board");
-    return false;
+    return ota.startSession(id, reply);
   #endif
 }
