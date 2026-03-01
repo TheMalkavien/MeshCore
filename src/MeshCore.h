@@ -58,6 +58,7 @@ public:
   virtual bool getBootloaderVersion(char* version, size_t max_len) { return false; }
   virtual bool startOTAUpdate(const char* id, char reply[]) { return false; }   // not supported
   virtual bool handleOTACommand(const char* command, char reply[]) { return false; }
+  virtual bool handleOTABinaryCommand(uint8_t opcode, const uint8_t* payload, size_t payload_len, char reply[]) { return false; }
 
   // Power management interface (boards with power management override these)
   virtual bool isExternalPowered() { return false; }
