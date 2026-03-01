@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MeshCore OTA OTG Prototype</title>
+  <style>
+    :root {
+      --bg-a: #0f1a28;
+      --bg-b: #1f3a56;
+      --panel: #0f1520d9;
+      --panel-border: #2a3950;
+      --text: #e8f2ff;
+      --muted: #a0b4cc;
+      --ok: #5fd48c;
+      --warn: #ffd16a;
+      --danger: #ff7878;
+      --accent: #70d6ff;
+      --accent-2: #8bffb0;
+      --font-main: "Space Grotesk", "Segoe UI Variable", "Trebuchet MS", sans-serif;
+      --font-mono: "IBM Plex Mono", "Consolas", "Menlo", monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font-family: var(--font-main);
+      background:
+        radial-gradient(1200px 600px at 100% -10%, #2b5f8a66, transparent),
+        radial-gradient(900px 500px at -10% 10%, #3aa37444, transparent),
+        linear-gradient(160deg, var(--bg-a), var(--bg-b));
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+    }
+
+    header {
+      padding: 16px 18px;
+      border-bottom: 1px solid #ffffff26;
+      backdrop-filter: blur(4px);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 1.12rem;
+      letter-spacing: 0.02em;
+      font-weight: 700;
+    }
+
+    main {
+      width: min(980px, 100%);
+      margin: 0 auto;
+      padding: 14px;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+      animation: fadeIn 260ms ease-out;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .card {
+      border: 1px solid var(--panel-border);
+      border-radius: 14px;
+      background: var(--panel);
+      box-shadow: 0 12px 24px #00000022;
+      padding: 12px;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    label {
+      display: block;
+      font-size: 0.82rem;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+
+    input, button {
+      width: 100%;
+      border-radius: 10px;
+      border: 1px solid #39506d;
+      background: #121b28;
+      color: var(--text);
+      padding: 10px 11px;
+      font-size: 0.92rem;
+      font-family: var(--font-main);
+    }
+
+    input[type="file"] {
+      padding: 7px 9px;
+    }
+
+    input:focus, button:focus {
+      outline: 2px solid #73c6ff88;
+      outline-offset: 1px;
+    }
+
+    button {
+      cursor: pointer;
+      background: linear-gradient(120deg, #18507f, #2f6c9f);
+      border-color: #4a7ea9;
+      font-weight: 600;
+      transition: transform 120ms ease, filter 120ms ease;
+    }
+
+    button:hover:not(:disabled) {
+      filter: brightness(1.08);
+      transform: translateY(-1px);
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    .secondary {
+      background: linear-gradient(120deg, #2e3f53, #3b4b5f);
+      border-color: #55687f;
+    }
+
+    .danger {
+      background: linear-gradient(120deg, #6b2d3a, #8f3f50);
+      border-color: #a65d6d;
+    }
+
+    .status-line {
+      font-size: 0.9rem;
+      color: var(--muted);
+      margin-top: 2px;
+      min-height: 1.2em;
+    }
+
+    .status-line strong { color: var(--accent-2); }
+
+    .pill {
+      display: inline-block;
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      border: 1px solid #456485;
+      color: var(--accent);
+      border-radius: 999px;
+      padding: 4px 9px;
+      margin-right: 8px;
+      margin-top: 4px;
+    }
+
+    .progress-wrap {
+      width: 100%;
+      background: #0f1927;
+      border: 1px solid #2d4461;
+      border-radius: 999px;
+      height: 16px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #56cbff, #74f0ad);
+      transition: width 100ms linear;
+    }
+
+    #log {
+      width: 100%;
+      height: min(38vh, 360px);
+      resize: vertical;
+      border-radius: 10px;
+      border: 1px solid #334962;
+      padding: 10px;
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      line-height: 1.35;
+      background: #0a1119;
+      color: #d8ebff;
+    }
+
+    .muted {
+      color: var(--muted);
+      font-size: 0.83rem;
+    }
+
+    footer {
+      padding: 8px 14px 14px;
+      font-size: 0.78rem;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .c4 { grid-column: span 4; }
+    .c3 { grid-column: span 3; }
+    .c2 { grid-column: span 2; }
+    .c6 { grid-column: span 6; }
+    .c8 { grid-column: span 8; }
+    .c12 { grid-column: span 12; }
+
+    @media (max-width: 760px) {
+      .c2, .c3, .c4, .c6, .c8 { grid-column: span 12; }
+      h1 { font-size: 1rem; }
+      main { padding: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>MeshCore OTA OTG - Prototype Web (USB)</h1>
+    <div class="status-line" id="connectionStatus">Non connecte</div>
+  </header>
+  <main>
+    <section class="card">
+      <div class="row">
+        <div class="c4">
+          <label for="baudrate">Baudrate USB serie</label>
+          <input id="baudrate" type="number" min="9600" step="100" value="115200">
+        </div>
+        <div class="c4">
+          <label>&nbsp;</label>
+          <button id="connectBtn">Connecter USB</button>
+        </div>
+        <div class="c4">
+          <label>&nbsp;</label>
+          <button id="disconnectBtn" class="secondary" disabled>Deconnecter</button>
+        </div>
+      </div>
+      <div>
+        <span class="pill" id="selfName">Noeud: -</span>
+        <span class="pill" id="selfKey">PubKey: -</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="row">
+        <div class="c8">
+          <label for="targetKey">Cible OTA (pubkey hex, min 12 chars)</label>
+          <input id="targetKey" type="text" placeholder="ex: 0a0c54d31f75 ou cle complete">
+        </div>
+        <div class="c4">
+          <label for="firmwareFile">Firmware (.bin ou .bin.gz)</label>
+          <input id="firmwareFile" type="file" accept=".bin,.gz,.bin.gz,application/octet-stream">
+        </div>
+      </div>
+      <div class="row">
+        <div class="c3">
+          <label for="chunkSize">Chunk size (binaire max 132)</label>
+          <input id="chunkSize" type="number" min="16" max="132" step="1" value="96">
+        </div>
+        <div class="c3">
+          <label for="ackEvery">Ack every N chunks</label>
+          <input id="ackEvery" type="number" min="1" max="64" step="1" value="4">
+        </div>
+        <div class="c3">
+          <label for="noAckGap">Gap no-ack (ms)</label>
+          <input id="noAckGap" type="number" min="0" max="1000" step="5" value="45">
+        </div>
+        <div class="c3">
+          <label for="checkpointTimeout">Timeout checkpoint (ms)</label>
+          <input id="checkpointTimeout" type="number" min="200" max="15000" step="100" value="1500">
+        </div>
+      </div>
+      <div class="row">
+        <div class="c6">
+          <button id="startOtaBtn" disabled>Lancer OTA</button>
+        </div>
+        <div class="c6">
+          <button id="cancelOtaBtn" class="danger" disabled>Annuler OTA</button>
+        </div>
+      </div>
+      <div class="status-line" id="otaStatus">Pret</div>
+      <div class="progress-wrap"><div class="progress-bar" id="progressBar"></div></div>
+      <div class="muted" id="metricsLine">Aucune mise a jour lancee.</div>
+    </section>
+
+    <section class="card">
+      <label for="log">Journal</label>
+      <textarea id="log" readonly></textarea>
+    </section>
+  </main>
+  <footer>Prototype OTA via companion serial protocol over USB OTG.</footer>
+  <script defer src="./app.js"></script>
+</body>
+</html>
