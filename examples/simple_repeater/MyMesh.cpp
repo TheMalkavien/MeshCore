@@ -88,6 +88,7 @@ static bool readPacketWireExact(mesh::Packet* dst, const uint8_t raw[], uint8_t 
 #define REQ_TYPE_GET_ACCESS_LIST    0x05
 #define REQ_TYPE_GET_NEIGHBOURS     0x06
 #define REQ_TYPE_GET_OWNER_INFO     0x07     // FIRMWARE_VER_LEVEL >= 2
+#define REQ_TYPE_OTA_BINARY         0x70
 
 #define RESP_SERVER_LOGIN_OK        0 // response to ANON_REQ
 
@@ -96,6 +97,13 @@ static bool readPacketWireExact(mesh::Packet* dst, const uint8_t raw[], uint8_t 
 #define ANON_REQ_TYPE_BASIC        0x03   // just remote clock
 
 #define CLI_REPLY_DELAY_MILLIS      600
+#ifndef OTA_CLI_REPLY_DELAY_MILLIS
+  #define OTA_CLI_REPLY_DELAY_MILLIS 40
+#endif
+
+#ifndef OTA_TXT_ACK_DELAY
+  #define OTA_TXT_ACK_DELAY 0
+#endif
 
 #define LAZY_CONTACTS_WRITE_DELAY    5000
 
@@ -236,6 +244,54 @@ void MyMesh::processGroupFloodRetries() {
     slot.next_retry_at = futureMillis(slot.wait_ms + gap);
   }
 #endif
+}
+
+static const char* skipCommandSpaces(const char* p) {
+  while (*p == ' ') {
+    p++;
+  }
+  return p;
+}
+
+static bool isHexChar(char c) {
+  return (c >= '0' && c <= '9') ||
+         (c >= 'a' && c <= 'f') ||
+         (c >= 'A' && c <= 'F');
+}
+
+static size_t getCommandPrefixLen(const char* command) {
+  const char* p = skipCommandSpaces(command);
+  size_t n = 0;
+  while (isHexChar(p[n])) {
+    n++;
+    if (n >= 8) {
+      break;  // safety cap
+    }
+  }
+  if (n >= 2 && p[n] == '|') {
+    return n + 1;
+  }
+  return 0;
+}
+
+static bool isOtaCLICommand(const char* command) {
+  if (command == NULL) {
+    return false;
+  }
+  const char* p = skipCommandSpaces(command);
+  size_t prefix_len = getCommandPrefixLen(p);
+  if (prefix_len > 0) {  // optional "<token>|" prefix from mccli
+    p += prefix_len;
+  }
+  p = skipCommandSpaces(p);
+
+  if (memcmp(p, "start ota", 9) == 0 && (p[9] == 0 || p[9] == ' ')) {
+    return true;
+  }
+  if (memcmp(p, "ota", 3) == 0 && (p[3] == 0 || p[3] == ' ')) {
+    return true;
+  }
+  return false;
 }
 
 void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
@@ -470,6 +526,7 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
 
       // create copy of neighbours list, skipping empty entries so we can sort it separately from main list
       int16_t neighbours_count = 0;
+#if MAX_NEIGHBOURS
       NeighbourInfo* sorted_neighbours[MAX_NEIGHBOURS];
       for (int i = 0; i < MAX_NEIGHBOURS; i++) {
         auto neighbour = &neighbours[i];
@@ -505,6 +562,7 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
           return a->snr < b->snr; // asc
         });
       }
+#endif
 
       // build results buffer
       int results_count = 0;
@@ -519,6 +577,7 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
           break;
         }
 
+#if MAX_NEIGHBOURS
         // add next neighbour to results
         auto neighbour = sorted_neighbours[index + offset];
         uint32_t heard_seconds_ago = getRTCClock()->getCurrentTime() - neighbour->heard_timestamp;
@@ -526,6 +585,7 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
         memcpy(&results_buffer[results_offset], &heard_seconds_ago, 4); results_offset += 4;
         memcpy(&results_buffer[results_offset], &neighbour->snr, 1); results_offset += 1;
         results_count++;
+#endif
 
       }
 
@@ -540,6 +600,37 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
   } else if (payload[0] == REQ_TYPE_GET_OWNER_INFO) {
     sprintf((char *) &reply_data[4], "%s\n%s\n%s", FIRMWARE_VERSION, _prefs.node_name, _prefs.owner_info);
     return 4 + strlen((char *) &reply_data[4]);
+  } else if (payload[0] == REQ_TYPE_OTA_BINARY) {
+#if defined(RP2040_PLATFORM)
+    if (sender == NULL || !sender->isAdmin()) {
+      strcpy((char*)&reply_data[4], "Err - admin required");
+      return 4 + strlen((char*)&reply_data[4]);
+    }
+    if (payload_len < 2) {
+      strcpy((char*)&reply_data[4], "Err - bad OTA req");
+      return 4 + strlen((char*)&reply_data[4]);
+    }
+
+    uint8_t opcode = payload[1];
+    const uint8_t *req_payload = payload_len > 2 ? &payload[2] : NULL;
+    size_t req_len = payload_len > 2 ? payload_len - 2 : 0;
+
+    char ota_reply[160];
+    ota_reply[0] = 0;
+    if (!board.handleOTABinaryCommand(opcode, req_payload, req_len, ota_reply)) {
+      strcpy(ota_reply, "Err - OTA unsupported");
+    }
+
+    size_t ota_reply_len = strlen(ota_reply);
+    if (ota_reply_len == 0) {
+      return 0; // no reply for intermediate write chunks
+    }
+    if (ota_reply_len > MAX_PACKET_PAYLOAD - 4) {
+      ota_reply_len = MAX_PACKET_PAYLOAD - 4;
+    }
+    memcpy(&reply_data[4], ota_reply, ota_reply_len);
+    return 4 + ota_reply_len;
+#endif
   }
   return 0; // unknown command
 }
@@ -816,6 +907,8 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
       // len can be > original length, but 'text' will be padded with zeroes
       data[len] = 0; // need to make a C string again, with null terminator
+      char *command = (char *)&data[5];
+      bool ota_command = isOtaCLICommand(command);
 
       if (flags == TXT_TYPE_PLAIN) { // for legacy CLI, send Acks
         uint32_t ack_hash; // calc truncated hash of the message timestamp + text + sender pub_key, to prove
@@ -825,16 +918,16 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
         mesh::Packet *ack = createAck(ack_hash);
         if (ack) {
+          uint32_t ack_delay = ota_command ? OTA_TXT_ACK_DELAY : TXT_ACK_DELAY;
           if (client->out_path_len < 0) {
-            sendFlood(ack, TXT_ACK_DELAY);
+            sendFlood(ack, ack_delay);
           } else {
-            sendDirect(ack, client->out_path, client->out_path_len, TXT_ACK_DELAY);
+            sendDirect(ack, client->out_path, client->out_path_len, ack_delay);
           }
         }
       }
 
       uint8_t temp[166];
-      char *command = (char *)&data[5];
       char *reply = (char *)&temp[5];
       if (is_retry) {
         *reply = 0;
@@ -853,10 +946,11 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
         auto reply = createDatagram(PAYLOAD_TYPE_TXT_MSG, client->id, secret, temp, 5 + text_len);
         if (reply) {
+          uint32_t reply_delay = ota_command ? OTA_CLI_REPLY_DELAY_MILLIS : CLI_REPLY_DELAY_MILLIS;
           if (client->out_path_len < 0) {
-            sendFlood(reply, CLI_REPLY_DELAY_MILLIS);
+            sendFlood(reply, reply_delay);
           } else {
-            sendDirect(reply, client->out_path, client->out_path_len, CLI_REPLY_DELAY_MILLIS);
+            sendDirect(reply, client->out_path, client->out_path_len, reply_delay);
           }
         }
       }
@@ -916,6 +1010,47 @@ void MyMesh::onControlDataRecv(mesh::Packet* packet) {
         sendZeroHop(resp, getRetransmitDelay(resp)*4);  // apply random delay (widened x4), as multiple nodes can respond to this
       }
     }
+  } else if (type == CTL_TYPE_NODE_DISCOVER_RESP && packet->payload_len >= 6) {
+    uint8_t node_type = packet->payload[0] & 0x0F;
+    if (node_type != ADV_TYPE_REPEATER) {
+      return;
+    }
+    if (packet->payload_len < 6 + PUB_KEY_SIZE) {
+      MESH_DEBUG_PRINTLN("onControlDataRecv: DISCOVER_RESP pubkey too short: %d", (uint32_t)packet->payload_len);
+      return;
+    }
+
+    if (pending_discover_tag == 0 || millisHasNowPassed(pending_discover_until)) {
+      pending_discover_tag = 0;
+      return;
+    }
+    uint32_t tag;
+    memcpy(&tag, &packet->payload[2], 4);
+    if (tag != pending_discover_tag) {
+      return;
+    }
+
+    mesh::Identity id(&packet->payload[6]);
+    if (id.matches(self_id)) {
+      return;
+    }
+    putNeighbour(id, rtc_clock.getCurrentTime(), packet->getSNR());
+  }
+}
+
+void MyMesh::sendNodeDiscoverReq() {
+  uint8_t data[10];
+  data[0] = CTL_TYPE_NODE_DISCOVER_REQ; // prefix_only=0
+  data[1] = (1 << ADV_TYPE_REPEATER);
+  getRNG()->random(&data[2], 4); // tag
+  memcpy(&pending_discover_tag, &data[2], 4);
+  pending_discover_until = futureMillis(60000);
+  uint32_t since = 0;
+  memcpy(&data[6], &since, 4);
+
+  auto pkt = createControlData(data, sizeof(data));
+  if (pkt) {
+    sendZeroHop(pkt);
   }
 }
 
@@ -950,7 +1085,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.airtime_factor = 1.0;   // one half
   _prefs.rx_delay_base = 0.0f;   // turn off by default, was 10.0;
   _prefs.tx_delay_factor = 0.5f; // was 0.25f
-  _prefs.direct_tx_delay_factor = 0.2f; // was zero
+  _prefs.direct_tx_delay_factor = 0.3f; // was 0.2
   StrHelper::strncpy(_prefs.node_name, ADVERT_NAME, sizeof(_prefs.node_name));
   _prefs.node_lat = ADVERT_LAT;
   _prefs.node_lon = ADVERT_LON;
@@ -980,6 +1115,9 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.advert_loc_policy = ADVERT_LOC_PREFS;
 
   _prefs.adc_multiplier = 0.0f; // 0.0f means use default board multiplier
+
+  pending_discover_tag = 0;
+  pending_discover_until = 0;
 }
 
 void MyMesh::begin(FILESYSTEM *fs) {
@@ -1216,12 +1354,13 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     return;
   }
 
-  while (*command == ' ') command++; // skip leading spaces
+  command = (char *) skipCommandSpaces(command);
 
-  if (strlen(command) > 4 && command[2] == '|') { // optional prefix (for companion radio CLI)
-    memcpy(reply, command, 3);                    // reflect the prefix back
-    reply += 3;
-    command += 3;
+  size_t prefix_len = getCommandPrefixLen(command);
+  if (prefix_len > 0) { // optional prefix (for companion radio CLI)
+    memcpy(reply, command, prefix_len); // reflect the prefix back
+    reply += prefix_len;
+    command += prefix_len;
   }
 
   // handle ACL related commands
@@ -1373,6 +1512,15 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     }
   } else if (strcmp(command, "usb status") == 0) {
     strcpy(reply, meshcore_board_usb_is_connected() ? "> on" : "> off");
+  } else if (memcmp(command, "discover.neighbors", 18) == 0) {
+    const char* sub = command + 18;
+    while (*sub == ' ') sub++;
+    if (*sub != 0) {
+      strcpy(reply, "Err - discover.neighbors has no options");
+    } else {
+      sendNodeDiscoverReq();
+      strcpy(reply, "OK - Discover sent");
+    }
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
