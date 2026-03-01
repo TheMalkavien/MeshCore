@@ -26,5 +26,5 @@ void WaveshareBoard::begin() {
 }
 
 bool WaveshareBoard::startOTAUpdate(const char *id, char reply[]) {
-  return false;
+  return ota.startSession(id, reply);
 }

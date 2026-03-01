@@ -215,8 +215,52 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
         strcpy(reply, "ERR: clock cannot go backwards");
       }
     } else if (memcmp(command, "start ota", 9) == 0) {
+      Serial.println("[OTA] CLI start ota");
       if (!_board->startOTAUpdate(_prefs->node_name, reply)) {
         strcpy(reply, "Error");
+      }
+    } else if (memcmp(command, "ota", 3) == 0 && (command[3] == 0 || command[3] == ' ')) {
+      const char* sub = &command[3];
+      while (*sub == ' ') sub++;
+      char ota_sub[16];
+      size_t j = 0;
+      while (sub[j] != 0 && sub[j] != ' ' && j < sizeof(ota_sub) - 1) {
+        ota_sub[j] = sub[j];
+        j++;
+      }
+      ota_sub[j] = 0;
+      if (memcmp(ota_sub, "write", 5) == 0) {
+        const char* args = sub + j;
+        while (*args == ' ') args++;
+
+        uint32_t offset = 0;
+        bool has_offset = false;
+        const char* p = args;
+        while (*p >= '0' && *p <= '9') p++;
+        if (p > args && (*p == ' ' || *p == 0)) {
+          has_offset = true;
+          offset = _atoi(args);
+          args = p;
+          while (*args == ' ') args++;
+        }
+
+        size_t hex_len = strlen(args);
+        while (hex_len > 0 && args[hex_len - 1] == ' ') {
+          hex_len--;
+        }
+        size_t chunk_bytes = hex_len / 2;
+
+        if (has_offset) {
+          Serial.printf("[OTA] CLI ota write offset=%lu bytes=%lu\n",
+                        (unsigned long) offset, (unsigned long) chunk_bytes);
+        } else {
+          Serial.printf("[OTA] CLI ota write bytes=%lu\n", (unsigned long) chunk_bytes);
+        }
+      } else {
+        Serial.printf("[OTA] CLI ota %s\n", ota_sub);
+      }
+      if (!_board->handleOTACommand(sub, reply)) {
+        strcpy(reply, "Err - OTA unsupported");
       }
     } else if (memcmp(command, "clock", 5) == 0) {
       uint32_t now = getRTCClock()->getCurrentTime();

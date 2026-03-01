@@ -57,8 +57,63 @@
 #define ANON_REQ_TYPE_BASIC        0x03   // just remote clock
 
 #define CLI_REPLY_DELAY_MILLIS      600
+#ifndef OTA_CLI_REPLY_DELAY_MILLIS
+  #define OTA_CLI_REPLY_DELAY_MILLIS 40
+#endif
+
+#ifndef OTA_TXT_ACK_DELAY
+  #define OTA_TXT_ACK_DELAY 0
+#endif
 
 #define LAZY_CONTACTS_WRITE_DELAY    5000
+
+static const char* skipCommandSpaces(const char* p) {
+  while (*p == ' ') {
+    p++;
+  }
+  return p;
+}
+
+static bool isHexChar(char c) {
+  return (c >= '0' && c <= '9') ||
+         (c >= 'a' && c <= 'f') ||
+         (c >= 'A' && c <= 'F');
+}
+
+static size_t getCommandPrefixLen(const char* command) {
+  const char* p = skipCommandSpaces(command);
+  size_t n = 0;
+  while (isHexChar(p[n])) {
+    n++;
+    if (n >= 8) {
+      break;  // safety cap
+    }
+  }
+  if (n >= 2 && p[n] == '|') {
+    return n + 1;
+  }
+  return 0;
+}
+
+static bool isOtaCLICommand(const char* command) {
+  if (command == NULL) {
+    return false;
+  }
+  const char* p = skipCommandSpaces(command);
+  size_t prefix_len = getCommandPrefixLen(p);
+  if (prefix_len > 0) {  // optional "<token>|" prefix from mccli
+    p += prefix_len;
+  }
+  p = skipCommandSpaces(p);
+
+  if (memcmp(p, "start ota", 9) == 0 && (p[9] == 0 || p[9] == ' ')) {
+    return true;
+  }
+  if (memcmp(p, "ota", 3) == 0 && (p[3] == 0 || p[3] == ' ')) {
+    return true;
+  }
+  return false;
+}
 
 void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
 #if MAX_NEIGHBOURS // check if neighbours enabled
@@ -642,6 +697,8 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
       // len can be > original length, but 'text' will be padded with zeroes
       data[len] = 0; // need to make a C string again, with null terminator
+      char *command = (char *)&data[5];
+      bool ota_command = isOtaCLICommand(command);
 
       if (flags == TXT_TYPE_PLAIN) { // for legacy CLI, send Acks
         uint32_t ack_hash; // calc truncated hash of the message timestamp + text + sender pub_key, to prove
@@ -651,16 +708,16 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
         mesh::Packet *ack = createAck(ack_hash);
         if (ack) {
+          uint32_t ack_delay = ota_command ? OTA_TXT_ACK_DELAY : TXT_ACK_DELAY;
           if (client->out_path_len < 0) {
-            sendFlood(ack, TXT_ACK_DELAY);
+            sendFlood(ack, ack_delay);
           } else {
-            sendDirect(ack, client->out_path, client->out_path_len, TXT_ACK_DELAY);
+            sendDirect(ack, client->out_path, client->out_path_len, ack_delay);
           }
         }
       }
 
       uint8_t temp[166];
-      char *command = (char *)&data[5];
       char *reply = (char *)&temp[5];
       if (is_retry) {
         *reply = 0;
@@ -679,10 +736,11 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
         auto reply = createDatagram(PAYLOAD_TYPE_TXT_MSG, client->id, secret, temp, 5 + text_len);
         if (reply) {
+          uint32_t reply_delay = ota_command ? OTA_CLI_REPLY_DELAY_MILLIS : CLI_REPLY_DELAY_MILLIS;
           if (client->out_path_len < 0) {
-            sendFlood(reply, CLI_REPLY_DELAY_MILLIS);
+            sendFlood(reply, reply_delay);
           } else {
-            sendDirect(reply, client->out_path, client->out_path_len, CLI_REPLY_DELAY_MILLIS);
+            sendDirect(reply, client->out_path, client->out_path_len, reply_delay);
           }
         }
       }
@@ -1073,12 +1131,13 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     return;
   }
 
-  while (*command == ' ') command++; // skip leading spaces
+  command = (char *) skipCommandSpaces(command);
 
-  if (strlen(command) > 4 && command[2] == '|') { // optional prefix (for companion radio CLI)
-    memcpy(reply, command, 3);                    // reflect the prefix back
-    reply += 3;
-    command += 3;
+  size_t prefix_len = getCommandPrefixLen(command);
+  if (prefix_len > 0) { // optional prefix (for companion radio CLI)
+    memcpy(reply, command, prefix_len); // reflect the prefix back
+    reply += prefix_len;
+    command += prefix_len;
   }
 
   // handle ACL related commands

@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <MeshCore.h>
+#include <helpers/RP2040OTA.h>
 
 // LoRa radio module pins for Waveshare RP2040-LoRa-HF/LF
 // https://files.waveshare.com/wiki/RP2040-LoRa/Rp2040-lora-sch.pdf
@@ -27,6 +28,7 @@
 class WaveshareBoard : public mesh::MainBoard {
 protected:
   uint8_t startup_reason;
+  RP2040OTAController ota;
 
 public:
   void begin();
@@ -58,4 +60,5 @@ public:
   void reboot() override { rp2040.reboot(); }
 
   bool startOTAUpdate(const char *id, char reply[]) override;
+  bool handleOTACommand(const char *command, char reply[]) override { return ota.handleCommand(command, reply); }
 };
