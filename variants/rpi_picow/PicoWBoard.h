@@ -51,4 +51,7 @@ public:
 
   bool startOTAUpdate(const char* id, char reply[]) override;
   bool handleOTACommand(const char *command, char reply[]) override { return ota.handleCommand(command, reply); }
+  bool handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) override {
+    return ota.handleBinaryCommand(opcode, payload, payload_len, reply);
+  }
 };
