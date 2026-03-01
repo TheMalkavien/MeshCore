@@ -49,6 +49,7 @@
 #define REQ_TYPE_GET_ACCESS_LIST    0x05
 #define REQ_TYPE_GET_NEIGHBOURS     0x06
 #define REQ_TYPE_GET_OWNER_INFO     0x07     // FIRMWARE_VER_LEVEL >= 2
+#define REQ_TYPE_OTA_BINARY         0x70
 
 #define RESP_SERVER_LOGIN_OK        0 // response to ANON_REQ
 
@@ -421,6 +422,37 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
   } else if (payload[0] == REQ_TYPE_GET_OWNER_INFO) {
     sprintf((char *) &reply_data[4], "%s\n%s\n%s", FIRMWARE_VERSION, _prefs.node_name, _prefs.owner_info);
     return 4 + strlen((char *) &reply_data[4]);
+  } else if (payload[0] == REQ_TYPE_OTA_BINARY) {
+#if defined(RP2040_PLATFORM)
+    if (sender == NULL || !sender->isAdmin()) {
+      strcpy((char*)&reply_data[4], "Err - admin required");
+      return 4 + strlen((char*)&reply_data[4]);
+    }
+    if (payload_len < 2) {
+      strcpy((char*)&reply_data[4], "Err - bad OTA req");
+      return 4 + strlen((char*)&reply_data[4]);
+    }
+
+    uint8_t opcode = payload[1];
+    const uint8_t *req_payload = payload_len > 2 ? &payload[2] : NULL;
+    size_t req_len = payload_len > 2 ? payload_len - 2 : 0;
+
+    char ota_reply[160];
+    ota_reply[0] = 0;
+    if (!board.handleOTABinaryCommand(opcode, req_payload, req_len, ota_reply)) {
+      strcpy(ota_reply, "Err - OTA unsupported");
+    }
+
+    size_t ota_reply_len = strlen(ota_reply);
+    if (ota_reply_len == 0) {
+      return 0; // no reply for intermediate write chunks
+    }
+    if (ota_reply_len > MAX_PACKET_PAYLOAD - 4) {
+      ota_reply_len = MAX_PACKET_PAYLOAD - 4;
+    }
+    memcpy(&reply_data[4], ota_reply, ota_reply_len);
+    return 4 + ota_reply_len;
+#endif
   }
   return 0; // unknown command
 }

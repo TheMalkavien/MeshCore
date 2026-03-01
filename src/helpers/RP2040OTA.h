@@ -7,10 +7,20 @@
 
 class RP2040OTAController {
 public:
+  enum BinaryOpcode : uint8_t {
+    BIN_OP_START  = 1,
+    BIN_OP_BEGIN  = 2,
+    BIN_OP_WRITE  = 3,
+    BIN_OP_END    = 4,
+    BIN_OP_STATUS = 5,
+    BIN_OP_ABORT  = 6
+  };
+
   RP2040OTAController();
 
   bool startSession(const char *id, char reply[]);
   bool handleCommand(const char *command, char reply[]);
+  bool handleBinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]);
 
 private:
   bool _armed;

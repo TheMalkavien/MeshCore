@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define OTA_CMD_MAX_CHUNK_BYTES  96
+#define OTA_CMD_MAX_CHUNK_BYTES  160
 #define OTA_PROGRESS_LOG_STEP_BYTES 4096
 
 #ifndef RP2040_OTA_SERIAL_DEBUG
@@ -68,6 +68,15 @@ bool RP2040OTAController::decodeHex(const char *hex, size_t hex_len, uint8_t *ou
 
   *out_len = bytes;
   return true;
+}
+
+static void bytesToHex(const uint8_t *src, size_t len, char *dst) {
+  static const char kHex[] = "0123456789abcdef";
+  for (size_t i = 0; i < len; i++) {
+    dst[i * 2] = kHex[(src[i] >> 4) & 0x0F];
+    dst[i * 2 + 1] = kHex[src[i] & 0x0F];
+  }
+  dst[len * 2] = 0;
 }
 
 bool RP2040OTAController::startSession(const char *id, char reply[]) {
@@ -395,6 +404,111 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
   OTA_DEBUG_PRINTLN("unknown command: %s", sub);
   strcpy(reply, "Err - unknown OTA cmd");
   return true;
+}
+
+bool RP2040OTAController::handleBinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) {
+  if (reply == NULL) {
+    return false;
+  }
+
+  if (payload == NULL && payload_len > 0) {
+    strcpy(reply, "Err - bad payload");
+    return true;
+  }
+
+  switch (opcode) {
+    case BIN_OP_START:
+      return startSession("binary", reply);
+
+    case BIN_OP_BEGIN: {
+      if (payload_len < 5) {
+        strcpy(reply, "Err - bad begin payload");
+        return true;
+      }
+
+      uint32_t size = (uint32_t) payload[0]
+                    | ((uint32_t) payload[1] << 8)
+                    | ((uint32_t) payload[2] << 16)
+                    | ((uint32_t) payload[3] << 24);
+      uint8_t ack_every = payload[4];
+      if (ack_every < 1 || ack_every > 64) {
+        strcpy(reply, "Err - ack_every range 1..64");
+        return true;
+      }
+
+      if (payload_len >= 21) {
+        char md5_hex[33];
+        bytesToHex(&payload[5], 16, md5_hex);
+
+        char cmd[96];
+        snprintf(cmd, sizeof(cmd), "begin %lu %s %u",
+                 (unsigned long) size, md5_hex, (unsigned int) ack_every);
+        return handleCommand(cmd, reply);
+      }
+
+      char cmd[48];
+      snprintf(cmd, sizeof(cmd), "begin %lu %u",
+               (unsigned long) size, (unsigned int) ack_every);
+      return handleCommand(cmd, reply);
+    }
+
+    case BIN_OP_WRITE: {
+      // Binary write payload layout:
+      //   <offset:u32 little-endian><chunk_len:u8><chunk_bytes...>
+      // The packet payload can include trailing cipher padding bytes.
+      // Use explicit chunk_len so we ignore padding.
+      if (payload_len < 6) {
+        strcpy(reply, "Err - bad write payload");
+        return true;
+      }
+
+      uint32_t offset = (uint32_t) payload[0]
+                      | ((uint32_t) payload[1] << 8)
+                      | ((uint32_t) payload[2] << 16)
+                      | ((uint32_t) payload[3] << 24);
+      uint8_t declared_len = payload[4];
+      if (declared_len == 0 || declared_len > OTA_CMD_MAX_CHUNK_BYTES) {
+        strcpy(reply, "Err - bad chunk len");
+        return true;
+      }
+
+      if (payload_len < 5 + declared_len) {
+        strcpy(reply, "Err - short OTA chunk");
+        return true;
+      }
+
+      const uint8_t *chunk = &payload[5];
+      size_t chunk_len = declared_len;
+      if (chunk_len == 0) {
+        strcpy(reply, "Err - empty OTA chunk");
+        return true;
+      }
+      if (chunk_len > OTA_CMD_MAX_CHUNK_BYTES) {
+        strcpy(reply, "Err - chunk too large");
+        return true;
+      }
+
+      char hex_buf[(OTA_CMD_MAX_CHUNK_BYTES * 2) + 1];
+      bytesToHex(chunk, chunk_len, hex_buf);
+
+      char cmd[16 + sizeof(hex_buf)];
+      snprintf(cmd, sizeof(cmd), "write %lu %s", (unsigned long) offset, hex_buf);
+      return handleCommand(cmd, reply);
+    }
+
+    case BIN_OP_END:
+      return handleCommand("end", reply);
+
+    case BIN_OP_STATUS:
+      return handleCommand("status", reply);
+
+    case BIN_OP_ABORT:
+      return handleCommand("abort", reply);
+
+    default:
+      strcpy(reply, "Err - unknown OTA bin cmd");
+      return true;
+  }
 }
 
 #endif
