@@ -257,11 +257,11 @@
       <div class="row">
         <div class="c3">
           <label for="chunkSize">Chunk size (binaire max 132)</label>
-          <input id="chunkSize" type="number" min="16" max="132" step="1" value="132">
+          <input id="chunkSize" type="number" min="16" max="132" step="1" value="96">
         </div>
         <div class="c3">
           <label for="ackEvery">Ack every N chunks</label>
-          <input id="ackEvery" type="number" min="1" max="64" step="1" value="4">
+          <input id="ackEvery" type="number" min="1" max="64" step="1" value="1">
         </div>
         <div class="c3">
           <label for="noAckGap">Gap no-ack (ms)</label>
@@ -270,6 +270,16 @@
         <div class="c3">
           <label for="checkpointTimeout">Timeout checkpoint (ms)</label>
           <input id="checkpointTimeout" type="number" min="200" max="15000" step="100" value="500">
+        </div>
+      </div>
+      <div class="row">
+        <div class="c3">
+          <label for="autoTune">Auto selon preset radio</label>
+          <input id="autoTune" type="checkbox" checked>
+        </div>
+        <div class="c9">
+          <label>&nbsp;</label>
+          <div class="muted" id="planLine">Plan OTA: selectionne un firmware</div>
         </div>
       </div>
       <div class="row">
