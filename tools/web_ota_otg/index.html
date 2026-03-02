@@ -241,19 +241,23 @@
 
     <section class="card">
       <div class="row">
-        <div class="c8">
+        <div class="c6">
           <label for="targetKey">Cible OTA (pubkey hex, min 12 chars)</label>
           <input id="targetKey" type="text" placeholder="ex: 0a0c54d31f75 ou cle complete">
         </div>
-        <div class="c4">
+        <div class="c3">
           <label for="firmwareFile">Firmware (.bin ou .bin.gz)</label>
           <input id="firmwareFile" type="file" accept=".bin,.gz,.bin.gz,application/octet-stream">
+        </div>
+        <div class="c3">
+          <label for="targetPassword">Mot de passe (optionnel)</label>
+          <input id="targetPassword" type="password" placeholder="login repeater">
         </div>
       </div>
       <div class="row">
         <div class="c3">
           <label for="chunkSize">Chunk size (binaire max 132)</label>
-          <input id="chunkSize" type="number" min="16" max="132" step="1" value="96">
+          <input id="chunkSize" type="number" min="16" max="132" step="1" value="132">
         </div>
         <div class="c3">
           <label for="ackEvery">Ack every N chunks</label>
@@ -261,11 +265,11 @@
         </div>
         <div class="c3">
           <label for="noAckGap">Gap no-ack (ms)</label>
-          <input id="noAckGap" type="number" min="0" max="1000" step="5" value="45">
+          <input id="noAckGap" type="number" min="0" max="1000" step="5" value="50">
         </div>
         <div class="c3">
           <label for="checkpointTimeout">Timeout checkpoint (ms)</label>
-          <input id="checkpointTimeout" type="number" min="200" max="15000" step="100" value="1500">
+          <input id="checkpointTimeout" type="number" min="200" max="15000" step="100" value="500">
         </div>
       </div>
       <div class="row">

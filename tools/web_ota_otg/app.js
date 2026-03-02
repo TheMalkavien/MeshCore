@@ -25,6 +25,8 @@ const PACKET_TYPE = {
   DEVICE_INFO: 13,
   CONTACT_MSG_RECV_V3: 16,
   MESSAGES_WAITING: 0x83,
+  LOGIN_SUCCESS: 0x85,
+  LOGIN_FAILED: 0x86,
   BINARY_RESPONSE: 0x8c,
 };
 
@@ -299,6 +301,12 @@ class MeshCoreSerialClient {
       case PACKET_TYPE.MESSAGES_WAITING:
         this.emit("messages_waiting", {});
         break;
+      case PACKET_TYPE.LOGIN_SUCCESS:
+        this.emit("login_success", this.parseLoginSuccess(frame));
+        break;
+      case PACKET_TYPE.LOGIN_FAILED:
+        this.emit("login_failed", this.parseLoginFailed(frame));
+        break;
       case PACKET_TYPE.BINARY_RESPONSE:
       {
         const bin = this.parseBinaryResponse(frame);
@@ -376,6 +384,32 @@ class MeshCoreSerialClient {
       data_bytes: dataBytes,
       text: textDecoder.decode(dataBytes).replace(/\0+$/g, ""),
     };
+  }
+
+  parseLoginSuccess(frame) {
+    // Packet: 0x85, perms(1), pubkey_prefix(6)
+    const payload = {
+      permissions: frame.length > 1 ? frame[1] : 0,
+      pubkey_prefix: "",
+      is_admin: false,
+    };
+    if (frame.length >= 8) {
+      payload.pubkey_prefix = bytesToHex(frame.slice(2, 8));
+    }
+    payload.is_admin = (payload.permissions & 0x01) === 0x01;
+    return payload;
+  }
+
+  parseLoginFailed(frame) {
+    // Packet: 0x86, reason?(1), pubkey_prefix?(6)
+    const payload = {
+      reason_code: frame.length > 1 ? frame[1] : null,
+      pubkey_prefix: "",
+    };
+    if (frame.length >= 8) {
+      payload.pubkey_prefix = bytesToHex(frame.slice(2, 8));
+    }
+    return payload;
   }
 
   parseContactMsg(frame, withSnr) {
@@ -592,6 +626,53 @@ class MeshCoreSerialClient {
     );
   }
 
+  async sendLogin(targetFullKeyHex, password) {
+    const full = this.normalizeTargetFullKey(targetFullKeyHex);
+    const dst = hexToBytes(full);
+    const pwd = textEncoder.encode(String(password || ""));
+    const payload = concatBytes(Uint8Array.of(0x1a), dst, pwd);
+
+    const sentEvt = await this.sendCommand(payload, ["msg_sent", "error"], null, 5000);
+    if (!sentEvt || sentEvt.type === "error") {
+      const code = sentEvt?.payload?.error_code;
+      return { ok: false, error: `send login error${code !== undefined ? ` (code=${code})` : ""}` };
+    }
+
+    const expectedPrefix = full.slice(0, 12);
+    const suggested = Number(sentEvt.payload?.suggested_timeout || 8000);
+    const waitMs = Math.max(5000, Math.round(((suggested / 800) * 1.5) * 1000));
+
+    let evt = null;
+    try {
+      evt = await this.waitForEvent(
+        ["login_success", "login_failed", "error"],
+        (payload, type) => {
+          if (type === "error") return true;
+          const pfx = String(payload?.pubkey_prefix || "").toLowerCase();
+          return pfx === expectedPrefix;
+        },
+        waitMs
+      );
+    } catch {
+      evt = null;
+    }
+    if (!evt) {
+      return { ok: false, error: "timeout waiting login response" };
+    }
+    if (evt.type === "login_success") {
+      return {
+        ok: true,
+        is_admin: Boolean(evt.payload?.is_admin),
+        permissions: Number(evt.payload?.permissions || 0),
+      };
+    }
+    if (evt.type === "login_failed") {
+      const reason = evt.payload?.reason_code;
+      return { ok: false, error: `login failed${reason !== null && reason !== undefined ? ` (reason=${reason})` : ""}` };
+    }
+    return { ok: false, error: "login error" };
+  }
+
   buildSendCmdPayload(targetHex, commandText) {
     const prefix = this.normalizeTargetPrefix(targetHex);
     const dst = hexToBytes(prefix);
@@ -746,6 +827,7 @@ const ui = {
   cancelOtaBtn: document.querySelector("#cancelOtaBtn"),
   baudrate: document.querySelector("#baudrate"),
   targetKey: document.querySelector("#targetKey"),
+  targetPassword: document.querySelector("#targetPassword"),
   firmwareFile: document.querySelector("#firmwareFile"),
   chunkSize: document.querySelector("#chunkSize"),
   ackEvery: document.querySelector("#ackEvery"),
@@ -780,6 +862,25 @@ function setOtaStatus(text) {
 function setProgress(percent) {
   const p = Math.max(0, Math.min(100, Number(percent) || 0));
   ui.progressBar.style.width = `${p}%`;
+}
+
+function updateLiveMetrics(transport, doneBytes, totalBytes, startTs, attempts, failures) {
+  const pct = totalBytes > 0 ? Math.floor((doneBytes * 100) / totalBytes) : 0;
+  const elapsedSec = Math.max(0.001, (performance.now() - startTs) / 1000.0);
+  const rateBps = doneBytes / elapsedSec;
+  const remainingBytes = Math.max(0, totalBytes - doneBytes);
+  const etaSec = rateBps > 0 ? (remainingBytes / rateBps) : NaN;
+  const failureRatePct = attempts > 0 ? (failures * 100.0 / attempts) : 0.0;
+  const tr = transport === "binary_req" ? "binary" : "text";
+
+  if (!Number.isFinite(etaSec) || doneBytes <= 0) {
+    ui.metricsLine.textContent =
+      `Transport ${tr} | ${pct}% | Estimation en cours... | Echecs ${failures}/${attempts} (${failureRatePct.toFixed(2)}%)`;
+    return;
+  }
+
+  ui.metricsLine.textContent =
+    `Transport ${tr} | ${pct}% | Restant ~${formatDuration(etaSec)} | Echecs ${failures}/${attempts} (${failureRatePct.toFixed(2)}%)`;
 }
 
 function updateButtons() {
@@ -868,6 +969,7 @@ async function runBinaryOta(params) {
   let chunkWriteAttempts = 0;
   let chunkWriteFailures = 0;
   let lastProgressPct = -1;
+  updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures);
 
   const startRes = await client.sendOtaBinaryCmd(
     targetFullKeyHex,
@@ -1081,6 +1183,7 @@ async function runBinaryOta(params) {
     if (pct !== lastProgressPct && (pct % 2 === 0 || offset === fwSize)) {
       setProgress(pct);
       setOtaStatus(`Progress: ${pct}% (${chunkIndex}/${totalChunks})`);
+      updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures);
       lastProgressPct = pct;
     }
   }
@@ -1171,6 +1274,7 @@ async function runTextOta(params) {
   let chunkWriteAttempts = 0;
   let chunkWriteFailures = 0;
   let lastProgressPct = -1;
+  updateLiveMetrics("text_cmd", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures);
 
   const startRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "start ota", 15);
   if (startRes.error) {
@@ -1360,6 +1464,7 @@ async function runTextOta(params) {
     if (pct !== lastProgressPct && (pct % 2 === 0 || offset === fwSize)) {
       setProgress(pct);
       setOtaStatus(`Progress: ${pct}% (${chunkIndex}/${totalChunks})`);
+      updateLiveMetrics("text_cmd", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures);
       lastProgressPct = pct;
     }
   }
@@ -1531,9 +1636,24 @@ ui.startOtaBtn.addEventListener("click", async () => {
       chunkSizeInput: Number.parseInt(ui.chunkSize.value, 10) || 64,
       ackEveryInput: Number.parseInt(ui.ackEvery.value, 10) || 1,
       noAckGapMs: Math.max(0, Number.parseInt(ui.noAckGap.value, 10) || 0),
-      checkpointTimeoutMs: Math.max(200, Number.parseInt(ui.checkpointTimeout.value, 10) || 1500),
+      checkpointTimeoutMs: Math.max(200, Number.parseInt(ui.checkpointTimeout.value, 10) || 500),
     };
     appendLog(`Firmware: ${file.name} (${firmware.length} bytes)`);
+
+    const password = String(ui.targetPassword.value || "").trim();
+    if (password.length > 0) {
+      setOtaStatus("Authentification...");
+      appendLog("Tentative de login...");
+      const fullKeyForLogin = await client.resolveTargetFullKeyForBinary(params.targetHex);
+      if (!fullKeyForLogin) {
+        throw new Error("Impossible de resoudre la cle complete de la cible pour login. Renseigne la cle 64 hex.");
+      }
+      const loginRes = await client.sendLogin(fullKeyForLogin, password);
+      if (!loginRes.ok) {
+        throw new Error(`Authentification echouee: ${loginRes.error}`);
+      }
+      appendLog(`Login OK${loginRes.is_admin ? " (admin)" : ""}`);
+    }
 
     const result = await runOtaWithAutoTransport(params);
     appendLog("OTA staged successfully, reboot command sent.");
