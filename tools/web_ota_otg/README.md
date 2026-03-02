@@ -6,8 +6,10 @@ Le prototype utilise le protocole companion serie (`<len + payload` / `>len + pa
 
 Par defaut, il tente:
 
-1. OTA **binaire** (REQ custom `0x70`)
-2. fallback OTA **texte** (`start ota`, `ota begin`, `ota write`, `ota end`)
+1. Connexion USB via **Web Serial**
+2. Fallback connexion USB via **WebUSB (CDC bulk)**
+3. OTA **binaire** (REQ custom `0x70`)
+4. fallback OTA **texte** (`start ota`, `ota begin`, `ota write`, `ota end`)
 
 ## Ce que fait le prototype
 
@@ -25,6 +27,7 @@ Par defaut, il tente:
 
 - En mode binaire, `ota begin` est envoye sans MD5 (size + ack_every), donc verification MD5 non active dans ce prototype.
 - Web Serial depend du support navigateur/OS. Sur Android, le support peut varier selon version de Chrome.
+- Le fallback WebUSB depend des interfaces USB exposees par le firmware companion (CDC-ACM bulk IN/OUT requis).
 
 ## Lancer en local
 
