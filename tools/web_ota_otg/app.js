@@ -519,14 +519,20 @@ class MeshCoreSerialClient {
 
     this.usbDevice = device;
     await this.usbDevice.open();
+    this.log(
+      `WebUSB open: vid=0x${Number(this.usbDevice.vendorId || 0).toString(16)} `
+      + `pid=0x${Number(this.usbDevice.productId || 0).toString(16)}`
+    );
     if (!this.usbDevice.configuration) {
       const cfgs = Array.isArray(this.usbDevice.configurations)
         ? this.usbDevice.configurations
         : [];
       if (cfgs.length > 0) {
         const preferredCfg = cfgs.find((cfg) => configurationHasBulkPair(cfg)) || cfgs[0];
+        this.log(`WebUSB selectConfiguration: ${preferredCfg.configurationValue}`);
         await this.usbDevice.selectConfiguration(preferredCfg.configurationValue);
       } else {
+        this.log("WebUSB selectConfiguration: fallback #1");
         await this.usbDevice.selectConfiguration(1);
       }
     }
@@ -535,19 +541,27 @@ class MeshCoreSerialClient {
     if (candidates.length < 1) {
       throw new Error("interface CDC bulk IN/OUT non trouvee");
     }
+    this.log(
+      `WebUSB candidates: ${candidates
+        .map((c) => `if${c.interfaceNumber}/alt${c.alternateSetting}/cls0x${Number(c.classCode).toString(16)} in${c.inEndpoint} out${c.outEndpoint}`)
+        .join(", ")}`
+    );
 
     let selected = null;
     let lastClaimErr = null;
     for (const c of candidates) {
       try {
+        this.log(`WebUSB claim try: if${c.interfaceNumber}`);
         await this.usbDevice.claimInterface(c.interfaceNumber);
         if (c.alternateSetting && c.alternateSetting > 0) {
           await this.usbDevice.selectAlternateInterface(c.interfaceNumber, c.alternateSetting);
         }
+        this.log(`WebUSB claim ok: if${c.interfaceNumber}`);
         selected = c;
         break;
       } catch (e) {
         lastClaimErr = e;
+        this.log(`WebUSB claim failed: if${c.interfaceNumber} -> ${e.message}`);
         try { await this.usbDevice.releaseInterface(c.interfaceNumber); } catch {}
       }
     }
