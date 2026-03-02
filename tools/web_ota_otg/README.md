@@ -14,6 +14,7 @@ Par defaut, il tente:
 - Connexion USB serie via Web Serial.
 - Handshake `APP_START` puis `DEVICE_QUERY`.
 - Envoi OTA en **transport binaire** (si support cible), sinon fallback texte.
+- Affiche une estimation du temps restant pendant l'upload.
 - Mode `ack_every` (checkpoint tous les N chunks).
 - Resume simple si `start ota` retourne `already running`.
 - Statistiques en fin d'OTA:
@@ -44,13 +45,14 @@ Puis ouvrir:
 1. Connecter le client MeshCore en USB.
 2. Cliquer `Connecter USB`.
 3. Renseigner la cible OTA (pubkey hex, min 12 chars = prefix 6 bytes).
-4. Selectionner le firmware `.bin` ou `.bin.gz`.
-5. Regler `chunk size`, `ack every`, `gap`, `checkpoint timeout`.
-6. Cliquer `Lancer OTA`.
+4. (Optionnel) renseigner `Mot de passe` pour faire un login avant OTA.
+5. Selectionner le firmware `.bin` ou `.bin.gz`.
+6. Regler `chunk size`, `ack every`, `gap`, `checkpoint timeout`.
+7. Cliquer `Lancer OTA`.
 
 ## Reglages de depart recommandes
 
-- `chunk size`: 96 (binaire) ou 64 (texte)
-- `ack every`: 4
-- `gap no-ack`: 45 ms
-- `checkpoint timeout`: 1500 ms
+- `chunk size`: 64
+- `ack every`: 1
+- `gap no-ack`: 50 ms
+- `checkpoint timeout`: 500 ms
