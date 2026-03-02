@@ -28,6 +28,7 @@ Par defaut, il tente:
 - En mode binaire, `ota begin` est envoye sans MD5 (size + ack_every), donc verification MD5 non active dans ce prototype.
 - Web Serial depend du support navigateur/OS. Sur Android, le support peut varier selon version de Chrome.
 - Le fallback WebUSB depend des interfaces USB exposees par le firmware companion (CDC-ACM bulk IN/OUT requis).
+- Si erreur `Unable to claim interface`: Android peut deja attacher le driver CDC systeme sur l'interface serie USB. Dans ce cas, WebUSB navigateur ne peut pas toujours la prendre.
 
 ## Lancer en local
 
