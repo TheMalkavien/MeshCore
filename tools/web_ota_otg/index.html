@@ -86,7 +86,7 @@
       margin-bottom: 4px;
     }
 
-    input, button {
+    input, select, button {
       width: 100%;
       border-radius: 10px;
       border: 1px solid #39506d;
@@ -101,7 +101,7 @@
       padding: 7px 9px;
     }
 
-    input:focus, button:focus {
+    input:focus, select:focus, button:focus {
       outline: 2px solid #73c6ff88;
       outline-offset: 1px;
     }
@@ -236,14 +236,21 @@
       <div>
         <span class="pill" id="selfName">Noeud: -</span>
         <span class="pill" id="selfKey">PubKey: -</span>
+        <span class="pill" id="selfRadio">Radio: -</span>
       </div>
     </section>
 
     <section class="card">
       <div class="row">
-        <div class="c6">
-          <label for="targetKey">Cible OTA (pubkey hex, min 12 chars)</label>
-          <input id="targetKey" type="text" placeholder="ex: 0a0c54d31f75 ou cle complete">
+        <div class="c4">
+          <label for="targetSelect">Cible OTA (repetiteurs connus)</label>
+          <select id="targetSelect">
+            <option value="">Selectionner un repetiteur...</option>
+          </select>
+        </div>
+        <div class="c2">
+          <label>&nbsp;</label>
+          <button id="refreshTargetsBtn" class="secondary" disabled>Rafraichir</button>
         </div>
         <div class="c3">
           <label for="firmwareFile">Firmware (.bin ou .bin.gz)</label>
@@ -252,6 +259,12 @@
         <div class="c3">
           <label for="targetPassword">Mot de passe (optionnel)</label>
           <input id="targetPassword" type="password" placeholder="login repeater">
+        </div>
+      </div>
+      <div class="row">
+        <div class="c12">
+          <label for="targetKey">Cible OTA manuelle (pubkey hex, optionnel)</label>
+          <input id="targetKey" type="text" placeholder="ex: 0a0c54d31f75 ou cle complete">
         </div>
       </div>
       <div class="row">
@@ -269,7 +282,7 @@
         </div>
         <div class="c3">
           <label for="checkpointTimeout">Timeout checkpoint (ms)</label>
-          <input id="checkpointTimeout" type="number" min="200" max="15000" step="100" value="500">
+          <input id="checkpointTimeout" type="number" min="1000" max="15000" step="100" value="1000">
         </div>
       </div>
       <div class="row">
@@ -277,9 +290,31 @@
           <label for="autoTune">Auto selon preset radio</label>
           <input id="autoTune" type="checkbox" checked>
         </div>
-        <div class="c9">
-          <label>&nbsp;</label>
-          <div class="muted" id="planLine">Plan OTA: selectionne un firmware</div>
+        <div class="c3">
+          <label for="useTempRadio">Preset OTA temporaire</label>
+          <input id="useTempRadio" type="checkbox">
+        </div>
+        <div class="c3">
+          <label for="tempRadioFreq">Freq OTA (MHz)</label>
+          <input id="tempRadioFreq" type="number" min="300" max="2500" step="0.001" value="869.4">
+        </div>
+        <div class="c3">
+          <label for="tempRadioBw">BW OTA (kHz)</label>
+          <input id="tempRadioBw" type="number" min="7.8" max="500" step="0.1" value="250">
+        </div>
+      </div>
+      <div class="row">
+        <div class="c4">
+          <label for="tempRadioSf">SF OTA</label>
+          <input id="tempRadioSf" type="number" min="5" max="12" step="1" value="5">
+        </div>
+        <div class="c4">
+          <label for="tempRadioCr">CR OTA</label>
+          <input id="tempRadioCr" type="number" min="5" max="8" step="1" value="5">
+        </div>
+        <div class="c4">
+          <label for="tempRadioMins">Duree temp (min)</label>
+          <input id="tempRadioMins" type="number" min="1" max="240" step="1" value="20">
         </div>
       </div>
       <div class="row">
@@ -301,6 +336,6 @@
     </section>
   </main>
   <footer>Prototype OTA via companion serial protocol over USB OTG.</footer>
-  <script defer src="./app.js?v=20260302-1"></script>
+  <script defer src="./app.js?v=20260302-3"></script>
 </body>
 </html>
