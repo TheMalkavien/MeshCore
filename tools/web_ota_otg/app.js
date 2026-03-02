@@ -142,6 +142,95 @@ function formatDuration(seconds) {
   return `${min}m ${(seconds - (min * 60)).toFixed(1)}s`;
 }
 
+function clamp(value, minValue, maxValue) {
+  return Math.max(minValue, Math.min(maxValue, value));
+}
+
+function estimateOtaRadioProfile(radioBwKhz, radioSf, radioCr) {
+  const bw = Number(radioBwKhz);
+  const sfRaw = Number(radioSf);
+  const crRaw = Number(radioCr);
+  if (!Number.isFinite(bw) || !Number.isFinite(sfRaw) || !Number.isFinite(crRaw) || bw <= 0) {
+    return null;
+  }
+
+  const sf = Math.trunc(clamp(sfRaw, 5, 12));
+  const cr = Math.trunc(clamp(crRaw, 5, 8));
+
+  const symRatio = (2 ** (sf - 7)) * (250.0 / bw);
+  const crFactor = clamp(cr / 5.0, 1.0, 1.8);
+  const airFactor = clamp(symRatio * crFactor, 0.1, 20.0);
+
+  let chunkBinary = 72;
+  if (airFactor <= 1.2) chunkBinary = 132;
+  else if (airFactor <= 2.5) chunkBinary = 120;
+  else if (airFactor <= 5.0) chunkBinary = 104;
+  else if (airFactor <= 10.0) chunkBinary = 88;
+
+  let chunkText = 48;
+  if (airFactor <= 1.2) chunkText = 80;
+  else if (airFactor <= 2.5) chunkText = 72;
+  else if (airFactor <= 5.0) chunkText = 64;
+  else if (airFactor <= 10.0) chunkText = 56;
+
+  let ackEvery = 2;
+  if (airFactor <= 0.25) ackEvery = 12;
+  else if (airFactor <= 0.6) ackEvery = 10;
+  else if (airFactor <= 1.2) ackEvery = 8;
+  else if (airFactor <= 2.5) ackEvery = 6;
+  else if (airFactor <= 5.0) ackEvery = 4;
+  else if (airFactor <= 10.0) ackEvery = 3;
+
+  const noAckGapSec = clamp(0.015 + (0.025 * airFactor), 0.015, 0.45);
+  const checkpointTimeoutSec = clamp(0.7 + (0.9 * airFactor), 1.2, 12.0);
+  const statusTimeoutSec = clamp(0.5 + (0.8 * airFactor), 1.2, 10.0);
+
+  return {
+    bwKhz: bw,
+    sf,
+    cr,
+    airFactor,
+    chunkBinary,
+    chunkText,
+    ackEvery,
+    noAckGapSec,
+    checkpointTimeoutSec,
+    statusTimeoutSec,
+  };
+}
+
+function computeAutoOtaSettings(selfInfo) {
+  const profile = estimateOtaRadioProfile(
+    selfInfo?.radio_bw,
+    selfInfo?.radio_sf,
+    selfInfo?.radio_cr
+  );
+
+  if (!profile) {
+    return {
+      profile: null,
+      chunkSize: 96,
+      ackEvery: 1,
+      noAckGapMs: 50,
+      checkpointTimeoutMs: 500,
+      statusTimeoutMs: 4000,
+      ackSettleGapMs: 30,
+    };
+  }
+
+  const noAckGapMs = Math.round(profile.noAckGapSec * 1000.0);
+  const checkpointTimeoutMs = Math.round(profile.checkpointTimeoutSec * 1000.0);
+  return {
+    profile,
+    chunkSize: profile.chunkBinary,
+    ackEvery: profile.ackEvery,
+    noAckGapMs,
+    checkpointTimeoutMs,
+    statusTimeoutMs: Math.round(profile.statusTimeoutSec * 1000.0),
+    ackSettleGapMs: Math.round(clamp(noAckGapMs * 0.5, 10, 200)),
+  };
+}
+
 class MeshCoreSerialClient {
   constructor(logger) {
     this.log = logger;
@@ -327,10 +416,22 @@ class MeshCoreSerialClient {
     const payload = {
       public_key: "",
       name: "",
+      radio_freq: null,
+      radio_bw: null,
+      radio_sf: null,
+      radio_cr: null,
     };
-    if (frame.length < 55) return payload;
+    if (frame.length < 36) return payload;
     payload.public_key = bytesToHex(frame.slice(4, 36));
-    payload.name = textDecoder.decode(frame.slice(55)).replace(/\0/g, "");
+    if (frame.length >= 58) {
+      payload.radio_freq = parseU32LE(frame, 48) / 1000.0;
+      payload.radio_bw = parseU32LE(frame, 52) / 1000.0;
+      payload.radio_sf = frame[56];
+      payload.radio_cr = frame[57];
+      payload.name = textDecoder.decode(frame.slice(58)).replace(/\0/g, "");
+    } else if (frame.length > 55) {
+      payload.name = textDecoder.decode(frame.slice(55)).replace(/\0/g, "");
+    }
     return payload;
   }
 
@@ -833,6 +934,8 @@ const ui = {
   ackEvery: document.querySelector("#ackEvery"),
   noAckGap: document.querySelector("#noAckGap"),
   checkpointTimeout: document.querySelector("#checkpointTimeout"),
+  autoTune: document.querySelector("#autoTune"),
+  planLine: document.querySelector("#planLine"),
   connectionStatus: document.querySelector("#connectionStatus"),
   otaStatus: document.querySelector("#otaStatus"),
   metricsLine: document.querySelector("#metricsLine"),
@@ -845,6 +948,7 @@ const ui = {
 let client = null;
 let otaRunning = false;
 let otaCancelRequested = false;
+let lastSelfInfo = null;
 
 function appendLog(line) {
   ui.log.value += `[${nowTime()}] ${line}\n`;
@@ -891,16 +995,79 @@ function updateButtons() {
   ui.cancelOtaBtn.disabled = !otaRunning;
 }
 
+function updateTuneInputsState() {
+  const auto = Boolean(ui.autoTune?.checked);
+  if (ui.chunkSize) ui.chunkSize.disabled = auto;
+  if (ui.ackEvery) ui.ackEvery.disabled = auto;
+  if (ui.noAckGap) ui.noAckGap.disabled = auto;
+  if (ui.checkpointTimeout) ui.checkpointTimeout.disabled = auto;
+}
+
+function updatePlanLine() {
+  if (!ui.planLine) return;
+
+  const file = ui.firmwareFile?.files && ui.firmwareFile.files[0];
+  const fwSize = file ? Number(file.size || 0) : 0;
+  const chunkInput = Number.parseInt(ui.chunkSize?.value || "0", 10) || 0;
+  const ackEvery = Number.parseInt(ui.ackEvery?.value || "0", 10) || 0;
+
+  if (!file || fwSize <= 0 || chunkInput < 1) {
+    ui.planLine.textContent = "Plan OTA: selectionne un firmware";
+    return;
+  }
+
+  const binaryChunk = clamp(chunkInput, 16, OTA_BINARY_MAX_CHUNK);
+  const binaryChunks = Math.ceil(fwSize / binaryChunk);
+
+  const safeTextLimit = maxOtaChunkForOffset(Math.max(0, fwSize - 1));
+  if (safeTextLimit < 16) {
+    ui.planLine.textContent = `Plan OTA: binaire ~${binaryChunks} chunks (chunk ${binaryChunk}), fallback texte indisponible`;
+    return;
+  }
+  const textChunk = Math.min(binaryChunk, 80, safeTextLimit);
+  const textChunks = estimateOtaChunkCount(fwSize, textChunk);
+  ui.planLine.textContent =
+    `Plan OTA: binaire ~${binaryChunks} chunks (chunk ${binaryChunk}, ack ${ackEvery || 1}) | `
+    + `fallback texte ~${textChunks} chunks (chunk ${textChunk})`;
+}
+
+function applyAutoOtaSettings(logReason = null) {
+  if (!ui.autoTune?.checked) return null;
+  const tuning = computeAutoOtaSettings(lastSelfInfo);
+
+  ui.chunkSize.value = String(tuning.chunkSize);
+  ui.ackEvery.value = String(tuning.ackEvery);
+  ui.noAckGap.value = String(tuning.noAckGapMs);
+  ui.checkpointTimeout.value = String(tuning.checkpointTimeoutMs);
+  updatePlanLine();
+
+  if (logReason) {
+    if (tuning.profile) {
+      appendLog(
+        `Auto tuning (${logReason}): chunk=${tuning.chunkSize} ack=${tuning.ackEvery} `
+        + `gap=${tuning.noAckGapMs}ms timeout=${tuning.checkpointTimeoutMs}ms `
+        + `| BW=${tuning.profile.bwKhz.toFixed(1)} SF=${tuning.profile.sf} CR=${tuning.profile.cr}`
+      );
+    } else {
+      appendLog(
+        `Auto tuning (${logReason}): chunk=${tuning.chunkSize} ack=${tuning.ackEvery} `
+        + `gap=${tuning.noAckGapMs}ms timeout=${tuning.checkpointTimeoutMs}ms (fallback)`
+      );
+    }
+  }
+  return tuning;
+}
+
 async function getFirmwareBytes(file) {
   const arrayBuffer = await file.arrayBuffer();
   return new Uint8Array(arrayBuffer);
 }
 
-async function getOtaStatus(targetHex) {
+async function getOtaStatus(targetHex, timeoutSec = 10) {
   const maxAttempts = 2;
   let lastErr = null;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const res = await client.sendRepeaterCmdAndWaitReply(targetHex, "ota status", 10);
+    const res = await client.sendRepeaterCmdAndWaitReply(targetHex, "ota status", timeoutSec);
     if (!res.error) {
       return { reply: res.reply, status: parseOtaStatus(res.reply), error: null };
     }
@@ -910,8 +1077,7 @@ async function getOtaStatus(targetHex) {
   return { reply: null, status: null, error: lastErr };
 }
 
-async function getOtaStatusBinary(targetFullKeyHex) {
-  const maxAttempts = 2;
+async function getOtaStatusBinary(targetFullKeyHex, maxAttempts = 2, timeoutMs = 4000) {
   let lastErr = null;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const res = await client.sendOtaBinaryCmd(
@@ -919,7 +1085,7 @@ async function getOtaStatusBinary(targetFullKeyHex) {
       OTA_BIN_OP.STATUS,
       new Uint8Array(),
       true,
-      4000,
+      timeoutMs,
       250
     );
     if (!res.error) {
@@ -940,6 +1106,8 @@ async function runBinaryOta(params) {
     ackEveryInput,
     noAckGapMs,
     checkpointTimeoutMs,
+    statusTimeoutMs,
+    radioProfile,
   } = params;
 
   if (chunkSizeInput < 16 || chunkSizeInput > OTA_BINARY_MAX_CHUNK) {
@@ -961,8 +1129,17 @@ async function runBinaryOta(params) {
   appendLog(`Firmware: ${fwSize} bytes`);
   appendLog(`Chunk size: ${chunkSize} bytes (${totalChunks} chunks)`);
   appendLog(`Ack every: ${ackEvery} chunk(s)`);
+  appendLog("Checkpoint mode: status");
+  if (radioProfile) {
+    appendLog(
+      `Radio profile: BW=${radioProfile.bwKhz.toFixed(1)}kHz SF=${radioProfile.sf} `
+      + `CR=${radioProfile.cr} factor=${radioProfile.airFactor.toFixed(2)}`
+    );
+  }
 
   const tStart = performance.now();
+  const statusTimeout = Math.max(1200, Number(statusTimeoutMs) || 4000);
+  const quickStatusTimeout = Math.max(900, Math.min(2000, Math.round(statusTimeout * 0.55)));
   let offset = 0;
   let chunkIndex = 0;
   let chunksSinceAck = 0;
@@ -992,7 +1169,7 @@ async function runBinaryOta(params) {
   if (!startReply.toLowerCase().startsWith("ok")) {
     const low = startReply.toLowerCase();
     if (low.includes("already running")) {
-      const st = await getOtaStatusBinary(targetFullKeyHex);
+      const st = await getOtaStatusBinary(targetFullKeyHex, 2, statusTimeout);
       if (st.error) {
         throw new Error(`Start OTA failed (binary): ${startReply}; ${st.error}`);
       }
@@ -1061,7 +1238,12 @@ async function runBinaryOta(params) {
       chunk
     );
 
-    if (!checkpointDue) {
+    const writeOffset = offset;
+    let writeOk = false;
+    let failure = "write failed";
+    const maxRetries = 3;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
       chunkWriteAttempts += 1;
       const writeRes = await client.sendOtaBinaryCmd(
         targetFullKeyHex,
@@ -1071,112 +1253,85 @@ async function runBinaryOta(params) {
         250,
         100
       );
-      if (writeRes.error) {
-        chunkWriteFailures += 1;
-        const st = await getOtaStatusBinary(targetFullKeyHex);
-        if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
-          offset = st.status.done;
-          chunkIndex = Math.floor(offset / chunkSize);
-          chunksSinceAck = 0;
-          appendLog(`Resync offset to ${offset}/${fwSize}`);
-          continue;
-        }
-        throw new Error(`OTA write failed (binary) at offset ${offset}: ${writeRes.error}`);
+      if (!writeRes.error) {
+        writeOk = true;
+        break;
       }
 
+      chunkWriteFailures += 1;
+      failure = writeRes.error || failure;
+
+      // On send error, query status quickly and resync if possible.
+      const st = await getOtaStatusBinary(targetFullKeyHex, 1, quickStatusTimeout);
+      if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
+        const srvOffset = st.status.done;
+        if (srvOffset !== offset) {
+          appendLog(`Resync offset to ${srvOffset}/${fwSize}`);
+          offset = srvOffset;
+          chunkIndex = Math.floor(offset / chunkSize);
+          chunksSinceAck = 0;
+          writeOk = true;
+          break;
+        }
+      }
+
+      if (attempt < maxRetries) {
+        appendLog(`Retry write (binary) at offset ${offset} (${attempt}/${maxRetries})`);
+        await sleep(120 * attempt);
+        continue;
+      }
+
+      if (!st.error && st.reply) {
+        failure = `${failure}; status=${st.reply}`;
+      }
+    }
+
+    if (!writeOk) {
+      throw new Error(`OTA write failed (binary) at offset ${offset}: ${failure}`);
+    }
+
+    // If no status-driven resync happened, advance local cursor.
+    if (offset === writeOffset) {
       offset += chunkLen;
       chunkIndex += 1;
       chunksSinceAck += 1;
-      if (noAckGapMs > 0) await sleep(noAckGapMs);
+      if (!checkpointDue && noAckGapMs > 0) await sleep(noAckGapMs);
     } else {
-      let chunkSent = false;
-      let failure = "checkpoint ack missing";
-      const maxRetries = 3;
+      // Resynced to server offset; continue from there.
+      continue;
+    }
+
+    if (checkpointDue) {
+      let checkpointOk = false;
+      failure = "checkpoint status missing";
 
       for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
-        chunkWriteAttempts += 1;
-        const writeRes = await client.sendOtaBinaryCmd(
+        const st = await getOtaStatusBinary(
           targetFullKeyHex,
-          OTA_BIN_OP.WRITE,
-          writePayload,
-          true,
-          checkpointTimeoutMs,
-          100
+          1,
+          Math.max(1200, checkpointTimeoutMs, statusTimeout)
         );
-        const reply = String(writeRes.replyText || "");
-        const okReply = reply === "" || reply.toLowerCase().startsWith("ok");
-
-        if (!writeRes.error && okReply) {
-          offset += chunkLen;
-          chunkIndex += 1;
-          chunksSinceAck = 0;
-          chunkSent = true;
-          break;
-        }
-
-        chunkWriteFailures += 1;
-
-        if (writeRes.error && writeRes.error.startsWith("timeout waiting binary reply")) {
-          offset += chunkLen;
-          chunkIndex += 1;
-          chunksSinceAck = 0;
-          chunkSent = true;
-          break;
-        }
-
-        const offErr = parseOtaOffsetError(reply);
-        if (offErr) {
-          if (offErr.expected >= offset + chunkLen) {
-            offset = offErr.expected;
-            chunkIndex = Math.floor(offset / chunkSize);
-            chunksSinceAck = 0;
-            chunkSent = true;
-            break;
-          }
-          if (offErr.expected < offset) {
-            offset = offErr.expected;
-            chunkIndex = Math.floor(offset / chunkSize);
-            chunksSinceAck = 0;
-            chunkSent = true;
-            appendLog(`Resync offset to ${offset}/${fwSize}`);
-            break;
-          }
-        }
-
-        failure = writeRes.error || reply || failure;
-        if (attempt < maxRetries) {
-          appendLog(`Retry checkpoint (binary) at offset ${offset} (${attempt}/${maxRetries})`);
-          await sleep(120 * attempt);
-          continue;
-        }
-
-        const st = await getOtaStatusBinary(targetFullKeyHex);
         if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
-          if (st.status.done >= offset + chunkLen) {
-            offset = st.status.done;
-            chunkIndex = Math.floor(offset / chunkSize);
-            chunksSinceAck = 0;
-            chunkSent = true;
-            break;
+          if (st.status.done !== offset) {
+            appendLog(`Resync offset to ${st.status.done}/${fwSize}`);
           }
-          if (st.status.done < offset) {
-            offset = st.status.done;
-            chunkIndex = Math.floor(offset / chunkSize);
-            chunksSinceAck = 0;
-            chunkSent = true;
-            appendLog(`Resync offset to ${offset}/${fwSize}`);
-            break;
-          }
+          offset = st.status.done;
+          chunkIndex = Math.floor(offset / chunkSize);
+          chunksSinceAck = 0;
+          checkpointOk = true;
+          break;
         }
-        if (!st.error && st.reply) {
-          failure = `${failure}; status=${st.reply}`;
+
+        failure = st.error || (st.reply ? `status=${st.reply}` : "invalid status response");
+        if (attempt < maxRetries) {
+          appendLog(`Retry checkpoint status (binary) at offset ${offset} (${attempt}/${maxRetries})`);
+          await sleep(120 * attempt);
         }
       }
 
-      if (!chunkSent) {
-        throw new Error(`OTA write failed (binary) at offset ${offset}: ${failure}`);
+      if (!checkpointOk) {
+        throw new Error(`OTA checkpoint failed (binary) at offset ${offset}: ${failure}`);
       }
-      await sleep(30);
     }
 
     const pct = Math.floor((offset * 100) / fwSize);
@@ -1231,6 +1386,9 @@ async function runTextOta(params) {
     ackEveryInput,
     noAckGapMs,
     checkpointTimeoutMs,
+    statusTimeoutMs,
+    ackSettleGapMs,
+    radioProfile,
   } = params;
 
   if (chunkSizeInput < 16 || chunkSizeInput > 80) {
@@ -1266,6 +1424,18 @@ async function runTextOta(params) {
   appendLog(`Firmware: ${fwSize} bytes`);
   appendLog(`Chunk size: ${chunkSize} bytes (${totalChunks} chunks)`);
   appendLog(`Ack every: ${ackEvery} chunk(s)`);
+  if (radioProfile) {
+    appendLog(
+      `Radio profile: BW=${radioProfile.bwKhz.toFixed(1)}kHz SF=${radioProfile.sf} `
+      + `CR=${radioProfile.cr} factor=${radioProfile.airFactor.toFixed(2)}`
+    );
+  }
+
+  const statusTimeoutSec = clamp((Number(statusTimeoutMs) || 4000) / 1000.0, 2.0, 15.0);
+  const startTimeoutSec = clamp(Math.max(8.0, statusTimeoutSec * 2.2), 8.0, 25.0);
+  const beginTimeoutSec = clamp(Math.max(10.0, statusTimeoutSec * 2.8), 10.0, 30.0);
+  const endTimeoutSec = clamp(Math.max(12.0, statusTimeoutSec * 3.0), 12.0, 35.0);
+  const writeAckTimeoutSec = clamp(Math.max(5.0, (checkpointTimeoutMs / 1000.0) * 1.6), 5.0, 15.0);
 
   const tStart = performance.now();
   let offset = 0;
@@ -1276,7 +1446,7 @@ async function runTextOta(params) {
   let lastProgressPct = -1;
   updateLiveMetrics("text_cmd", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures);
 
-  const startRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "start ota", 15);
+  const startRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "start ota", startTimeoutSec);
   if (startRes.error) {
     throw new Error(`Start OTA failed: ${startRes.error}`);
   }
@@ -1284,7 +1454,7 @@ async function runTextOta(params) {
   let startReply = String(startRes.reply || "");
   if (!startReply.toLowerCase().startsWith("ok")) {
     if (startReply.toLowerCase().includes("already running")) {
-      const st = await getOtaStatus(targetHex);
+      const st = await getOtaStatus(targetHex, statusTimeoutSec);
       if (st.error) {
         throw new Error(`Start OTA failed: ${startReply}; ${st.error}`);
       }
@@ -1302,14 +1472,14 @@ async function runTextOta(params) {
 
   if (offset === 0) {
     let beginCmd = `ota begin ${fwSize} ${ackEvery}`;
-    let beginRes = await client.sendRepeaterCmdAndWaitReply(targetHex, beginCmd, 20);
+    let beginRes = await client.sendRepeaterCmdAndWaitReply(targetHex, beginCmd, beginTimeoutSec);
     if (!beginRes.error && !String(beginRes.reply || "").toLowerCase().startsWith("ok") && ackEvery > 1) {
       const r = String(beginRes.reply || "").toLowerCase();
       if (r.includes("too many args") || r.includes("bad ack")) {
         appendLog("Target ne supporte pas ack_every sur begin, fallback a ack_every=1.");
         ackEvery = 1;
         beginCmd = `ota begin ${fwSize}`;
-        beginRes = await client.sendRepeaterCmdAndWaitReply(targetHex, beginCmd, 20);
+        beginRes = await client.sendRepeaterCmdAndWaitReply(targetHex, beginCmd, beginTimeoutSec);
       }
     }
     if (beginRes.error) {
@@ -1352,7 +1522,7 @@ async function runTextOta(params) {
       const sendErr = await client.sendRepeaterCmdNoReply(targetHex, chunkCmd);
       if (sendErr) {
         chunkWriteFailures += 1;
-        const st = await getOtaStatus(targetHex);
+        const st = await getOtaStatus(targetHex, statusTimeoutSec);
         if (st.status && st.status.done !== offset) {
           offset = st.status.done;
           chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
@@ -1383,7 +1553,7 @@ async function runTextOta(params) {
       const maxRetries = 3;
       for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
         chunkWriteAttempts += 1;
-        const timeoutSec = (ackEvery > 1 ? checkpointTimeoutMs : 5000) / 1000.0;
+        const timeoutSec = (ackEvery > 1 ? checkpointTimeoutMs / 1000.0 : writeAckTimeoutSec);
         const writeRes = await client.sendRepeaterCmdAndWaitReply(targetHex, chunkCmd, timeoutSec);
         const reply = String(writeRes.reply || "");
         const okReply = reply === "" || reply.toLowerCase().startsWith("ok");
@@ -1432,7 +1602,7 @@ async function runTextOta(params) {
           continue;
         }
 
-        const st = await getOtaStatus(targetHex);
+        const st = await getOtaStatus(targetHex, statusTimeoutSec);
         if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
           if (st.status.done >= offset + chunkLen) {
             offset = st.status.done;
@@ -1457,7 +1627,7 @@ async function runTextOta(params) {
       if (!chunkSent) {
         throw new Error(`OTA write failed at offset ${offset}: ${failure}`);
       }
-      await sleep(30);
+      if (ackSettleGapMs > 0) await sleep(ackSettleGapMs);
     }
 
     const pct = Math.floor((offset * 100) / fwSize);
@@ -1469,7 +1639,7 @@ async function runTextOta(params) {
     }
   }
 
-  const endRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "ota end", 25);
+  const endRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "ota end", endTimeoutSec);
   if (endRes.error) {
     throw new Error(`OTA end failed: ${endRes.error}`);
   }
@@ -1514,7 +1684,13 @@ async function runOtaWithAutoTransport(params) {
   }
 
   const textParams = { ...params };
-  if (textParams.chunkSizeInput > 80) {
+  if (textParams.radioProfile && Number.isFinite(Number(textParams.radioProfile.chunkText))) {
+    const profChunk = clamp(Number(textParams.radioProfile.chunkText), 16, 80);
+    if (textParams.chunkSizeInput !== profChunk) {
+      appendLog(`Fallback chunk size adjusted to ${profChunk} (radio profile text mode)`);
+    }
+    textParams.chunkSizeInput = profChunk;
+  } else if (textParams.chunkSizeInput > 80) {
     appendLog("Fallback chunk size adjusted to 80 (text mode limit)");
     textParams.chunkSizeInput = 80;
   }
@@ -1562,12 +1738,27 @@ ui.connectBtn.addEventListener("click", async () => {
     } catch {}
 
     if (selfInfo) {
+      lastSelfInfo = selfInfo;
       ui.selfName.textContent = `Noeud: ${selfInfo.name || "-"}`;
       const pub = selfInfo.public_key || "";
       ui.selfKey.textContent = `PubKey: ${pub ? pub.slice(0, 12) : "-"}`;
+      if (
+        Number.isFinite(Number(selfInfo.radio_bw))
+        && Number.isFinite(Number(selfInfo.radio_sf))
+        && Number.isFinite(Number(selfInfo.radio_cr))
+      ) {
+        appendLog(
+          `Preset radio: ${Number(selfInfo.radio_freq).toFixed(3)} MHz, `
+          + `BW ${Number(selfInfo.radio_bw).toFixed(1)} kHz, `
+          + `SF${Number(selfInfo.radio_sf)}, CR${Number(selfInfo.radio_cr)}`
+        );
+      }
+      if (ui.autoTune?.checked) applyAutoOtaSettings("connect");
     } else {
+      lastSelfInfo = null;
       ui.selfName.textContent = "Noeud: inconnu";
       ui.selfKey.textContent = "PubKey: -";
+      if (ui.autoTune?.checked) applyAutoOtaSettings("connect");
     }
   } catch (e) {
     appendLog(`Connexion impossible: ${e.message}`);
@@ -1587,9 +1778,11 @@ ui.disconnectBtn.addEventListener("click", async () => {
     await client.disconnect();
     client = null;
   }
+  lastSelfInfo = null;
   setConnectionStatus("Non connecte");
   ui.selfName.textContent = "Noeud: -";
   ui.selfKey.textContent = "PubKey: -";
+  if (ui.autoTune?.checked) applyAutoOtaSettings("disconnect");
   appendLog("Deconnecte.");
   updateButtons();
 });
@@ -1630,15 +1823,28 @@ ui.startOtaBtn.addEventListener("click", async () => {
   ui.metricsLine.textContent = "OTA en cours...";
 
   try {
+    const autoSettings = ui.autoTune?.checked ? applyAutoOtaSettings("ota-start") : null;
+    const manualChunk = Number.parseInt(ui.chunkSize.value, 10) || 64;
+    const manualAck = Number.parseInt(ui.ackEvery.value, 10) || 1;
+    const manualNoAckGap = Math.max(0, Number.parseInt(ui.noAckGap.value, 10) || 0);
+    const manualCheckpoint = Math.max(200, Number.parseInt(ui.checkpointTimeout.value, 10) || 500);
+    const manualStatusTimeout = Math.max(1200, Math.round(manualCheckpoint * 1.5));
+
     const params = {
       targetHex: ui.targetKey.value,
       firmware,
-      chunkSizeInput: Number.parseInt(ui.chunkSize.value, 10) || 64,
-      ackEveryInput: Number.parseInt(ui.ackEvery.value, 10) || 1,
-      noAckGapMs: Math.max(0, Number.parseInt(ui.noAckGap.value, 10) || 0),
-      checkpointTimeoutMs: Math.max(200, Number.parseInt(ui.checkpointTimeout.value, 10) || 500),
+      chunkSizeInput: autoSettings ? autoSettings.chunkSize : manualChunk,
+      ackEveryInput: autoSettings ? autoSettings.ackEvery : manualAck,
+      noAckGapMs: autoSettings ? autoSettings.noAckGapMs : manualNoAckGap,
+      checkpointTimeoutMs: autoSettings ? autoSettings.checkpointTimeoutMs : manualCheckpoint,
+      statusTimeoutMs: autoSettings ? autoSettings.statusTimeoutMs : manualStatusTimeout,
+      ackSettleGapMs: autoSettings
+        ? autoSettings.ackSettleGapMs
+        : Math.round(clamp(manualNoAckGap * 0.5, 10, 200)),
+      radioProfile: autoSettings ? autoSettings.profile : null,
     };
     appendLog(`Firmware: ${file.name} (${firmware.length} bytes)`);
+    updatePlanLine();
 
     const password = String(ui.targetPassword.value || "").trim();
     if (password.length > 0) {
@@ -1677,6 +1883,39 @@ ui.startOtaBtn.addEventListener("click", async () => {
   }
 });
 
+if (ui.autoTune) {
+  ui.autoTune.addEventListener("change", () => {
+    updateTuneInputsState();
+    if (ui.autoTune.checked) {
+      applyAutoOtaSettings("toggle");
+    } else {
+      appendLog("Auto tuning desactive.");
+      updatePlanLine();
+    }
+  });
+}
+
+if (ui.firmwareFile) {
+  ui.firmwareFile.addEventListener("change", () => {
+    updatePlanLine();
+  });
+}
+if (ui.chunkSize) {
+  ui.chunkSize.addEventListener("input", () => {
+    updatePlanLine();
+  });
+}
+if (ui.ackEvery) {
+  ui.ackEvery.addEventListener("input", () => {
+    updatePlanLine();
+  });
+}
+
 setConnectionStatus("Non connecte");
 setProgress(0);
+updateTuneInputsState();
+if (ui.autoTune?.checked) {
+  applyAutoOtaSettings();
+}
+updatePlanLine();
 updateButtons();
