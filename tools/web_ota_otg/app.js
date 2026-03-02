@@ -146,6 +146,133 @@ function clamp(value, minValue, maxValue) {
   return Math.max(minValue, Math.min(maxValue, value));
 }
 
+function safeAdd32(x, y) {
+  const lsw = (x & 0xffff) + (y & 0xffff);
+  const msw = (x >>> 16) + (y >>> 16) + (lsw >>> 16);
+  return (((msw & 0xffff) << 16) | (lsw & 0xffff)) >>> 0;
+}
+
+function rotl32(x, n) {
+  return ((x << n) | (x >>> (32 - n))) >>> 0;
+}
+
+function md5Digest(bytes) {
+  const s = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+  ];
+
+  const k = [
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+    0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+    0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+    0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+    0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+    0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+    0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+    0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+    0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+  ];
+
+  const origLen = bytes.length >>> 0;
+  const padLen = ((56 - ((origLen + 1) % 64)) + 64) % 64;
+  const totalLen = origLen + 1 + padLen + 8;
+  const msg = new Uint8Array(totalLen);
+  msg.set(bytes);
+  msg[origLen] = 0x80;
+
+  const bitLenLo = (origLen << 3) >>> 0;
+  const bitLenHi = (origLen >>> 29) >>> 0;
+  msg[totalLen - 8] = bitLenLo & 0xff;
+  msg[totalLen - 7] = (bitLenLo >>> 8) & 0xff;
+  msg[totalLen - 6] = (bitLenLo >>> 16) & 0xff;
+  msg[totalLen - 5] = (bitLenLo >>> 24) & 0xff;
+  msg[totalLen - 4] = bitLenHi & 0xff;
+  msg[totalLen - 3] = (bitLenHi >>> 8) & 0xff;
+  msg[totalLen - 2] = (bitLenHi >>> 16) & 0xff;
+  msg[totalLen - 1] = (bitLenHi >>> 24) & 0xff;
+
+  let a0 = 0x67452301;
+  let b0 = 0xefcdab89;
+  let c0 = 0x98badcfe;
+  let d0 = 0x10325476;
+
+  const x = new Uint32Array(16);
+  for (let offset = 0; offset < totalLen; offset += 64) {
+    for (let i = 0; i < 16; i += 1) {
+      const j = offset + (i * 4);
+      x[i] = (msg[j]) | (msg[j + 1] << 8) | (msg[j + 2] << 16) | (msg[j + 3] << 24);
+    }
+
+    let a = a0;
+    let b = b0;
+    let c = c0;
+    let d = d0;
+
+    for (let i = 0; i < 64; i += 1) {
+      let f = 0;
+      let g = 0;
+
+      if (i < 16) {
+        f = (b & c) | ((~b) & d);
+        g = i;
+      } else if (i < 32) {
+        f = (d & b) | ((~d) & c);
+        g = ((5 * i) + 1) % 16;
+      } else if (i < 48) {
+        f = b ^ c ^ d;
+        g = ((3 * i) + 5) % 16;
+      } else {
+        f = c ^ (b | (~d));
+        g = (7 * i) % 16;
+      }
+
+      const temp = d;
+      d = c;
+      c = b;
+      const sum = safeAdd32(a, safeAdd32(f >>> 0, safeAdd32(k[i], x[g] >>> 0)));
+      b = safeAdd32(b, rotl32(sum, s[i]));
+      a = temp;
+    }
+
+    a0 = safeAdd32(a0, a);
+    b0 = safeAdd32(b0, b);
+    c0 = safeAdd32(c0, c);
+    d0 = safeAdd32(d0, d);
+  }
+
+  const out = new Uint8Array(16);
+  const words = [a0, b0, c0, d0];
+  for (let i = 0; i < 4; i += 1) {
+    const w = words[i] >>> 0;
+    out[(i * 4)] = w & 0xff;
+    out[(i * 4) + 1] = (w >>> 8) & 0xff;
+    out[(i * 4) + 2] = (w >>> 16) & 0xff;
+    out[(i * 4) + 3] = (w >>> 24) & 0xff;
+  }
+  return out;
+}
+
+function md5Hex(bytes) {
+  return bytesToHex(md5Digest(bytes));
+}
+
+function estimateRejectedChunks(localOffset, serverOffset, chunkSize) {
+  if (!Number.isFinite(localOffset) || !Number.isFinite(serverOffset)) return 0;
+  if (serverOffset >= localOffset) return 0;
+  const step = Math.max(1, Number(chunkSize) || 1);
+  return Math.max(1, Math.ceil((localOffset - serverOffset) / step));
+}
+
 function estimateOtaRadioProfile(radioBwKhz, radioSf, radioCr) {
   const bw = Number(radioBwKhz);
   const sfRaw = Number(radioSf);
@@ -182,8 +309,8 @@ function estimateOtaRadioProfile(radioBwKhz, radioSf, radioCr) {
   else if (airFactor <= 10.0) ackEvery = 3;
 
   const noAckGapSec = clamp(0.015 + (0.025 * airFactor), 0.015, 0.45);
-  const checkpointTimeoutSec = clamp(0.7 + (0.9 * airFactor), 1.2, 12.0);
-  const statusTimeoutSec = clamp(0.5 + (0.8 * airFactor), 1.2, 10.0);
+  const checkpointTimeoutSec = clamp(0.35 + (0.6 * airFactor), 0.5, 12.0);
+  const statusTimeoutSec = clamp(0.35 + (0.8 * airFactor), 0.5, 10.0);
 
   return {
     bwKhz: bw,
@@ -968,23 +1095,29 @@ function setProgress(percent) {
   ui.progressBar.style.width = `${p}%`;
 }
 
-function updateLiveMetrics(transport, doneBytes, totalBytes, startTs, attempts, failures) {
+function updateLiveMetrics(transport, doneBytes, totalBytes, startTs, attempts, sendFailures, serverRejects = 0) {
   const pct = totalBytes > 0 ? Math.floor((doneBytes * 100) / totalBytes) : 0;
   const elapsedSec = Math.max(0.001, (performance.now() - startTs) / 1000.0);
   const rateBps = doneBytes / elapsedSec;
   const remainingBytes = Math.max(0, totalBytes - doneBytes);
   const etaSec = rateBps > 0 ? (remainingBytes / rateBps) : NaN;
-  const failureRatePct = attempts > 0 ? (failures * 100.0 / attempts) : 0.0;
+  const sendFailureRatePct = attempts > 0 ? (sendFailures * 100.0 / attempts) : 0.0;
+  const serverRejectRatePct = attempts > 0 ? (serverRejects * 100.0 / attempts) : 0.0;
+  const totalRejects = sendFailures + serverRejects;
+  const totalRejectRatePct = attempts > 0 ? (totalRejects * 100.0 / attempts) : 0.0;
   const tr = transport === "binary_req" ? "binary" : "text";
 
   if (!Number.isFinite(etaSec) || doneBytes <= 0) {
     ui.metricsLine.textContent =
-      `Transport ${tr} | ${pct}% | Estimation en cours... | Echecs ${failures}/${attempts} (${failureRatePct.toFixed(2)}%)`;
+      `Transport ${tr} | ${pct}% | Estimation en cours... | Rejets ${totalRejects}/${attempts} (${totalRejectRatePct.toFixed(2)}%)`;
     return;
   }
 
   ui.metricsLine.textContent =
-    `Transport ${tr} | ${pct}% | Restant ~${formatDuration(etaSec)} | Echecs ${failures}/${attempts} (${failureRatePct.toFixed(2)}%)`;
+    `Transport ${tr} | ${pct}% | Restant ~${formatDuration(etaSec)} | `
+    + `Rejets ${totalRejects}/${attempts} (${totalRejectRatePct.toFixed(2)}%) `
+    + `[send ${sendFailures}/${attempts} ${sendFailureRatePct.toFixed(2)}%, `
+    + `srv ${serverRejects}/${attempts} ${serverRejectRatePct.toFixed(2)}%]`;
 }
 
 function updateButtons() {
@@ -1102,6 +1235,7 @@ async function runBinaryOta(params) {
     targetHex,
     targetFullKeyHex,
     firmware,
+    firmwareMd5,
     chunkSizeInput,
     ackEveryInput,
     noAckGapMs,
@@ -1119,6 +1253,9 @@ async function runBinaryOta(params) {
   if (!firmware || firmware.length === 0) {
     throw new Error("firmware vide");
   }
+  if (!/^[0-9a-f]{32}$/i.test(String(firmwareMd5 || ""))) {
+    throw new Error("md5 firmware invalide");
+  }
 
   const fwSize = firmware.length;
   let chunkSize = Math.min(chunkSizeInput, OTA_BINARY_MAX_CHUNK);
@@ -1126,7 +1263,7 @@ async function runBinaryOta(params) {
   const totalChunks = Math.ceil(fwSize / chunkSize);
 
   appendLog(`Transport: binary req`);
-  appendLog(`Firmware: ${fwSize} bytes`);
+  appendLog(`Firmware: ${fwSize} bytes (md5=${firmwareMd5})`);
   appendLog(`Chunk size: ${chunkSize} bytes (${totalChunks} chunks)`);
   appendLog(`Ack every: ${ackEvery} chunk(s)`);
   appendLog("Checkpoint mode: status");
@@ -1138,15 +1275,16 @@ async function runBinaryOta(params) {
   }
 
   const tStart = performance.now();
-  const statusTimeout = Math.max(1200, Number(statusTimeoutMs) || 4000);
-  const quickStatusTimeout = Math.max(900, Math.min(2000, Math.round(statusTimeout * 0.55)));
+  const statusTimeout = Math.max(500, Number(statusTimeoutMs) || 4000);
+  const quickStatusTimeout = Math.max(450, Math.min(2000, Math.round(statusTimeout * 0.55)));
   let offset = 0;
   let chunkIndex = 0;
   let chunksSinceAck = 0;
   let chunkWriteAttempts = 0;
   let chunkWriteFailures = 0;
+  let chunkServerRejects = 0;
   let lastProgressPct = -1;
-  updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures);
+  updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
 
   const startRes = await client.sendOtaBinaryCmd(
     targetFullKeyHex,
@@ -1189,9 +1327,14 @@ async function runBinaryOta(params) {
   }
 
   if (offset === 0) {
+    const md5Bytes = hexToBytes(firmwareMd5);
+    if (md5Bytes.length !== 16) {
+      throw new Error("md5 firmware invalide (taille)");
+    }
     const beginPayload = concatBytes(
       u32ToBytesLE(fwSize),
-      Uint8Array.of(ackEvery & 0xff)
+      Uint8Array.of(ackEvery & 0xff),
+      md5Bytes
     );
     const beginRes = await client.sendOtaBinaryCmd(
       targetFullKeyHex,
@@ -1266,6 +1409,7 @@ async function runBinaryOta(params) {
       if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
         const srvOffset = st.status.done;
         if (srvOffset !== offset) {
+          chunkServerRejects += estimateRejectedChunks(offset, srvOffset, chunkSize);
           appendLog(`Resync offset to ${srvOffset}/${fwSize}`);
           offset = srvOffset;
           chunkIndex = Math.floor(offset / chunkSize);
@@ -1309,10 +1453,11 @@ async function runBinaryOta(params) {
         const st = await getOtaStatusBinary(
           targetFullKeyHex,
           1,
-          Math.max(1200, checkpointTimeoutMs, statusTimeout)
+          Math.max(500, checkpointTimeoutMs)
         );
         if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
           if (st.status.done !== offset) {
+            chunkServerRejects += estimateRejectedChunks(offset, st.status.done, chunkSize);
             appendLog(`Resync offset to ${st.status.done}/${fwSize}`);
           }
           offset = st.status.done;
@@ -1338,7 +1483,15 @@ async function runBinaryOta(params) {
     if (pct !== lastProgressPct && (pct % 2 === 0 || offset === fwSize)) {
       setProgress(pct);
       setOtaStatus(`Progress: ${pct}% (${chunkIndex}/${totalChunks})`);
-      updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures);
+      updateLiveMetrics(
+        "binary_req",
+        offset,
+        fwSize,
+        tStart,
+        chunkWriteAttempts,
+        chunkWriteFailures,
+        chunkServerRejects
+      );
       lastProgressPct = pct;
     }
   }
@@ -1361,8 +1514,15 @@ async function runBinaryOta(params) {
   await client.sendRepeaterCmdNoReply(targetHex, "reboot");
 
   const durationSec = (performance.now() - tStart) / 1000.0;
-  const failureRatePct = chunkWriteAttempts > 0
+  const sendFailureRatePct = chunkWriteAttempts > 0
     ? (chunkWriteFailures * 100.0) / chunkWriteAttempts
+    : 0;
+  const serverRejectRatePct = chunkWriteAttempts > 0
+    ? (chunkServerRejects * 100.0) / chunkWriteAttempts
+    : 0;
+  const totalRejects = chunkWriteFailures + chunkServerRejects;
+  const failureRatePct = chunkWriteAttempts > 0
+    ? (totalRejects * 100.0) / chunkWriteAttempts
     : 0;
 
   return {
@@ -1374,6 +1534,10 @@ async function runBinaryOta(params) {
     durationSec,
     chunkWriteAttempts,
     chunkWriteFailures,
+    chunkServerRejects,
+    totalRejects,
+    sendFailureRatePct,
+    serverRejectRatePct,
     failureRatePct,
   };
 }
@@ -1382,6 +1546,7 @@ async function runTextOta(params) {
   const {
     targetHex,
     firmware,
+    firmwareMd5,
     chunkSizeInput,
     ackEveryInput,
     noAckGapMs,
@@ -1399,6 +1564,9 @@ async function runTextOta(params) {
   }
   if (!firmware || firmware.length === 0) {
     throw new Error("firmware vide");
+  }
+  if (!/^[0-9a-f]{32}$/i.test(String(firmwareMd5 || ""))) {
+    throw new Error("md5 firmware invalide");
   }
 
   const targetPrefix = client.normalizeTargetPrefix(targetHex);
@@ -1421,7 +1589,7 @@ async function runTextOta(params) {
   }
 
   appendLog(`OTA target prefix: ${targetPrefix}`);
-  appendLog(`Firmware: ${fwSize} bytes`);
+  appendLog(`Firmware: ${fwSize} bytes (md5=${firmwareMd5})`);
   appendLog(`Chunk size: ${chunkSize} bytes (${totalChunks} chunks)`);
   appendLog(`Ack every: ${ackEvery} chunk(s)`);
   if (radioProfile) {
@@ -1443,8 +1611,9 @@ async function runTextOta(params) {
   let chunksSinceAck = 0;
   let chunkWriteAttempts = 0;
   let chunkWriteFailures = 0;
+  let chunkServerRejects = 0;
   let lastProgressPct = -1;
-  updateLiveMetrics("text_cmd", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures);
+  updateLiveMetrics("text_cmd", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
 
   const startRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "start ota", startTimeoutSec);
   if (startRes.error) {
@@ -1471,14 +1640,14 @@ async function runTextOta(params) {
   }
 
   if (offset === 0) {
-    let beginCmd = `ota begin ${fwSize} ${ackEvery}`;
+    let beginCmd = `ota begin ${fwSize} ${firmwareMd5} ${ackEvery}`;
     let beginRes = await client.sendRepeaterCmdAndWaitReply(targetHex, beginCmd, beginTimeoutSec);
     if (!beginRes.error && !String(beginRes.reply || "").toLowerCase().startsWith("ok") && ackEvery > 1) {
       const r = String(beginRes.reply || "").toLowerCase();
       if (r.includes("too many args") || r.includes("bad ack")) {
         appendLog("Target ne supporte pas ack_every sur begin, fallback a ack_every=1.");
         ackEvery = 1;
-        beginCmd = `ota begin ${fwSize}`;
+        beginCmd = `ota begin ${fwSize} ${firmwareMd5}`;
         beginRes = await client.sendRepeaterCmdAndWaitReply(targetHex, beginCmd, beginTimeoutSec);
       }
     }
@@ -1499,6 +1668,7 @@ async function runTextOta(params) {
     const pendingOffsetErr = client.popLatestOffsetError(targetPrefix);
     if (pendingOffsetErr && pendingOffsetErr.expected !== offset && pendingOffsetErr.expected <= fwSize) {
       chunkWriteFailures += 1;
+      chunkServerRejects += estimateRejectedChunks(offset, pendingOffsetErr.expected, chunkSize);
       offset = pendingOffsetErr.expected;
       chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
       chunksSinceAck = 0;
@@ -1524,6 +1694,7 @@ async function runTextOta(params) {
         chunkWriteFailures += 1;
         const st = await getOtaStatus(targetHex, statusTimeoutSec);
         if (st.status && st.status.done !== offset) {
+          chunkServerRejects += estimateRejectedChunks(offset, st.status.done, chunkSize);
           offset = st.status.done;
           chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
           chunksSinceAck = 0;
@@ -1540,6 +1711,7 @@ async function runTextOta(params) {
       const postSendErr = client.popLatestOffsetError(targetPrefix);
       if (postSendErr && postSendErr.expected !== offset && postSendErr.expected <= fwSize) {
         chunkWriteFailures += 1;
+        chunkServerRejects += estimateRejectedChunks(offset, postSendErr.expected, chunkSize);
         offset = postSendErr.expected;
         chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
         chunksSinceAck = 0;
@@ -1578,6 +1750,9 @@ async function runTextOta(params) {
 
         const offErr = !writeRes.error ? parseOtaOffsetError(reply) : null;
         if (offErr) {
+          if (offErr.expected < offset + chunkLen) {
+            chunkServerRejects += estimateRejectedChunks(offset + chunkLen, offErr.expected, chunkSize);
+          }
           if (offErr.expected >= offset + chunkLen) {
             offset = offErr.expected;
             chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
@@ -1612,6 +1787,7 @@ async function runTextOta(params) {
             break;
           }
           if (st.status.done < offset) {
+            chunkServerRejects += estimateRejectedChunks(offset, st.status.done, chunkSize);
             offset = st.status.done;
             chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
             chunksSinceAck = 0;
@@ -1634,7 +1810,15 @@ async function runTextOta(params) {
     if (pct !== lastProgressPct && (pct % 2 === 0 || offset === fwSize)) {
       setProgress(pct);
       setOtaStatus(`Progress: ${pct}% (${chunkIndex}/${totalChunks})`);
-      updateLiveMetrics("text_cmd", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures);
+      updateLiveMetrics(
+        "text_cmd",
+        offset,
+        fwSize,
+        tStart,
+        chunkWriteAttempts,
+        chunkWriteFailures,
+        chunkServerRejects
+      );
       lastProgressPct = pct;
     }
   }
@@ -1650,8 +1834,15 @@ async function runTextOta(params) {
   await client.sendRepeaterCmdNoReply(targetHex, "reboot");
 
   const durationSec = (performance.now() - tStart) / 1000.0;
-  const failureRatePct = chunkWriteAttempts > 0
+  const sendFailureRatePct = chunkWriteAttempts > 0
     ? (chunkWriteFailures * 100.0) / chunkWriteAttempts
+    : 0;
+  const serverRejectRatePct = chunkWriteAttempts > 0
+    ? (chunkServerRejects * 100.0) / chunkWriteAttempts
+    : 0;
+  const totalRejects = chunkWriteFailures + chunkServerRejects;
+  const failureRatePct = chunkWriteAttempts > 0
+    ? (totalRejects * 100.0) / chunkWriteAttempts
     : 0;
 
   return {
@@ -1663,6 +1854,10 @@ async function runTextOta(params) {
     durationSec,
     chunkWriteAttempts,
     chunkWriteFailures,
+    chunkServerRejects,
+    totalRejects,
+    sendFailureRatePct,
+    serverRejectRatePct,
     failureRatePct,
   };
 }
@@ -1815,6 +2010,14 @@ ui.startOtaBtn.addEventListener("click", async () => {
     return;
   }
 
+  let firmwareMd5;
+  try {
+    firmwareMd5 = md5Hex(firmware);
+  } catch (e) {
+    appendLog(`Calcul MD5 echoue: ${e.message}`);
+    return;
+  }
+
   otaRunning = true;
   otaCancelRequested = false;
   updateButtons();
@@ -1833,6 +2036,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
     const params = {
       targetHex: ui.targetKey.value,
       firmware,
+      firmwareMd5,
       chunkSizeInput: autoSettings ? autoSettings.chunkSize : manualChunk,
       ackEveryInput: autoSettings ? autoSettings.ackEvery : manualAck,
       noAckGapMs: autoSettings ? autoSettings.noAckGapMs : manualNoAckGap,
@@ -1844,6 +2048,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
       radioProfile: autoSettings ? autoSettings.profile : null,
     };
     appendLog(`Firmware: ${file.name} (${firmware.length} bytes)`);
+    appendLog(`MD5: ${firmwareMd5}`);
     updatePlanLine();
 
     const password = String(ui.targetPassword.value || "").trim();
@@ -1866,12 +2071,17 @@ ui.startOtaBtn.addEventListener("click", async () => {
     appendLog(`Transport utilise: ${result.transport === "binary_req" ? "binary req" : "text cmd"}`);
     appendLog(`Duration: ${formatDuration(result.durationSec)}`);
     appendLog(
-      `Chunk failures: ${result.chunkWriteFailures}/${result.chunkWriteAttempts} (${result.failureRatePct.toFixed(2)}%)`
+      `Rejets chunks: total ${result.totalRejects}/${result.chunkWriteAttempts} (${result.failureRatePct.toFixed(2)}%), `
+      + `send ${result.chunkWriteFailures}/${result.chunkWriteAttempts} (${result.sendFailureRatePct.toFixed(2)}%), `
+      + `serveur ${result.chunkServerRejects}/${result.chunkWriteAttempts} (${result.serverRejectRatePct.toFixed(2)}%)`
     );
     setProgress(100);
     setOtaStatus("OTA terminee");
     ui.metricsLine.textContent =
-      `Transport ${result.transport === "binary_req" ? "binary" : "text"} | Duree ${formatDuration(result.durationSec)} | Echecs chunks ${result.chunkWriteFailures}/${result.chunkWriteAttempts} (${result.failureRatePct.toFixed(2)}%)`;
+      `Transport ${result.transport === "binary_req" ? "binary" : "text"} | Duree ${formatDuration(result.durationSec)} | `
+      + `Rejets total ${result.totalRejects}/${result.chunkWriteAttempts} (${result.failureRatePct.toFixed(2)}%) `
+      + `[send ${result.chunkWriteFailures}/${result.chunkWriteAttempts} ${result.sendFailureRatePct.toFixed(2)}%, `
+      + `srv ${result.chunkServerRejects}/${result.chunkWriteAttempts} ${result.serverRejectRatePct.toFixed(2)}%]`;
   } catch (e) {
     appendLog(`OTA error: ${e.message}`);
     setOtaStatus("OTA echouee");
