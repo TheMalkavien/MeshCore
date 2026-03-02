@@ -119,24 +119,51 @@ function isWebUsbDeviceLike(device) {
   );
 }
 
-function findWebUsbCdcCandidate(device) {
+function configurationHasBulkPair(cfg) {
+  for (const iface of cfg?.interfaces || []) {
+    for (const alt of iface.alternates || []) {
+      const inEp = (alt.endpoints || []).some((ep) => ep.type === "bulk" && ep.direction === "in");
+      const outEp = (alt.endpoints || []).some((ep) => ep.type === "bulk" && ep.direction === "out");
+      if (inEp && outEp) return true;
+    }
+  }
+  return false;
+}
+
+function listWebUsbBulkCandidates(device) {
   const cfg = device?.configuration;
-  if (!cfg || !Array.isArray(cfg.interfaces)) return null;
+  if (!cfg || !Array.isArray(cfg.interfaces)) return [];
 
-  let firstBulk = null;
-  let firstData = null;
-  let controlIface = null;
+  const controlIfaces = [];
+  for (const iface of cfg.interfaces) {
+    for (const alt of iface.alternates || []) {
+      if (alt.interfaceClass === WEBUSB_CDC_CLASS_CONTROL) {
+        controlIfaces.push(iface.interfaceNumber);
+        break;
+      }
+    }
+  }
 
+  const candidates = [];
   for (const iface of cfg.interfaces) {
     for (const alt of iface.alternates || []) {
       const inEp = (alt.endpoints || []).find((ep) => ep.type === "bulk" && ep.direction === "in");
       const outEp = (alt.endpoints || []).find((ep) => ep.type === "bulk" && ep.direction === "out");
-      if (alt.interfaceClass === WEBUSB_CDC_CLASS_CONTROL && controlIface === null) {
-        controlIface = iface.interfaceNumber;
-      }
       if (!inEp || !outEp) continue;
 
-      const candidate = {
+      let controlInterfaceNumber = iface.interfaceNumber;
+      if (alt.interfaceClass === WEBUSB_CDC_CLASS_DATA) {
+        const prev = iface.interfaceNumber - 1;
+        if (controlIfaces.includes(prev)) {
+          controlInterfaceNumber = prev;
+        } else if (controlIfaces.length > 0) {
+          controlInterfaceNumber = controlIfaces[0];
+        }
+      } else if (controlIfaces.length > 0) {
+        controlInterfaceNumber = controlIfaces[0];
+      }
+
+      candidates.push({
         interfaceNumber: iface.interfaceNumber,
         alternateSetting: alt.alternateSetting || 0,
         inEndpoint: inEp.endpointNumber,
@@ -144,22 +171,20 @@ function findWebUsbCdcCandidate(device) {
         inPacketSize: Number(inEp.packetSize || WEBUSB_DEFAULT_PACKET_SIZE),
         outPacketSize: Number(outEp.packetSize || WEBUSB_DEFAULT_PACKET_SIZE),
         classCode: alt.interfaceClass,
-      };
-
-      if (!firstBulk) firstBulk = candidate;
-      if (!firstData && alt.interfaceClass === WEBUSB_CDC_CLASS_DATA) {
-        firstData = candidate;
-      }
+        controlInterfaceNumber,
+      });
     }
   }
 
-  const selected = firstData || firstBulk;
-  if (!selected) return null;
-
-  return {
-    ...selected,
-    controlInterfaceNumber: controlIface !== null ? controlIface : selected.interfaceNumber,
-  };
+  candidates.sort((a, b) => {
+    const rank = (c) => {
+      if (c.classCode === WEBUSB_CDC_CLASS_DATA) return 0;
+      if (c.classCode === 0xff) return 1; // vendor specific
+      return 2;
+    };
+    return rank(a) - rank(b);
+  });
+  return candidates;
 }
 
 function maxOtaChunkForOffset(offset) {
@@ -495,25 +520,53 @@ class MeshCoreSerialClient {
     this.usbDevice = device;
     await this.usbDevice.open();
     if (!this.usbDevice.configuration) {
-      await this.usbDevice.selectConfiguration(1);
+      const cfgs = Array.isArray(this.usbDevice.configurations)
+        ? this.usbDevice.configurations
+        : [];
+      if (cfgs.length > 0) {
+        const preferredCfg = cfgs.find((cfg) => configurationHasBulkPair(cfg)) || cfgs[0];
+        await this.usbDevice.selectConfiguration(preferredCfg.configurationValue);
+      } else {
+        await this.usbDevice.selectConfiguration(1);
+      }
     }
 
-    const cdc = findWebUsbCdcCandidate(this.usbDevice);
-    if (!cdc) {
+    const candidates = listWebUsbBulkCandidates(this.usbDevice);
+    if (candidates.length < 1) {
       throw new Error("interface CDC bulk IN/OUT non trouvee");
     }
 
-    this.usbDataInterface = cdc.interfaceNumber;
-    this.usbControlInterface = cdc.controlInterfaceNumber;
-    this.usbInEndpoint = cdc.inEndpoint;
-    this.usbOutEndpoint = cdc.outEndpoint;
-    this.usbInPacketSize = Math.max(8, cdc.inPacketSize || WEBUSB_DEFAULT_PACKET_SIZE);
-    this.usbOutPacketSize = Math.max(8, cdc.outPacketSize || WEBUSB_DEFAULT_PACKET_SIZE);
-
-    await this.usbDevice.claimInterface(this.usbDataInterface);
-    if (cdc.alternateSetting && cdc.alternateSetting > 0) {
-      await this.usbDevice.selectAlternateInterface(this.usbDataInterface, cdc.alternateSetting);
+    let selected = null;
+    let lastClaimErr = null;
+    for (const c of candidates) {
+      try {
+        await this.usbDevice.claimInterface(c.interfaceNumber);
+        if (c.alternateSetting && c.alternateSetting > 0) {
+          await this.usbDevice.selectAlternateInterface(c.interfaceNumber, c.alternateSetting);
+        }
+        selected = c;
+        break;
+      } catch (e) {
+        lastClaimErr = e;
+        try { await this.usbDevice.releaseInterface(c.interfaceNumber); } catch {}
+      }
     }
+
+    if (!selected) {
+      const hint = "interface USB verrouillee (souvent driver CDC Android).";
+      const details = candidates
+        .map((c) => `if${c.interfaceNumber}/cls0x${Number(c.classCode).toString(16)}`)
+        .join(", ");
+      throw new Error(`Unable to claim interface: ${hint} candidates=[${details}] ${lastClaimErr ? `(${lastClaimErr.message})` : ""}`.trim());
+    }
+
+    this.usbDataInterface = selected.interfaceNumber;
+    this.usbControlInterface = selected.controlInterfaceNumber;
+    this.usbInEndpoint = selected.inEndpoint;
+    this.usbOutEndpoint = selected.outEndpoint;
+    this.usbInPacketSize = Math.max(8, selected.inPacketSize || WEBUSB_DEFAULT_PACKET_SIZE);
+    this.usbOutPacketSize = Math.max(8, selected.outPacketSize || WEBUSB_DEFAULT_PACKET_SIZE);
+
     if (
       this.usbControlInterface !== null
       && this.usbControlInterface !== undefined
@@ -522,7 +575,7 @@ class MeshCoreSerialClient {
       try {
         await this.usbDevice.claimInterface(this.usbControlInterface);
       } catch {
-        // Some devices do not allow claiming control interface.
+        // Optional.
       }
     }
 
