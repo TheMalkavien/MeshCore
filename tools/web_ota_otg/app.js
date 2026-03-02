@@ -30,6 +30,19 @@ const PACKET_TYPE = {
   BINARY_RESPONSE: 0x8c,
 };
 
+const WEBUSB_REQ_SET_LINE_CODING = 0x20;
+const WEBUSB_REQ_SET_CONTROL_LINE_STATE = 0x22;
+const WEBUSB_CDC_CLASS_CONTROL = 0x02;
+const WEBUSB_CDC_CLASS_DATA = 0x0a;
+const WEBUSB_DEFAULT_PACKET_SIZE = 64;
+const WEBUSB_DEVICE_FILTERS = [
+  { vendorId: 0x2e8a }, // Raspberry Pi / RP2040
+  { vendorId: 0x10c4 }, // Silicon Labs CP210x
+  { vendorId: 0x1a86 }, // QinHeng CH34x
+  { classCode: WEBUSB_CDC_CLASS_CONTROL },
+  { classCode: WEBUSB_CDC_CLASS_DATA },
+];
+
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
 
@@ -86,6 +99,67 @@ function concatBytes(...parts) {
     offset += p.length;
   }
   return out;
+}
+
+function isWebSerialPortLike(port) {
+  return Boolean(
+    port
+    && typeof port.open === "function"
+    && port.readable
+    && port.writable
+  );
+}
+
+function isWebUsbDeviceLike(device) {
+  return Boolean(
+    device
+    && typeof device.open === "function"
+    && typeof device.transferIn === "function"
+    && typeof device.transferOut === "function"
+  );
+}
+
+function findWebUsbCdcCandidate(device) {
+  const cfg = device?.configuration;
+  if (!cfg || !Array.isArray(cfg.interfaces)) return null;
+
+  let firstBulk = null;
+  let firstData = null;
+  let controlIface = null;
+
+  for (const iface of cfg.interfaces) {
+    for (const alt of iface.alternates || []) {
+      const inEp = (alt.endpoints || []).find((ep) => ep.type === "bulk" && ep.direction === "in");
+      const outEp = (alt.endpoints || []).find((ep) => ep.type === "bulk" && ep.direction === "out");
+      if (alt.interfaceClass === WEBUSB_CDC_CLASS_CONTROL && controlIface === null) {
+        controlIface = iface.interfaceNumber;
+      }
+      if (!inEp || !outEp) continue;
+
+      const candidate = {
+        interfaceNumber: iface.interfaceNumber,
+        alternateSetting: alt.alternateSetting || 0,
+        inEndpoint: inEp.endpointNumber,
+        outEndpoint: outEp.endpointNumber,
+        inPacketSize: Number(inEp.packetSize || WEBUSB_DEFAULT_PACKET_SIZE),
+        outPacketSize: Number(outEp.packetSize || WEBUSB_DEFAULT_PACKET_SIZE),
+        classCode: alt.interfaceClass,
+      };
+
+      if (!firstBulk) firstBulk = candidate;
+      if (!firstData && alt.interfaceClass === WEBUSB_CDC_CLASS_DATA) {
+        firstData = candidate;
+      }
+    }
+  }
+
+  const selected = firstData || firstBulk;
+  if (!selected) return null;
+
+  return {
+    ...selected,
+    controlInterfaceNumber: controlIface !== null ? controlIface : selected.interfaceNumber,
+  };
 }
 
 function maxOtaChunkForOffset(offset) {
@@ -364,6 +438,14 @@ class MeshCoreSerialClient {
     this.port = null;
     this.reader = null;
     this.writer = null;
+    this.usbDevice = null;
+    this.usbDataInterface = null;
+    this.usbControlInterface = null;
+    this.usbInEndpoint = null;
+    this.usbOutEndpoint = null;
+    this.usbInPacketSize = WEBUSB_DEFAULT_PACKET_SIZE;
+    this.usbOutPacketSize = WEBUSB_DEFAULT_PACKET_SIZE;
+    this.transport = null;
     this.connected = false;
     this.rxPending = [];
     this.waiters = [];
@@ -377,7 +459,19 @@ class MeshCoreSerialClient {
     this.onEvent = null;
   }
 
-  async connect(port, baudrate) {
+  async connect(portOrDevice, baudrate) {
+    if (isWebSerialPortLike(portOrDevice)) {
+      await this.connectSerial(portOrDevice, baudrate);
+      return;
+    }
+    if (isWebUsbDeviceLike(portOrDevice)) {
+      await this.connectWebUsb(portOrDevice, baudrate);
+      return;
+    }
+    throw new Error("transport USB non supporte");
+  }
+
+  async connectSerial(port, baudrate) {
     if (!port) throw new Error("port USB manquant");
     this.port = port;
     await this.port.open({
@@ -389,9 +483,91 @@ class MeshCoreSerialClient {
     });
     this.reader = this.port.readable.getReader();
     this.writer = this.port.writable.getWriter();
+    this.transport = "web_serial";
     this.connected = true;
     this.rxPending = [];
-    this.readLoop();
+    this.readLoopSerial();
+  }
+
+  async connectWebUsb(device, baudrate = 115200) {
+    if (!device) throw new Error("peripherique USB manquant");
+
+    this.usbDevice = device;
+    await this.usbDevice.open();
+    if (!this.usbDevice.configuration) {
+      await this.usbDevice.selectConfiguration(1);
+    }
+
+    const cdc = findWebUsbCdcCandidate(this.usbDevice);
+    if (!cdc) {
+      throw new Error("interface CDC bulk IN/OUT non trouvee");
+    }
+
+    this.usbDataInterface = cdc.interfaceNumber;
+    this.usbControlInterface = cdc.controlInterfaceNumber;
+    this.usbInEndpoint = cdc.inEndpoint;
+    this.usbOutEndpoint = cdc.outEndpoint;
+    this.usbInPacketSize = Math.max(8, cdc.inPacketSize || WEBUSB_DEFAULT_PACKET_SIZE);
+    this.usbOutPacketSize = Math.max(8, cdc.outPacketSize || WEBUSB_DEFAULT_PACKET_SIZE);
+
+    await this.usbDevice.claimInterface(this.usbDataInterface);
+    if (cdc.alternateSetting && cdc.alternateSetting > 0) {
+      await this.usbDevice.selectAlternateInterface(this.usbDataInterface, cdc.alternateSetting);
+    }
+    if (
+      this.usbControlInterface !== null
+      && this.usbControlInterface !== undefined
+      && this.usbControlInterface !== this.usbDataInterface
+    ) {
+      try {
+        await this.usbDevice.claimInterface(this.usbControlInterface);
+      } catch {
+        // Some devices do not allow claiming control interface.
+      }
+    }
+
+    try {
+      const lineCoding = new Uint8Array(7);
+      const baud = Number(baudrate) || 115200;
+      lineCoding[0] = baud & 0xff;
+      lineCoding[1] = (baud >> 8) & 0xff;
+      lineCoding[2] = (baud >> 16) & 0xff;
+      lineCoding[3] = (baud >> 24) & 0xff;
+      lineCoding[4] = 0; // 1 stop bit
+      lineCoding[5] = 0; // no parity
+      lineCoding[6] = 8; // data bits
+      await this.usbDevice.controlTransferOut(
+        {
+          requestType: "class",
+          recipient: "interface",
+          request: WEBUSB_REQ_SET_LINE_CODING,
+          value: 0,
+          index: this.usbControlInterface ?? this.usbDataInterface,
+        },
+        lineCoding
+      );
+    } catch {
+      // Optional for some CDC implementations.
+    }
+
+    try {
+      await this.usbDevice.controlTransferOut(
+        {
+          requestType: "class",
+          recipient: "interface",
+          request: WEBUSB_REQ_SET_CONTROL_LINE_STATE,
+          value: 0x0001, // DTR
+          index: this.usbControlInterface ?? this.usbDataInterface,
+        }
+      );
+    } catch {
+      // Optional for some CDC implementations.
+    }
+
+    this.transport = "web_usb";
+    this.connected = true;
+    this.rxPending = [];
+    this.readLoopWebUsb();
   }
 
   async disconnect() {
@@ -414,9 +590,34 @@ class MeshCoreSerialClient {
       try { await this.port.close(); } catch {}
       this.port = null;
     }
+    if (this.usbDevice) {
+      try {
+        if (this.usbDataInterface !== null && this.usbDataInterface !== undefined) {
+          await this.usbDevice.releaseInterface(this.usbDataInterface);
+        }
+      } catch {}
+      try {
+        if (
+          this.usbControlInterface !== null
+          && this.usbControlInterface !== undefined
+          && this.usbControlInterface !== this.usbDataInterface
+        ) {
+          await this.usbDevice.releaseInterface(this.usbControlInterface);
+        }
+      } catch {}
+      try { await this.usbDevice.close(); } catch {}
+      this.usbDevice = null;
+    }
+    this.usbDataInterface = null;
+    this.usbControlInterface = null;
+    this.usbInEndpoint = null;
+    this.usbOutEndpoint = null;
+    this.usbInPacketSize = WEBUSB_DEFAULT_PACKET_SIZE;
+    this.usbOutPacketSize = WEBUSB_DEFAULT_PACKET_SIZE;
+    this.transport = null;
   }
 
-  async readLoop() {
+  async readLoopSerial() {
     while (this.connected && this.reader) {
       let res;
       try {
@@ -432,6 +633,32 @@ class MeshCoreSerialClient {
     }
     if (this.connected) {
       this.log("Connexion serie interrompue.");
+      await this.disconnect();
+    }
+  }
+
+  async readLoopWebUsb() {
+    while (this.connected && this.usbDevice && this.usbInEndpoint !== null) {
+      let res;
+      try {
+        res = await this.usbDevice.transferIn(this.usbInEndpoint, this.usbInPacketSize);
+      } catch (e) {
+        if (this.connected) this.log(`USB RX error: ${e.message}`);
+        break;
+      }
+      if (!res) continue;
+      if (res.status === "stall") {
+        try { await this.usbDevice.clearHalt("in", this.usbInEndpoint); } catch {}
+        continue;
+      }
+      if (res.status !== "ok" || !res.data || res.data.byteLength === 0) continue;
+
+      const chunk = new Uint8Array(res.data.buffer, res.data.byteOffset, res.data.byteLength);
+      this.pushRxChunk(chunk);
+      this.parseFrames();
+    }
+    if (this.connected) {
+      this.log("Connexion USB interrompue.");
       await this.disconnect();
     }
   }
@@ -703,7 +930,7 @@ class MeshCoreSerialClient {
   }
 
   async sendFrame(payload) {
-    if (!this.connected || !this.writer) {
+    if (!this.connected) {
       throw new Error("non connecte");
     }
     if (!(payload instanceof Uint8Array)) {
@@ -714,7 +941,28 @@ class MeshCoreSerialClient {
     frame[1] = payload.length & 0xff;
     frame[2] = (payload.length >> 8) & 0xff;
     frame.set(payload, 3);
-    await this.writer.write(frame);
+    await this.writeRaw(frame);
+  }
+
+  async writeRaw(bytes) {
+    if (this.writer) {
+      await this.writer.write(bytes);
+      return;
+    }
+    if (this.usbDevice && this.usbOutEndpoint !== null) {
+      let offset = 0;
+      while (offset < bytes.length) {
+        const end = Math.min(bytes.length, offset + this.usbOutPacketSize);
+        const chunk = bytes.slice(offset, end);
+        const res = await this.usbDevice.transferOut(this.usbOutEndpoint, chunk);
+        if (!res || res.status !== "ok") {
+          throw new Error(`usb transferOut status=${res?.status || "unknown"}`);
+        }
+        offset = end;
+      }
+      return;
+    }
+    throw new Error("transport ecriture indisponible");
   }
 
   async sendCommand(payload, expectedTypes = [], predicate = null, timeoutMs = 5000) {
@@ -1892,69 +2140,117 @@ async function runOtaWithAutoTransport(params) {
   return runTextOta(textParams);
 }
 
-ui.connectBtn.addEventListener("click", async () => {
-  if (!("serial" in navigator)) {
+function formatUsbDeviceLabel(device) {
+  if (!device) return "USB";
+  const vid = Number(device.vendorId || 0).toString(16).padStart(4, "0");
+  const pid = Number(device.productId || 0).toString(16).padStart(4, "0");
+  return `USB ${vid}:${pid}`;
+}
+
+async function initClientSession(baudrate) {
+  let selfInfo = null;
+  try {
+    const startEvt = await client.sendAppStart();
+    if (startEvt?.type === "self_info") {
+      selfInfo = startEvt.payload;
+    } else if (startEvt?.type === "error") {
+      appendLog(`APP_START error code=${startEvt.payload?.error_code}`);
+    }
+  } catch (e) {
+    appendLog(`APP_START timeout: ${e.message}`);
+  }
+
+  try {
+    await client.sendDeviceQuery();
+  } catch {}
+
+  if (selfInfo) {
+    lastSelfInfo = selfInfo;
+    ui.selfName.textContent = `Noeud: ${selfInfo.name || "-"}`;
+    const pub = selfInfo.public_key || "";
+    ui.selfKey.textContent = `PubKey: ${pub ? pub.slice(0, 12) : "-"}`;
+    if (
+      Number.isFinite(Number(selfInfo.radio_bw))
+      && Number.isFinite(Number(selfInfo.radio_sf))
+      && Number.isFinite(Number(selfInfo.radio_cr))
+    ) {
+      appendLog(
+        `Preset radio: ${Number(selfInfo.radio_freq).toFixed(3)} MHz, `
+        + `BW ${Number(selfInfo.radio_bw).toFixed(1)} kHz, `
+        + `SF${Number(selfInfo.radio_sf)}, CR${Number(selfInfo.radio_cr)}`
+      );
+    }
+    if (ui.autoTune?.checked) applyAutoOtaSettings("connect");
+  } else {
+    lastSelfInfo = null;
+    ui.selfName.textContent = "Noeud: inconnu";
+    ui.selfKey.textContent = "PubKey: -";
+    if (ui.autoTune?.checked) applyAutoOtaSettings("connect");
+  }
+
+  const mode = client.transport === "web_usb" ? "WebUSB" : "Web Serial";
+  setConnectionStatus(`Connecte ${mode} (${baudrate} bps)`, true);
+}
+
+async function connectClientWithBestUsbTransport(baudrate) {
+  let serialErr = null;
+
+  if ("serial" in navigator) {
+    try {
+      appendLog("Tentative de connexion Web Serial...");
+      const port = await navigator.serial.requestPort();
+      const c = new MeshCoreSerialClient(appendLog);
+      c.onEvent = (type, payload) => {
+        if (type === "contact_msg_recv" && payload?.txt_type === 1) {
+          const txt = String(payload.text || "").trim();
+          if (txt.startsWith("[OTA]")) {
+            appendLog(`RX OTA: ${payload.pubkey_prefix} ${txt}`);
+          }
+        }
+      };
+      await c.connectSerial(port, baudrate);
+      client = c;
+      appendLog("USB serie connecte via Web Serial.");
+      return;
+    } catch (e) {
+      serialErr = e;
+      appendLog(`Web Serial indisponible: ${e.message}`);
+    }
+  } else {
     appendLog("Web Serial non supporte par ce navigateur.");
+  }
+
+  if (!("usb" in navigator)) {
+    throw serialErr || new Error("WebUSB non supporte par ce navigateur");
+  }
+
+  appendLog("Tentative de connexion WebUSB...");
+  const device = await navigator.usb.requestDevice({ filters: WEBUSB_DEVICE_FILTERS });
+  const c = new MeshCoreSerialClient(appendLog);
+  c.onEvent = (type, payload) => {
+    if (type === "contact_msg_recv" && payload?.txt_type === 1) {
+      const txt = String(payload.text || "").trim();
+      if (txt.startsWith("[OTA]")) {
+        appendLog(`RX OTA: ${payload.pubkey_prefix} ${txt}`);
+      }
+    }
+  };
+  await c.connectWebUsb(device, baudrate);
+  client = c;
+  appendLog(`USB connecte via WebUSB (${formatUsbDeviceLabel(device)}).`);
+}
+
+ui.connectBtn.addEventListener("click", async () => {
+  if (!("serial" in navigator) && !("usb" in navigator)) {
+    appendLog("Ni Web Serial ni WebUSB ne sont supportes par ce navigateur.");
     return;
   }
   if (otaRunning) return;
 
   try {
     const baudrate = Number.parseInt(ui.baudrate.value, 10) || 115200;
-    const port = await navigator.serial.requestPort();
-    client = new MeshCoreSerialClient(appendLog);
-    client.onEvent = (type, payload) => {
-      if (type === "contact_msg_recv" && payload?.txt_type === 1) {
-        const txt = String(payload.text || "").trim();
-        if (txt.startsWith("[OTA]")) {
-          appendLog(`RX OTA: ${payload.pubkey_prefix} ${txt}`);
-        }
-      }
-    };
-
-    await client.connect(port, baudrate);
-    setConnectionStatus(`Connecte (${baudrate} bps)`, true);
-    appendLog("USB serie connecte.");
-
-    let selfInfo = null;
-    try {
-      const startEvt = await client.sendAppStart();
-      if (startEvt?.type === "self_info") {
-        selfInfo = startEvt.payload;
-      } else if (startEvt?.type === "error") {
-        appendLog(`APP_START error code=${startEvt.payload?.error_code}`);
-      }
-    } catch (e) {
-      appendLog(`APP_START timeout: ${e.message}`);
-    }
-
-    try {
-      await client.sendDeviceQuery();
-    } catch {}
-
-    if (selfInfo) {
-      lastSelfInfo = selfInfo;
-      ui.selfName.textContent = `Noeud: ${selfInfo.name || "-"}`;
-      const pub = selfInfo.public_key || "";
-      ui.selfKey.textContent = `PubKey: ${pub ? pub.slice(0, 12) : "-"}`;
-      if (
-        Number.isFinite(Number(selfInfo.radio_bw))
-        && Number.isFinite(Number(selfInfo.radio_sf))
-        && Number.isFinite(Number(selfInfo.radio_cr))
-      ) {
-        appendLog(
-          `Preset radio: ${Number(selfInfo.radio_freq).toFixed(3)} MHz, `
-          + `BW ${Number(selfInfo.radio_bw).toFixed(1)} kHz, `
-          + `SF${Number(selfInfo.radio_sf)}, CR${Number(selfInfo.radio_cr)}`
-        );
-      }
-      if (ui.autoTune?.checked) applyAutoOtaSettings("connect");
-    } else {
-      lastSelfInfo = null;
-      ui.selfName.textContent = "Noeud: inconnu";
-      ui.selfKey.textContent = "PubKey: -";
-      if (ui.autoTune?.checked) applyAutoOtaSettings("connect");
-    }
+    await connectClientWithBestUsbTransport(baudrate);
+    await initClientSession(baudrate);
   } catch (e) {
     appendLog(`Connexion impossible: ${e.message}`);
     setConnectionStatus("Connexion echouee");
