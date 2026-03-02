@@ -17,7 +17,12 @@ Par defaut, il tente:
 - Handshake `APP_START` puis `DEVICE_QUERY`.
 - Envoi OTA en **transport binaire** (si support cible), sinon fallback texte.
 - Affiche une estimation du temps restant pendant l'upload.
+- Affiche le `Plan OTA` dans le journal (console) au lieu d'une ligne UI dediee.
 - Mode `ack_every` (checkpoint tous les N chunks).
+- Option `Preset OTA temporaire`:
+  - envoie `tempradio` a la cible avant OTA
+  - bascule le client USB sur le meme preset
+  - restaure le preset radio du client en fin d'OTA
 - Resume simple si `start ota` retourne `already running`.
 - Statistiques en fin d'OTA:
   - duree
@@ -52,7 +57,8 @@ Puis ouvrir:
 4. (Optionnel) renseigner `Mot de passe` pour faire un login avant OTA.
 5. Selectionner le firmware `.bin` ou `.bin.gz`.
 6. Regler `chunk size`, `ack every`, `gap`, `checkpoint timeout`.
-7. Cliquer `Lancer OTA`.
+7. (Optionnel) activer `Preset OTA temporaire` et regler `freq,bw,sf,cr` (defaut: `869.4,250,5,5`).
+8. Cliquer `Lancer OTA`.
 
 ## Reglages de depart recommandes
 

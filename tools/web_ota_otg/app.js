@@ -11,6 +11,7 @@ const OTA_BIN_OP = {
   ABORT: 6,
 };
 const OTA_BINARY_MAX_CHUNK = 132;
+const CMD_SET_RADIO_PARAMS = 11;
 
 const PACKET_TYPE = {
   OK: 0,
@@ -28,6 +29,13 @@ const PACKET_TYPE = {
   LOGIN_SUCCESS: 0x85,
   LOGIN_FAILED: 0x86,
   BINARY_RESPONSE: 0x8c,
+};
+
+const CONTACT_TYPE = {
+  COMPANION: 1,
+  REPEATER: 2,
+  ROOM_SERVER: 3,
+  SENSOR: 4,
 };
 
 const WEBUSB_REQ_SET_LINE_CODING = 0x20;
@@ -245,6 +253,37 @@ function clamp(value, minValue, maxValue) {
   return Math.max(minValue, Math.min(maxValue, value));
 }
 
+function formatRadioValue(value, decimals = 3) {
+  if (!Number.isFinite(Number(value))) return "-";
+  return Number(value).toFixed(decimals).replace(/\.?0+$/, "");
+}
+
+function normalizeRadioPreset(preset) {
+  if (!preset) return null;
+  const freq = Number(preset.freq);
+  const bw = Number(preset.bw);
+  const sf = Math.trunc(Number(preset.sf));
+  const cr = Math.trunc(Number(preset.cr));
+  if (!Number.isFinite(freq) || !Number.isFinite(bw) || !Number.isFinite(sf) || !Number.isFinite(cr)) {
+    return null;
+  }
+  if (freq < 300.0 || freq > 2500.0) return null;
+  if (bw < 7.0 || bw > 500.0) return null;
+  if (sf < 5 || sf > 12) return null;
+  if (cr < 5 || cr > 8) return null;
+  return { freq, bw, sf, cr };
+}
+
+function extractRadioPresetFromSelfInfo(selfInfo) {
+  if (!selfInfo) return null;
+  return normalizeRadioPreset({
+    freq: selfInfo.radio_freq,
+    bw: selfInfo.radio_bw,
+    sf: selfInfo.radio_sf,
+    cr: selfInfo.radio_cr,
+  });
+}
+
 function safeAdd32(x, y) {
   const lsw = (x & 0xffff) + (y & 0xffff);
   const msw = (x >>> 16) + (y >>> 16) + (lsw >>> 16);
@@ -408,7 +447,7 @@ function estimateOtaRadioProfile(radioBwKhz, radioSf, radioCr) {
   else if (airFactor <= 10.0) ackEvery = 3;
 
   const noAckGapSec = clamp(0.015 + (0.025 * airFactor), 0.015, 0.45);
-  const checkpointTimeoutSec = clamp(0.35 + (0.6 * airFactor), 0.5, 12.0);
+  const checkpointTimeoutSec = clamp(0.35 + (0.6 * airFactor), 1.0, 12.0);
   const statusTimeoutSec = clamp(0.35 + (0.8 * airFactor), 0.5, 10.0);
 
   return {
@@ -425,20 +464,14 @@ function estimateOtaRadioProfile(radioBwKhz, radioSf, radioCr) {
   };
 }
 
-function computeAutoOtaSettings(selfInfo) {
-  const profile = estimateOtaRadioProfile(
-    selfInfo?.radio_bw,
-    selfInfo?.radio_sf,
-    selfInfo?.radio_cr
-  );
-
+function computeAutoOtaSettingsFromProfile(profile) {
   if (!profile) {
     return {
       profile: null,
       chunkSize: 96,
       ackEvery: 1,
       noAckGapMs: 50,
-      checkpointTimeoutMs: 500,
+      checkpointTimeoutMs: 1000,
       statusTimeoutMs: 4000,
       ackSettleGapMs: 30,
     };
@@ -455,6 +488,15 @@ function computeAutoOtaSettings(selfInfo) {
     statusTimeoutMs: Math.round(profile.statusTimeoutSec * 1000.0),
     ackSettleGapMs: Math.round(clamp(noAckGapMs * 0.5, 10, 200)),
   };
+}
+
+function computeAutoOtaSettings(selfInfo) {
+  const profile = estimateOtaRadioProfile(
+    selfInfo?.radio_bw,
+    selfInfo?.radio_sf,
+    selfInfo?.radio_cr
+  );
+  return computeAutoOtaSettingsFromProfile(profile);
 }
 
 class MeshCoreSerialClient {
@@ -1052,6 +1094,27 @@ class MeshCoreSerialClient {
     return this.sendCommand(Uint8Array.of(0x16, 0x03), ["device_info", "error"], null, 5000);
   }
 
+  async setLocalRadioParams(freqMhz, bwKhz, sf, cr, repeat = 0) {
+    const norm = normalizeRadioPreset({ freq: freqMhz, bw: bwKhz, sf, cr });
+    if (!norm) {
+      return { ok: false, error: "parametres radio invalides" };
+    }
+    const freqKhz = Math.round(norm.freq * 1000.0);
+    const bwHz = Math.round(norm.bw * 1000.0);
+    const payload = concatBytes(
+      Uint8Array.of(CMD_SET_RADIO_PARAMS),
+      u32ToBytesLE(freqKhz),
+      u32ToBytesLE(bwHz),
+      Uint8Array.of(norm.sf & 0xff, norm.cr & 0xff, repeat ? 1 : 0)
+    );
+    const evt = await this.sendCommand(payload, ["ok", "error"], null, 5000);
+    if (!evt || evt.type === "error") {
+      const code = evt?.payload?.error_code;
+      return { ok: false, error: `set radio error${code !== undefined ? ` (code=${code})` : ""}` };
+    }
+    return { ok: true };
+  }
+
   normalizeTargetPrefix(targetHex) {
     const clean = normalizeHex(targetHex);
     if (clean.length < 12) {
@@ -1368,7 +1431,9 @@ const ui = {
   disconnectBtn: document.querySelector("#disconnectBtn"),
   startOtaBtn: document.querySelector("#startOtaBtn"),
   cancelOtaBtn: document.querySelector("#cancelOtaBtn"),
+  refreshTargetsBtn: document.querySelector("#refreshTargetsBtn"),
   baudrate: document.querySelector("#baudrate"),
+  targetSelect: document.querySelector("#targetSelect"),
   targetKey: document.querySelector("#targetKey"),
   targetPassword: document.querySelector("#targetPassword"),
   firmwareFile: document.querySelector("#firmwareFile"),
@@ -1377,12 +1442,19 @@ const ui = {
   noAckGap: document.querySelector("#noAckGap"),
   checkpointTimeout: document.querySelector("#checkpointTimeout"),
   autoTune: document.querySelector("#autoTune"),
+  useTempRadio: document.querySelector("#useTempRadio"),
+  tempRadioFreq: document.querySelector("#tempRadioFreq"),
+  tempRadioBw: document.querySelector("#tempRadioBw"),
+  tempRadioSf: document.querySelector("#tempRadioSf"),
+  tempRadioCr: document.querySelector("#tempRadioCr"),
+  tempRadioMins: document.querySelector("#tempRadioMins"),
   planLine: document.querySelector("#planLine"),
   connectionStatus: document.querySelector("#connectionStatus"),
   otaStatus: document.querySelector("#otaStatus"),
   metricsLine: document.querySelector("#metricsLine"),
   selfName: document.querySelector("#selfName"),
   selfKey: document.querySelector("#selfKey"),
+  selfRadio: document.querySelector("#selfRadio"),
   progressBar: document.querySelector("#progressBar"),
   log: document.querySelector("#log"),
 };
@@ -1391,6 +1463,7 @@ let client = null;
 let otaRunning = false;
 let otaCancelRequested = false;
 let lastSelfInfo = null;
+let lastPlanSummary = "";
 
 function appendLog(line) {
   ui.log.value += `[${nowTime()}] ${line}\n`;
@@ -1408,6 +1481,85 @@ function setOtaStatus(text) {
 function setProgress(percent) {
   const p = Math.max(0, Math.min(100, Number(percent) || 0));
   ui.progressBar.style.width = `${p}%`;
+}
+
+function formatRadioPresetText(presetLike) {
+  const preset = normalizeRadioPreset(presetLike);
+  if (!preset) return "-";
+  return `${formatRadioValue(preset.freq)} MHz | BW ${formatRadioValue(preset.bw, 1)} kHz | SF${preset.sf} | CR${preset.cr}`;
+}
+
+function targetKeyPreview(fullKey) {
+  const clean = normalizeHex(fullKey);
+  if (clean.length < 12) return clean || "-";
+  return `${clean.slice(0, 12)}...`;
+}
+
+function getSelectedTargetHex() {
+  const selected = normalizeHex(ui.targetSelect?.value || "");
+  if (selected.length >= 12) return selected;
+  const manual = normalizeHex(ui.targetKey?.value || "");
+  if (manual.length >= 12) return manual;
+  return "";
+}
+
+function resetTargetRepeaterSelect() {
+  if (!ui.targetSelect) return;
+  ui.targetSelect.innerHTML = "";
+  const option = document.createElement("option");
+  option.value = "";
+  option.textContent = "Selectionner un repetiteur...";
+  ui.targetSelect.appendChild(option);
+  ui.targetSelect.value = "";
+}
+
+function isRepeaterContact(contact) {
+  return Number(contact?.type) === CONTACT_TYPE.REPEATER;
+}
+
+function buildRepeaterOptionLabel(contact) {
+  const name = String(contact?.adv_name || "").trim() || "Repeater";
+  const key = normalizeHex(contact?.public_key || "");
+  const suffix = key.length >= 12 ? key.slice(0, 12) : key;
+  return `${name} (${suffix})`;
+}
+
+function updateTargetRepeaterSelect(contacts, keepCurrent = true) {
+  if (!ui.targetSelect) return;
+  const manual = normalizeHex(ui.targetKey?.value || "");
+  const previous = keepCurrent
+    ? normalizeHex(ui.targetSelect.value || manual)
+    : "";
+
+  const repeaters = Object.values(contacts || {})
+    .filter((c) => isRepeaterContact(c) && normalizeHex(c.public_key || "").length >= 12)
+    .sort((a, b) => {
+      const la = Number(a.last_advert || 0);
+      const lb = Number(b.last_advert || 0);
+      if (lb !== la) return lb - la;
+      const na = String(a.adv_name || "").toLowerCase();
+      const nb = String(b.adv_name || "").toLowerCase();
+      return na.localeCompare(nb);
+    });
+
+  resetTargetRepeaterSelect();
+  for (const contact of repeaters) {
+    const key = normalizeHex(contact.public_key || "");
+    if (key.length < 12) continue;
+    const option = document.createElement("option");
+    option.value = key;
+    option.textContent = buildRepeaterOptionLabel(contact);
+    ui.targetSelect.appendChild(option);
+  }
+
+  const allOptionValues = Array.from(ui.targetSelect.options).map((opt) => normalizeHex(opt.value || ""));
+  const selected =
+    allOptionValues.find((k) => previous.length >= 12 && (k === previous || k.startsWith(previous) || previous.startsWith(k)))
+    || "";
+  ui.targetSelect.value = selected;
+  if (!manual && selected && ui.targetKey) {
+    ui.targetKey.value = selected;
+  }
 }
 
 function updateLiveMetrics(transport, doneBytes, totalBytes, startTs, attempts, sendFailures, serverRejects = 0) {
@@ -1441,6 +1593,13 @@ function updateButtons() {
   ui.disconnectBtn.disabled = !connected || otaRunning;
   ui.startOtaBtn.disabled = !connected || otaRunning;
   ui.cancelOtaBtn.disabled = !otaRunning;
+  if (ui.refreshTargetsBtn) ui.refreshTargetsBtn.disabled = !connected || otaRunning;
+  if (ui.targetSelect) ui.targetSelect.disabled = !connected || otaRunning;
+  if (ui.targetKey) ui.targetKey.disabled = otaRunning;
+  if (ui.useTempRadio) {
+    ui.useTempRadio.disabled = otaRunning;
+  }
+  updateTempRadioInputsState();
 }
 
 function updateTuneInputsState() {
@@ -1451,17 +1610,25 @@ function updateTuneInputsState() {
   if (ui.checkpointTimeout) ui.checkpointTimeout.disabled = auto;
 }
 
-function updatePlanLine() {
-  if (!ui.planLine) return;
+function updateTempRadioInputsState() {
+  const useTemp = Boolean(ui.useTempRadio?.checked) && !otaRunning;
+  if (ui.tempRadioFreq) ui.tempRadioFreq.disabled = !useTemp;
+  if (ui.tempRadioBw) ui.tempRadioBw.disabled = !useTemp;
+  if (ui.tempRadioSf) ui.tempRadioSf.disabled = !useTemp;
+  if (ui.tempRadioCr) ui.tempRadioCr.disabled = !useTemp;
+  if (ui.tempRadioMins) ui.tempRadioMins.disabled = !useTemp;
+}
 
+function updatePlanLine(logToConsole = true) {
   const file = ui.firmwareFile?.files && ui.firmwareFile.files[0];
   const fwSize = file ? Number(file.size || 0) : 0;
   const chunkInput = Number.parseInt(ui.chunkSize?.value || "0", 10) || 0;
   const ackEvery = Number.parseInt(ui.ackEvery?.value || "0", 10) || 0;
+  let planText = "Plan OTA: selectionne un firmware";
 
   if (!file || fwSize <= 0 || chunkInput < 1) {
-    ui.planLine.textContent = "Plan OTA: selectionne un firmware";
-    return;
+    if (ui.planLine) ui.planLine.textContent = planText;
+    return planText;
   }
 
   const binaryChunk = clamp(chunkInput, 16, OTA_BINARY_MAX_CHUNK);
@@ -1469,14 +1636,25 @@ function updatePlanLine() {
 
   const safeTextLimit = maxOtaChunkForOffset(Math.max(0, fwSize - 1));
   if (safeTextLimit < 16) {
-    ui.planLine.textContent = `Plan OTA: binaire ~${binaryChunks} chunks (chunk ${binaryChunk}), fallback texte indisponible`;
-    return;
+    planText = `Plan OTA: binaire ~${binaryChunks} chunks (chunk ${binaryChunk}), fallback texte indisponible`;
+    if (ui.planLine) ui.planLine.textContent = planText;
+    if (logToConsole && planText !== lastPlanSummary) {
+      appendLog(planText);
+      lastPlanSummary = planText;
+    }
+    return planText;
   }
   const textChunk = Math.min(binaryChunk, 80, safeTextLimit);
   const textChunks = estimateOtaChunkCount(fwSize, textChunk);
-  ui.planLine.textContent =
+  planText =
     `Plan OTA: binaire ~${binaryChunks} chunks (chunk ${binaryChunk}, ack ${ackEvery || 1}) | `
     + `fallback texte ~${textChunks} chunks (chunk ${textChunk})`;
+  if (ui.planLine) ui.planLine.textContent = planText;
+  if (logToConsole && planText !== lastPlanSummary) {
+    appendLog(planText);
+    lastPlanSummary = planText;
+  }
+  return planText;
 }
 
 function applyAutoOtaSettings(logReason = null) {
@@ -1504,6 +1682,46 @@ function applyAutoOtaSettings(logReason = null) {
     }
   }
   return tuning;
+}
+
+function applyAutoOtaSettingsForPreset(preset, logReason = null) {
+  const norm = normalizeRadioPreset(preset);
+  if (!norm) {
+    throw new Error("Preset radio invalide pour auto tuning");
+  }
+  const profile = estimateOtaRadioProfile(norm.bw, norm.sf, norm.cr);
+  const tuning = computeAutoOtaSettingsFromProfile(profile);
+
+  ui.chunkSize.value = String(tuning.chunkSize);
+  ui.ackEvery.value = String(tuning.ackEvery);
+  ui.noAckGap.value = String(tuning.noAckGapMs);
+  ui.checkpointTimeout.value = String(tuning.checkpointTimeoutMs);
+  updatePlanLine(true);
+
+  if (logReason) {
+    appendLog(
+      `Auto tuning (${logReason}): chunk=${tuning.chunkSize} ack=${tuning.ackEvery} `
+      + `gap=${tuning.noAckGapMs}ms timeout=${tuning.checkpointTimeoutMs}ms `
+      + `| BW=${norm.bw.toFixed(1)} SF=${norm.sf} CR=${norm.cr}`
+    );
+  }
+  return tuning;
+}
+
+function recalcAutoFromCurrentSelection(logReason = null) {
+  if (!ui.autoTune?.checked) return null;
+  if (ui.useTempRadio?.checked) {
+    try {
+      const preset = readTempRadioPresetFromUi();
+      return applyAutoOtaSettingsForPreset(preset, logReason);
+    } catch (e) {
+      if (logReason) {
+        appendLog(`Auto tuning ignore (preset OTA invalide): ${e.message}`);
+      }
+      return null;
+    }
+  }
+  return applyAutoOtaSettings(logReason);
 }
 
 async function getFirmwareBytes(file) {
@@ -1599,6 +1817,8 @@ async function runBinaryOta(params) {
   let chunkWriteFailures = 0;
   let chunkServerRejects = 0;
   let lastProgressPct = -1;
+  const writeMaxRetries = 3;
+  const checkpointMaxRetries = 10;
   updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
 
   const startRes = await client.sendOtaBinaryCmd(
@@ -1699,9 +1919,8 @@ async function runBinaryOta(params) {
     const writeOffset = offset;
     let writeOk = false;
     let failure = "write failed";
-    const maxRetries = 3;
 
-    for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+    for (let attempt = 1; attempt <= writeMaxRetries; attempt += 1) {
       chunkWriteAttempts += 1;
       const writeRes = await client.sendOtaBinaryCmd(
         targetFullKeyHex,
@@ -1734,8 +1953,8 @@ async function runBinaryOta(params) {
         }
       }
 
-      if (attempt < maxRetries) {
-        appendLog(`Retry write (binary) at offset ${offset} (${attempt}/${maxRetries})`);
+      if (attempt < writeMaxRetries) {
+        appendLog(`Retry write (binary) at offset ${offset} (${attempt}/${writeMaxRetries})`);
         await sleep(120 * attempt);
         continue;
       }
@@ -1764,7 +1983,7 @@ async function runBinaryOta(params) {
       let checkpointOk = false;
       failure = "checkpoint status missing";
 
-      for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+      for (let attempt = 1; attempt <= checkpointMaxRetries; attempt += 1) {
         const st = await getOtaStatusBinary(
           targetFullKeyHex,
           1,
@@ -1783,8 +2002,8 @@ async function runBinaryOta(params) {
         }
 
         failure = st.error || (st.reply ? `status=${st.reply}` : "invalid status response");
-        if (attempt < maxRetries) {
-          appendLog(`Retry checkpoint status (binary) at offset ${offset} (${attempt}/${maxRetries})`);
+        if (attempt < checkpointMaxRetries) {
+          appendLog(`Retry checkpoint status (binary) at offset ${offset} (${attempt}/${checkpointMaxRetries})`);
           await sleep(120 * attempt);
         }
       }
@@ -2037,8 +2256,8 @@ async function runTextOta(params) {
     } else {
       let chunkSent = false;
       let failure = "checkpoint ack missing";
-      const maxRetries = 3;
-      for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+      const checkpointMaxRetries = 10;
+      for (let attempt = 1; attempt <= checkpointMaxRetries; attempt += 1) {
         chunkWriteAttempts += 1;
         const timeoutSec = (ackEvery > 1 ? checkpointTimeoutMs / 1000.0 : writeAckTimeoutSec);
         const writeRes = await client.sendRepeaterCmdAndWaitReply(targetHex, chunkCmd, timeoutSec);
@@ -2086,8 +2305,8 @@ async function runTextOta(params) {
         }
 
         failure = writeRes.error || reply || failure;
-        if (attempt < maxRetries) {
-          appendLog(`Retry checkpoint at offset ${offset} (${attempt}/${maxRetries})`);
+        if (attempt < checkpointMaxRetries) {
+          appendLog(`Retry checkpoint at offset ${offset} (${attempt}/${checkpointMaxRetries})`);
           await sleep(120 * attempt);
           continue;
         }
@@ -2214,30 +2433,23 @@ function formatUsbDeviceLabel(device) {
   return `USB ${vid}:${pid}`;
 }
 
-async function initClientSession(baudrate) {
-  let selfInfo = null;
-  try {
-    const startEvt = await client.sendAppStart();
-    if (startEvt?.type === "self_info") {
-      selfInfo = startEvt.payload;
-    } else if (startEvt?.type === "error") {
-      appendLog(`APP_START error code=${startEvt.payload?.error_code}`);
-    }
-  } catch (e) {
-    appendLog(`APP_START timeout: ${e.message}`);
-  }
-
-  try {
-    await client.sendDeviceQuery();
-  } catch {}
-
+function updateSelfInfoUi(selfInfo, logRadio = false) {
   if (selfInfo) {
     lastSelfInfo = selfInfo;
     ui.selfName.textContent = `Noeud: ${selfInfo.name || "-"}`;
     const pub = selfInfo.public_key || "";
     ui.selfKey.textContent = `PubKey: ${pub ? pub.slice(0, 12) : "-"}`;
+    if (ui.selfRadio) {
+      ui.selfRadio.textContent = `Radio: ${formatRadioPresetText({
+        freq: selfInfo.radio_freq,
+        bw: selfInfo.radio_bw,
+        sf: selfInfo.radio_sf,
+        cr: selfInfo.radio_cr,
+      })}`;
+    }
     if (
-      Number.isFinite(Number(selfInfo.radio_bw))
+      logRadio
+      && Number.isFinite(Number(selfInfo.radio_bw))
       && Number.isFinite(Number(selfInfo.radio_sf))
       && Number.isFinite(Number(selfInfo.radio_cr))
     ) {
@@ -2247,16 +2459,151 @@ async function initClientSession(baudrate) {
         + `SF${Number(selfInfo.radio_sf)}, CR${Number(selfInfo.radio_cr)}`
       );
     }
-    if (ui.autoTune?.checked) applyAutoOtaSettings("connect");
-  } else {
-    lastSelfInfo = null;
-    ui.selfName.textContent = "Noeud: inconnu";
-    ui.selfKey.textContent = "PubKey: -";
-    if (ui.autoTune?.checked) applyAutoOtaSettings("connect");
+    return;
   }
+  lastSelfInfo = null;
+  ui.selfName.textContent = "Noeud: inconnu";
+  ui.selfKey.textContent = "PubKey: -";
+  if (ui.selfRadio) ui.selfRadio.textContent = "Radio: -";
+}
+
+async function syncSelfInfoFromNode(logErrors = false) {
+  let selfInfo = null;
+  try {
+    const startEvt = await client.sendAppStart();
+    if (startEvt?.type === "self_info") {
+      selfInfo = startEvt.payload;
+    } else if (startEvt?.type === "error") {
+      if (logErrors) appendLog(`APP_START error code=${startEvt.payload?.error_code}`);
+    }
+  } catch (e) {
+    if (logErrors) appendLog(`APP_START timeout: ${e.message}`);
+  }
+  updateSelfInfoUi(selfInfo, false);
+  return selfInfo;
+}
+
+async function refreshKnownRepeaters(logToConsole = false) {
+  if (!client || !client.connected) {
+    resetTargetRepeaterSelect();
+    return {};
+  }
+  try {
+    const contacts = await client.requestContacts();
+    updateTargetRepeaterSelect(contacts, true);
+    const repeaters = Object.values(contacts || {}).filter((c) => isRepeaterContact(c)).length;
+    if (logToConsole) {
+      appendLog(`Repetiteurs connus: ${repeaters}`);
+    }
+    return contacts;
+  } catch (e) {
+    resetTargetRepeaterSelect();
+    if (logToConsole) appendLog(`Lecture contacts echouee: ${e.message}`);
+    return {};
+  }
+}
+
+async function initClientSession(baudrate) {
+  const selfInfo = await syncSelfInfoFromNode(true);
+
+  try {
+    await client.sendDeviceQuery();
+  } catch {}
+
+  await refreshKnownRepeaters(true);
+
+  updateSelfInfoUi(selfInfo, true);
+  if (ui.autoTune?.checked) recalcAutoFromCurrentSelection("connect");
 
   const mode = client.transport === "web_usb" ? "WebUSB" : "Web Serial";
   setConnectionStatus(`Connecte ${mode} (${baudrate} bps)`, true);
+}
+
+function readTempRadioPresetFromUi() {
+  const preset = normalizeRadioPreset({
+    freq: Number.parseFloat(ui.tempRadioFreq?.value || ""),
+    bw: Number.parseFloat(ui.tempRadioBw?.value || ""),
+    sf: Number.parseInt(ui.tempRadioSf?.value || "", 10),
+    cr: Number.parseInt(ui.tempRadioCr?.value || "", 10),
+  });
+  if (!preset) {
+    throw new Error("Preset OTA temporaire invalide (freq,bw,sf,cr)");
+  }
+  const timeoutMins = Number.parseInt(ui.tempRadioMins?.value || "", 10);
+  if (!Number.isFinite(timeoutMins) || timeoutMins < 1 || timeoutMins > 240) {
+    throw new Error("Duree temp invalide (1-240 minutes)");
+  }
+  return { ...preset, timeoutMins };
+}
+
+function applySelfRadioPresetToCache(preset) {
+  if (!preset) return;
+  if (!lastSelfInfo) lastSelfInfo = {};
+  lastSelfInfo.radio_freq = preset.freq;
+  lastSelfInfo.radio_bw = preset.bw;
+  lastSelfInfo.radio_sf = preset.sf;
+  lastSelfInfo.radio_cr = preset.cr;
+}
+
+async function applyTempRadioPresetForOta(targetHex, preset) {
+  const oldSelfInfo = await syncSelfInfoFromNode(false);
+  const previousLocalPreset = extractRadioPresetFromSelfInfo(oldSelfInfo || lastSelfInfo);
+  if (!previousLocalPreset) {
+    appendLog("Warning: preset radio client actuel indisponible, restauration finale impossible.");
+  }
+
+  const cmd = `tempradio ${formatRadioValue(preset.freq)},${formatRadioValue(preset.bw)},${preset.sf},${preset.cr},${preset.timeoutMins}`;
+  appendLog(
+    `Applying OTA temp preset: target=${formatRadioValue(preset.freq)}MHz/${formatRadioValue(preset.bw)}kHz/SF${preset.sf}/CR${preset.cr} `
+    + `(${preset.timeoutMins} min)`
+  );
+  const sentEvt = await client.sendMeshCmd(targetHex, cmd, true);
+  if (!sentEvt || sentEvt.type === "error") {
+    const code = sentEvt?.payload?.error_code;
+    throw new Error(`tempradio cible echoue: send error${code !== undefined ? ` (code=${code})` : ""}`);
+  }
+  appendLog("Target tempradio: commande envoyee (pas d'ACK attendu).");
+
+  const suggested = Number(sentEvt.payload?.suggested_timeout || 0);
+  const computedGuard = Number.isFinite(suggested) && suggested > 0
+    ? Math.round((suggested / 800.0) * 1000.0 * 0.6)
+    : 0;
+  const dispatchGuardMs = clamp(computedGuard || 1200, 800, 2500);
+  appendLog(`Attente ${dispatchGuardMs}ms pour laisser partir la commande tempradio...`);
+  await sleep(dispatchGuardMs);
+
+  const localRes = await client.setLocalRadioParams(preset.freq, preset.bw, preset.sf, preset.cr, 0);
+  if (!localRes.ok) {
+    throw new Error(`set radio client echoue: ${localRes.error}`);
+  }
+  applySelfRadioPresetToCache(preset);
+  appendLog("Client radio preset bascule pour OTA.");
+
+  const settleMs = 2400;
+  appendLog(`Attente ${settleMs}ms pour synchroniser le changement radio...`);
+  await sleep(settleMs);
+
+  return previousLocalPreset;
+}
+
+async function restoreLocalRadioPresetAfterOta(previousPreset) {
+  if (!previousPreset) return;
+  appendLog(
+    `Restauration preset client: ${formatRadioValue(previousPreset.freq)}MHz/${formatRadioValue(previousPreset.bw)}kHz/`
+    + `SF${previousPreset.sf}/CR${previousPreset.cr}`
+  );
+  const res = await client.setLocalRadioParams(
+    previousPreset.freq,
+    previousPreset.bw,
+    previousPreset.sf,
+    previousPreset.cr,
+    0
+  );
+  if (!res.ok) {
+    throw new Error(res.error || "set radio restore error");
+  }
+  applySelfRadioPresetToCache(previousPreset);
+  appendLog("Preset radio client restaure.");
 }
 
 async function connectClientWithBestUsbTransport(baudrate) {
@@ -2340,6 +2687,9 @@ ui.disconnectBtn.addEventListener("click", async () => {
   setConnectionStatus("Non connecte");
   ui.selfName.textContent = "Noeud: -";
   ui.selfKey.textContent = "PubKey: -";
+  if (ui.selfRadio) ui.selfRadio.textContent = "Radio: -";
+  resetTargetRepeaterSelect();
+  if (ui.targetKey) ui.targetKey.value = "";
   if (ui.autoTune?.checked) applyAutoOtaSettings("disconnect");
   appendLog("Deconnecte.");
   updateButtons();
@@ -2351,6 +2701,25 @@ ui.cancelOtaBtn.addEventListener("click", () => {
   setOtaStatus("Annulation demandee...");
   appendLog("Annulation OTA demandee.");
 });
+
+if (ui.targetSelect) {
+  ui.targetSelect.addEventListener("change", () => {
+    const selected = normalizeHex(ui.targetSelect.value || "");
+    if (selected.length >= 12 && ui.targetKey) {
+      ui.targetKey.value = selected;
+    }
+    if (selected.length >= 12) {
+      appendLog(`Cible OTA selectionnee: ${targetKeyPreview(selected)}`);
+    }
+  });
+}
+
+if (ui.refreshTargetsBtn) {
+  ui.refreshTargetsBtn.addEventListener("click", async () => {
+    if (!client || !client.connected || otaRunning) return;
+    await refreshKnownRepeaters(true);
+  });
+}
 
 ui.startOtaBtn.addEventListener("click", async () => {
   if (!client || !client.connected) {
@@ -2388,16 +2757,23 @@ ui.startOtaBtn.addEventListener("click", async () => {
   setOtaStatus("Demarrage OTA...");
   ui.metricsLine.textContent = "OTA en cours...";
 
+  let restoreClientPreset = null;
+
   try {
-    const autoSettings = ui.autoTune?.checked ? applyAutoOtaSettings("ota-start") : null;
+    const selectedTargetHex = getSelectedTargetHex();
+    if (selectedTargetHex.length < 12) {
+      throw new Error("Selectionne un repetiteur cible ou renseigne une pubkey manuelle (>=12 hex).");
+    }
+
+    const autoSettings = ui.autoTune?.checked ? recalcAutoFromCurrentSelection("ota-start") : null;
     const manualChunk = Number.parseInt(ui.chunkSize.value, 10) || 64;
     const manualAck = Number.parseInt(ui.ackEvery.value, 10) || 1;
     const manualNoAckGap = Math.max(0, Number.parseInt(ui.noAckGap.value, 10) || 0);
-    const manualCheckpoint = Math.max(200, Number.parseInt(ui.checkpointTimeout.value, 10) || 500);
+    const manualCheckpoint = Math.max(1000, Number.parseInt(ui.checkpointTimeout.value, 10) || 1000);
     const manualStatusTimeout = Math.max(1200, Math.round(manualCheckpoint * 1.5));
 
     const params = {
-      targetHex: ui.targetKey.value,
+      targetHex: selectedTargetHex,
       firmware,
       firmwareMd5,
       chunkSizeInput: autoSettings ? autoSettings.chunkSize : manualChunk,
@@ -2412,7 +2788,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
     };
     appendLog(`Firmware: ${file.name} (${firmware.length} bytes)`);
     appendLog(`MD5: ${firmwareMd5}`);
-    updatePlanLine();
+    updatePlanLine(true);
 
     const password = String(ui.targetPassword.value || "").trim();
     if (password.length > 0) {
@@ -2427,6 +2803,29 @@ ui.startOtaBtn.addEventListener("click", async () => {
         throw new Error(`Authentification echouee: ${loginRes.error}`);
       }
       appendLog(`Login OK${loginRes.is_admin ? " (admin)" : ""}`);
+    }
+
+    if (ui.useTempRadio?.checked) {
+      const tempPreset = readTempRadioPresetFromUi();
+      restoreClientPreset = await applyTempRadioPresetForOta(params.targetHex, tempPreset);
+
+      if (ui.autoTune?.checked) {
+        const tempAuto = recalcAutoFromCurrentSelection("temp-radio");
+        if (!tempAuto) {
+          throw new Error("auto tuning indisponible apres application du preset temp");
+        }
+        params.chunkSizeInput = tempAuto.chunkSize;
+        params.ackEveryInput = tempAuto.ackEvery;
+        params.noAckGapMs = tempAuto.noAckGapMs;
+        params.checkpointTimeoutMs = tempAuto.checkpointTimeoutMs;
+        params.statusTimeoutMs = tempAuto.statusTimeoutMs;
+        params.ackSettleGapMs = tempAuto.ackSettleGapMs;
+        params.radioProfile = tempAuto.profile;
+      } else {
+        params.radioProfile = estimateOtaRadioProfile(tempPreset.bw, tempPreset.sf, tempPreset.cr);
+      }
+
+      updatePlanLine(true);
     }
 
     const result = await runOtaWithAutoTransport(params);
@@ -2450,6 +2849,16 @@ ui.startOtaBtn.addEventListener("click", async () => {
     setOtaStatus("OTA echouee");
     ui.metricsLine.textContent = `Erreur: ${e.message}`;
   } finally {
+    if (restoreClientPreset) {
+      try {
+        await restoreLocalRadioPresetAfterOta(restoreClientPreset);
+        if (ui.autoTune?.checked) {
+          applyAutoOtaSettings("restore");
+        }
+      } catch (restoreErr) {
+        appendLog(`Warning: restauration preset client echouee: ${restoreErr.message}`);
+      }
+    }
     otaRunning = false;
     otaCancelRequested = false;
     updateButtons();
@@ -2460,35 +2869,76 @@ if (ui.autoTune) {
   ui.autoTune.addEventListener("change", () => {
     updateTuneInputsState();
     if (ui.autoTune.checked) {
-      applyAutoOtaSettings("toggle");
+      recalcAutoFromCurrentSelection("toggle");
     } else {
       appendLog("Auto tuning desactive.");
-      updatePlanLine();
+      updatePlanLine(true);
+    }
+  });
+}
+
+if (ui.useTempRadio) {
+  ui.useTempRadio.addEventListener("change", () => {
+    updateTempRadioInputsState();
+    if (ui.useTempRadio.checked) appendLog("Preset OTA temporaire active.");
+    else appendLog("Preset OTA temporaire desactive.");
+
+    if (ui.autoTune?.checked) {
+      recalcAutoFromCurrentSelection(ui.useTempRadio.checked ? "temp-on" : "temp-off");
+    }
+  });
+}
+
+for (const el of [ui.tempRadioFreq, ui.tempRadioBw, ui.tempRadioSf, ui.tempRadioCr]) {
+  if (!el) continue;
+  el.addEventListener("input", () => {
+    if (ui.autoTune?.checked && ui.useTempRadio?.checked) {
+      recalcAutoFromCurrentSelection(null);
     }
   });
 }
 
 if (ui.firmwareFile) {
   ui.firmwareFile.addEventListener("change", () => {
-    updatePlanLine();
+    updatePlanLine(true);
   });
 }
 if (ui.chunkSize) {
   ui.chunkSize.addEventListener("input", () => {
-    updatePlanLine();
+    updatePlanLine(true);
   });
 }
 if (ui.ackEvery) {
   ui.ackEvery.addEventListener("input", () => {
-    updatePlanLine();
+    updatePlanLine(true);
+  });
+}
+if (ui.targetKey) {
+  ui.targetKey.addEventListener("input", () => {
+    const manual = normalizeHex(ui.targetKey.value || "");
+    if (!ui.targetSelect) return;
+    if (!manual) {
+      return;
+    }
+    const match = Array.from(ui.targetSelect.options).find((opt) => {
+      const key = normalizeHex(opt.value || "");
+      return key.length >= 12 && (key === manual || key.startsWith(manual) || manual.startsWith(key));
+    });
+    if (match) {
+      ui.targetSelect.value = match.value;
+    } else {
+      ui.targetSelect.value = "";
+    }
   });
 }
 
 setConnectionStatus("Non connecte");
 setProgress(0);
+resetTargetRepeaterSelect();
 updateTuneInputsState();
+updateTempRadioInputsState();
 if (ui.autoTune?.checked) {
-  applyAutoOtaSettings();
+  recalcAutoFromCurrentSelection();
 }
-updatePlanLine();
+updatePlanLine(false);
 updateButtons();
