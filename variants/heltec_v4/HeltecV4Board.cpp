@@ -6,8 +6,26 @@ void HeltecV4Board::begin() {
     pinMode(PIN_ADC_CTRL, OUTPUT);
     digitalWrite(PIN_ADC_CTRL, LOW); // Initially inactive
 
-    // Check if waking from deep sleep
+    // Set up digital GPIO registers before releasing RTC hold. The hold latches
+    // the pad state including function select, so register writes accumulate
+    // without affecting the pad. On hold release, all changes apply atomically
+    // (IO MUX switches to digital GPIO with output already HIGH — no glitch).
+    pinMode(P_LORA_PA_POWER, OUTPUT);
+    digitalWrite(P_LORA_PA_POWER,HIGH);
+    rtc_gpio_hold_dis((gpio_num_t)P_LORA_PA_POWER);
+
+    pinMode(P_LORA_PA_EN, OUTPUT);
+    digitalWrite(P_LORA_PA_EN,HIGH);
+    rtc_gpio_hold_dis((gpio_num_t)P_LORA_PA_EN);
+    pinMode(P_LORA_PA_TX_EN, OUTPUT);
+    digitalWrite(P_LORA_PA_TX_EN,LOW);
+
     esp_reset_reason_t reason = esp_reset_reason();
+    if (reason != ESP_RST_DEEPSLEEP) {
+      delay(1);  // GC1109 startup time after cold power-on
+    }
+
+    periph_power.begin();
     if (reason == ESP_RST_DEEPSLEEP) {
       long wakeup_source = esp_sleep_get_ext1_wakeup_status();
       if (wakeup_source & (1 << P_LORA_DIO_1)) {  // received a LoRa packet (while in deep sleep)
