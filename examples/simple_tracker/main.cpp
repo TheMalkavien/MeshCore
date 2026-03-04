@@ -120,6 +120,30 @@ extern uint32_t t1000e_get_light(void);
   #define TRACKER_BUTTON_LED_PULSE_MS 80
 #endif
 
+#ifndef TRACKER_EXT_POWER_LED_PERIOD_MS
+  #define TRACKER_EXT_POWER_LED_PERIOD_MS 5000
+#endif
+
+#ifndef TRACKER_EXT_POWER_LED_ON_MS
+  #define TRACKER_EXT_POWER_LED_ON_MS 120
+#endif
+
+#ifndef TRACKER_EXT_POWER_LED_GAP_MS
+  #define TRACKER_EXT_POWER_LED_GAP_MS 180
+#endif
+
+#ifndef TRACKER_EXT_POWER_DEBUG_LOG_MS
+  #define TRACKER_EXT_POWER_DEBUG_LOG_MS 5000
+#endif
+
+#ifndef TRACKER_BUZZER_NOTE_MS
+  #define TRACKER_BUZZER_NOTE_MS 95
+#endif
+
+#ifndef TRACKER_BUZZER_NOTE_GAP_MS
+  #define TRACKER_BUZZER_NOTE_GAP_MS 35
+#endif
+
 #ifndef BATT_MIN_MILLIVOLTS
   #define BATT_MIN_MILLIVOLTS 3000
 #endif
@@ -198,6 +222,9 @@ static void trackerRadioWakeFromSleep(T&, long) {
 
 static unsigned long tracker_tx_led_until = 0;
 static bool tracker_now_requested = false;
+static bool tracker_external_power_led_mode = false;
+static unsigned long tracker_external_power_led_epoch = 0;
+static unsigned long tracker_external_power_last_dbg_ms = 0;
 
 static void trackerSetStatusLed(bool on) {
 #if defined(LED_PIN) && (LED_PIN >= 0)
@@ -218,6 +245,9 @@ static void trackerSetStatusLed(bool on) {
 }
 
 static void trackerPulseStatusLed(uint16_t duration_ms) {
+  if (tracker_external_power_led_mode) {
+    return;
+  }
   trackerSetStatusLed(true);
   tracker_tx_led_until = millis() + duration_ms;
 }
@@ -237,10 +267,211 @@ static void trackerFlashBootLed() {
 }
 
 static void handleTrackerTxLedPulse() {
+  if (tracker_external_power_led_mode) {
+    return;
+  }
   if (tracker_tx_led_until != 0 && (int32_t)(millis() - tracker_tx_led_until) >= 0) {
     tracker_tx_led_until = 0;
     trackerSetStatusLed(false);
   }
+}
+
+static void trackerPlayExternalPowerPlugBuzzerSequence();
+static void trackerPlayExternalPowerUnplugBuzzerSequence();
+
+#if defined(T1000_E) && defined(NRF52_PLATFORM)
+static bool trackerReadT1000ExternalPowerRaw(uint32_t* usb_status_out, bool* via_softdevice_out) {
+  uint32_t usb_status = 0;
+  bool via_softdevice = false;
+
+  uint8_t sd_enabled = 0;
+  bool sd_ok = (sd_softdevice_is_enabled(&sd_enabled) == NRF_SUCCESS);
+  if (sd_ok && sd_enabled) {
+    if (sd_power_usbregstatus_get(&usb_status) == NRF_SUCCESS) {
+      via_softdevice = true;
+    } else {
+      usb_status = NRF_POWER->USBREGSTATUS;
+    }
+  } else {
+    usb_status = NRF_POWER->USBREGSTATUS;
+  }
+
+  if (usb_status_out) {
+    *usb_status_out = usb_status;
+  }
+  if (via_softdevice_out) {
+    *via_softdevice_out = via_softdevice;
+  }
+  return (usb_status & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+}
+#endif
+
+static bool trackerIsExternalPowered() {
+#if defined(T1000_E) && defined(NRF52_PLATFORM)
+  return trackerReadT1000ExternalPowerRaw(NULL, NULL);
+#else
+  return board.isExternalPowered();
+#endif
+}
+
+static void trackerDebugExternalPowerState(const char* tag, bool force_log = false) {
+#if TRACKER_SERIAL_DEBUG == 1
+  if (!force_log) {
+    if (TRACKER_EXT_POWER_DEBUG_LOG_MS == 0) {
+      return;
+    }
+    if (tracker_external_power_last_dbg_ms != 0 &&
+        (uint32_t)(millis() - tracker_external_power_last_dbg_ms) < (uint32_t)TRACKER_EXT_POWER_DEBUG_LOG_MS) {
+      return;
+    }
+  }
+  tracker_external_power_last_dbg_ms = millis();
+
+  #if defined(T1000_E) && defined(NRF52_PLATFORM)
+  uint32_t usb_status = 0;
+  bool via_softdevice = false;
+  bool powered = trackerReadT1000ExternalPowerRaw(&usb_status, &via_softdevice);
+  TRACKER_DBG("ext power [%s]: powered=%d usbreg=0x%08lX source=%s",
+    tag ? tag : "?",
+    powered ? 1 : 0,
+    (unsigned long)usb_status,
+    via_softdevice ? "softdevice" : "register");
+  #else
+  bool powered = board.isExternalPowered();
+  TRACKER_DBG("ext power [%s]: powered=%d source=board.isExternalPowered()",
+    tag ? tag : "?",
+    powered ? 1 : 0);
+  #endif
+#else
+  (void)tag;
+  (void)force_log;
+#endif
+}
+
+static void trackerHandleExternalPowerLed(bool external_powered) {
+  if (external_powered) {
+    if (!tracker_external_power_led_mode) {
+      tracker_external_power_led_mode = true;
+      tracker_external_power_led_epoch = millis();
+      tracker_tx_led_until = 0;
+      TRACKER_DBG("external power: LED double-blink enabled");
+      trackerPlayExternalPowerPlugBuzzerSequence();
+      trackerDebugExternalPowerState("plug", true);
+    }
+
+    const uint32_t elapsed = (uint32_t)(millis() - tracker_external_power_led_epoch);
+    const uint32_t phase = elapsed % (uint32_t)TRACKER_EXT_POWER_LED_PERIOD_MS;
+    const uint32_t second_on_start = (uint32_t)TRACKER_EXT_POWER_LED_ON_MS + (uint32_t)TRACKER_EXT_POWER_LED_GAP_MS;
+    const uint32_t second_on_end = second_on_start + (uint32_t)TRACKER_EXT_POWER_LED_ON_MS;
+    bool led_on = (phase < (uint32_t)TRACKER_EXT_POWER_LED_ON_MS) ||
+                  (phase >= second_on_start && phase < second_on_end);
+    trackerSetStatusLed(led_on);
+  } else if (tracker_external_power_led_mode) {
+    tracker_external_power_led_mode = false;
+    tracker_external_power_led_epoch = 0;
+    trackerSetStatusLed(false);
+    TRACKER_DBG("external power: LED double-blink disabled");
+    trackerPlayExternalPowerUnplugBuzzerSequence();
+    trackerDebugExternalPowerState("unplug", true);
+  }
+}
+
+static void trackerInitBuzzerPins() {
+#if defined(PIN_BUZZER_EN)
+  pinMode(PIN_BUZZER_EN, OUTPUT);
+  digitalWrite(PIN_BUZZER_EN, LOW);
+  TRACKER_DBG("buzzer enable pin configured: PIN_BUZZER_EN=%d", PIN_BUZZER_EN);
+#endif
+#if defined(PIN_BUZZER) && (PIN_BUZZER >= 0)
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+  TRACKER_DBG("buzzer pin configured: PIN_BUZZER=%d", PIN_BUZZER);
+#else
+  TRACKER_DBG("buzzer disabled: PIN_BUZZER not defined in this build");
+#endif
+}
+
+static void trackerEnableBuzzer(bool on) {
+#if defined(PIN_BUZZER_EN)
+  digitalWrite(PIN_BUZZER_EN, on ? HIGH : LOW);
+#else
+  (void)on;
+#endif
+}
+
+static void trackerPlayToneBlocking(uint16_t freq_hz, uint16_t duration_ms) {
+#if defined(PIN_BUZZER) && (PIN_BUZZER >= 0)
+  if (duration_ms == 0) {
+    return;
+  }
+  if (freq_hz == 0) {
+    delay(duration_ms);
+    return;
+  }
+
+  uint32_t period_us = 1000000UL / (uint32_t)freq_hz;
+  if (period_us < 2) {
+    period_us = 2;
+  }
+  uint32_t half_period_us = period_us / 2UL;
+  uint32_t cycles = ((uint32_t)duration_ms * 1000UL) / period_us;
+  if (cycles == 0) {
+    cycles = 1;
+  }
+
+  for (uint32_t i = 0; i < cycles; i++) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    delayMicroseconds((unsigned int)half_period_us);
+    digitalWrite(PIN_BUZZER, LOW);
+    delayMicroseconds((unsigned int)half_period_us);
+  }
+#else
+  (void)freq_hz;
+  (void)duration_ms;
+#endif
+}
+
+static void trackerPlayBuzzerSequence(const uint16_t* notes_hz, size_t note_count) {
+#if defined(PIN_BUZZER) && (PIN_BUZZER >= 0)
+  if (!notes_hz || note_count == 0) {
+    return;
+  }
+
+  TRACKER_DBG("buzzer sequence: notes=%u", (unsigned)note_count);
+  trackerEnableBuzzer(true);
+  for (size_t i = 0; i < note_count; i++) {
+    trackerPlayToneBlocking(notes_hz[i], TRACKER_BUZZER_NOTE_MS);
+    if (i + 1 < note_count) {
+      delay(TRACKER_BUZZER_NOTE_GAP_MS);
+    }
+  }
+  digitalWrite(PIN_BUZZER, LOW);
+  trackerEnableBuzzer(false);
+#else
+  TRACKER_DBG("buzzer sequence skipped: no PIN_BUZZER");
+  (void)notes_hz;
+  (void)note_count;
+#endif
+}
+
+static void trackerPlayBootBuzzerSequence() {
+  static const uint16_t notes_hz[4] = {523, 659, 784, 988};
+  trackerPlayBuzzerSequence(notes_hz, sizeof(notes_hz) / sizeof(notes_hz[0]));
+}
+
+static void trackerPlayShutdownBuzzerSequence() {
+  static const uint16_t notes_hz[4] = {988, 784, 659, 523};
+  trackerPlayBuzzerSequence(notes_hz, sizeof(notes_hz) / sizeof(notes_hz[0]));
+}
+
+static void trackerPlayExternalPowerPlugBuzzerSequence() {
+  static const uint16_t notes_hz[2] = {659, 988};
+  trackerPlayBuzzerSequence(notes_hz, sizeof(notes_hz) / sizeof(notes_hz[0]));
+}
+
+static void trackerPlayExternalPowerUnplugBuzzerSequence() {
+  static const uint16_t notes_hz[2] = {988, 659};
+  trackerPlayBuzzerSequence(notes_hz, sizeof(notes_hz) / sizeof(notes_hz[0]));
 }
 
 static void trackerInitPowerButtonPin() {
@@ -342,6 +573,8 @@ static void handleTrackerPowerButton() {
       (uint32_t)(millis() - pressed_since) >= TRACKER_POWER_BUTTON_HOLD_MS) {
     long_sent = true;
     press_armed = false;
+    TRACKER_DBG("power button long press -> shutdown melody");
+    trackerPlayShutdownBuzzerSequence();
     TRACKER_DBG("power button long press -> power off");
     radio_driver.powerOff();
     board.powerOff();
@@ -442,6 +675,11 @@ public:
   }
 
   void loop() {
+    if (handleExternalPowerPolicy()) {
+      SensorMesh::loop();
+      return;
+    }
+
 #if defined(NRF52_PLATFORM)
     // nRF52 light sleep mode: keep running state (including GPS backup-assisted flow)
     // while idling between tracker cycles.
@@ -521,6 +759,49 @@ protected:
   bool _group_psk_is_default = true;
   char _group_name[24] = TRACKER_DEFAULT_GROUP_NAME;
   char _group_psk[56] = TRACKER_DEFAULT_GROUP_PSK;
+  bool _external_power_paused = false;
+
+  void pauseTrackingForExternalPower() {
+    _sleep_waiting_for_queue_drain = false;
+    _sleep_drain_started_millis = 0;
+    _next_measure_millis = 0;
+    _tracking_in_progress = false;
+    _cycle_has_gps_snapshot = false;
+    _cycle_start_gps_ts = LONG_MIN;
+    _cycle_start_raw_lat = LONG_MIN;
+    _cycle_start_raw_lon = LONG_MIN;
+#if ENV_INCLUDE_GPS == 1
+    sensors.setSettingValue("gps", "0");
+#endif
+  }
+
+  bool handleExternalPowerPolicy() {
+    bool external_powered = trackerIsExternalPowered();
+    if (external_powered) {
+      if (!_external_power_paused) {
+        _external_power_paused = true;
+        TRACKER_DBG("external power detected: pause tracker GPS cycles");
+        pauseTrackingForExternalPower();
+      } else {
+#if ENV_INCLUDE_GPS == 1
+        // Ensure GPS stays off while USB/external power is present.
+        const char* gps_state = sensors.getSettingByKey("gps");
+        if (gps_state != NULL && gps_state[0] == '1') {
+          sensors.setSettingValue("gps", "0");
+        }
+#endif
+      }
+      return true;
+    }
+
+    if (_external_power_paused) {
+      _external_power_paused = false;
+      TRACKER_DBG("external power removed: resume tracker GPS cycles");
+      queueImmediateCycle("external-power-removed");
+    }
+
+    return false;
+  }
 
   void onSensorDataRead() override {
     // No periodic sensor logic needed; tracking is timer-driven from TrackerMesh::loop().
@@ -1485,6 +1766,10 @@ void setup() {
   TRACKER_DBG("button pin configured");
   trackerFlashBootLed();
   TRACKER_DBG("boot led pulse");
+  trackerInitBuzzerPins();
+  trackerPlayBootBuzzerSequence();
+  TRACKER_DBG("boot buzzer sequence");
+  trackerDebugExternalPowerState("setup", true);
 
 #ifdef DISPLAY_CLASS
   if (display.begin()) {
@@ -1599,6 +1884,9 @@ void loop() {
 #ifdef DISPLAY_CLASS
   ui_task.loop();
 #endif
+  trackerDebugExternalPowerState("loop");
+  bool external_powered = trackerIsExternalPowered();
+  trackerHandleExternalPowerLed(external_powered);
   handleTrackerTxLedPulse();
   handleTrackerPowerButton();
   if (tracker_now_requested) {
