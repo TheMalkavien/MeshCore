@@ -130,6 +130,35 @@ void nrf52_sleep_button_prepare() {
 }  // namespace
 #endif
 
+#if defined(NRF52_SLEEP_STRICT_WAKE) && defined(NRF52_SLEEP_WAKE_VBUS) && (NRF52_SLEEP_WAKE_VBUS == 1)
+namespace {
+bool nrf52_sleep_vbus_present() {
+  uint8_t sd_enabled = 0;
+  sd_softdevice_is_enabled(&sd_enabled);
+
+  if (sd_enabled) {
+    uint32_t usb_status = 0;
+    if (sd_power_usbregstatus_get(&usb_status) == NRF_SUCCESS) {
+      return (usb_status & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+    }
+  }
+  return (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+}
+
+void nrf52_sleep_vbus_prepare() {
+  uint8_t sd_enabled = 0;
+  sd_softdevice_is_enabled(&sd_enabled);
+
+  if (sd_enabled) {
+    sd_power_usbdetected_enable(1);
+  } else {
+    NRF_POWER->EVENTS_USBDETECTED = 0;
+    NRF_POWER->INTENSET = POWER_INTENSET_USBDETECTED_Msk;
+  }
+}
+}  // namespace
+#endif
+
 void NRF52Board::begin() {
   startup_reason = BD_STARTUP_NORMAL;
 }
@@ -390,6 +419,9 @@ void NRF52Board::sleep(uint32_t secs) {
     #if defined(NRF52_SLEEP_WAKE_BTN_PIN) && (NRF52_SLEEP_WAKE_BTN_PIN >= 0)
   nrf52_sleep_button_prepare();
     #endif
+    #if defined(NRF52_SLEEP_WAKE_VBUS) && (NRF52_SLEEP_WAKE_VBUS == 1)
+  nrf52_sleep_vbus_prepare();
+    #endif
   for (;;) {
   #endif
     if (sd_enabled) {
@@ -412,6 +444,7 @@ void NRF52Board::sleep(uint32_t secs) {
       bool wake_from_timer = false;
       bool wake_from_deadline = false;
       bool wake_from_button = false;
+      bool wake_from_vbus = false;
     #if defined(NRF_RTC2) && defined(RTC2_IRQn)
       wake_from_timer = (secs > 0) && g_nrf52_sleep_rtc_fired;
     #endif
@@ -419,7 +452,10 @@ void NRF52Board::sleep(uint32_t secs) {
     #if defined(NRF52_SLEEP_WAKE_BTN_PIN) && (NRF52_SLEEP_WAKE_BTN_PIN >= 0)
       wake_from_button = nrf52_sleep_button_pressed();
     #endif
-      if ((secs == 0) || wake_from_timer || wake_from_deadline || wake_from_button) {
+    #if defined(NRF52_SLEEP_WAKE_VBUS) && (NRF52_SLEEP_WAKE_VBUS == 1)
+      wake_from_vbus = nrf52_sleep_vbus_present();
+    #endif
+      if ((secs == 0) || wake_from_timer || wake_from_deadline || wake_from_button || wake_from_vbus) {
         break;
       }
   }
