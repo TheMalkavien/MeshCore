@@ -1,10 +1,13 @@
 # MeshCore Web OTA OTG Prototype
 
-Prototype web (single-page app) pour lancer une OTA RP2040 via un **client MeshCore connecte en USB** (OTG sur Android possible).
+Prototype web (single-page app) pour lancer une OTA RP2040 via un **client MeshCore connecte en USB ou BLE**.
 
-Le prototype utilise le protocole companion serie (`<len + payload` / `>len + payload`) et execute la sequence OTA distante.
+Le prototype utilise le protocole companion MeshCore et execute la sequence OTA distante:
 
-Par defaut, il tente:
+- **USB**: framing serie companion (`<len + payload` / `>len + payload`)
+- **BLE**: frames companion **brutes** sur le service UART MeshCore/Nordic (`6E400001...`)
+
+En mode `USB`, il tente:
 
 1. Connexion USB via **Web Serial**
 2. Fallback connexion USB via **WebUSB (CDC bulk)**
@@ -14,6 +17,7 @@ Par defaut, il tente:
 ## Ce que fait le prototype
 
 - Connexion USB serie via Web Serial.
+- Connexion BLE via Web Bluetooth.
 - Handshake `APP_START` puis `DEVICE_QUERY`.
 - Envoi OTA en **transport binaire** (si support cible), sinon fallback texte.
 - Affiche une estimation du temps restant pendant l'upload.
@@ -31,9 +35,10 @@ Par defaut, il tente:
 ## Limitations connues
 
 - En mode binaire, `ota begin` est envoye sans MD5 (size + ack_every), donc verification MD5 non active dans ce prototype.
-- Web Serial depend du support navigateur/OS. Sur Android, le support peut varier selon version de Chrome.
+- Web Serial depend du support navigateur/OS. Sur Android, le prototype force plutot WebUSB.
 - Le fallback WebUSB depend des interfaces USB exposees par le firmware companion (CDC-ACM bulk IN/OUT requis).
 - Si erreur `Unable to claim interface`: Android peut deja attacher le driver CDC systeme sur l'interface serie USB. Dans ce cas, WebUSB navigateur ne peut pas toujours la prendre.
+- Le mode BLE depend du support `Web Bluetooth` du navigateur et du companion BLE.
 
 ## Lancer en local
 
@@ -51,18 +56,19 @@ Puis ouvrir:
 
 ## Usage
 
-1. Connecter le client MeshCore en USB.
-2. Cliquer `Connecter USB`.
-3. Renseigner la cible OTA (pubkey hex, min 12 chars = prefix 6 bytes).
-4. (Optionnel) renseigner `Mot de passe` pour faire un login avant OTA.
-5. Selectionner le firmware `.bin` ou `.bin.gz`.
-6. Regler `chunk size`, `ack every`, `gap`, `checkpoint timeout`.
-7. (Optionnel) activer `Preset OTA temporaire` et regler `freq,bw,sf,cr` (defaut: `869.4,250,5,5`).
-8. Cliquer `Lancer OTA`.
+1. Choisir `USB` ou `BLE`.
+2. Connecter le client MeshCore.
+3. Cliquer `Connecter`.
+4. Renseigner la cible OTA (pubkey hex, min 12 chars = prefix 6 bytes).
+5. (Optionnel) renseigner `Mot de passe` pour faire un login avant OTA.
+6. Selectionner le firmware `.bin` ou `.bin.gz`.
+7. Regler `chunk size`, `ack every`, `gap`, `checkpoint timeout`.
+8. (Optionnel) activer `Preset OTA temporaire` et regler `freq,bw,sf,cr` (defaut: `869.4,250,5,5`).
+9. Cliquer `Lancer OTA`.
 
 ## Reglages de depart recommandes
 
 - `chunk size`: 64
 - `ack every`: 1
 - `gap no-ack`: 50 ms
-- `checkpoint timeout`: 500 ms
+- `checkpoint timeout`: 1000 ms
