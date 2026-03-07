@@ -214,19 +214,26 @@
 </head>
 <body>
   <header>
-    <h1>MeshCore OTA OTG - Prototype Web (USB)</h1>
+    <h1>MeshCore OTA OTG - Prototype Web (USB / BLE)</h1>
     <div class="status-line" id="connectionStatus">Non connecte</div>
   </header>
   <main>
     <section class="card">
       <div class="row">
         <div class="c4">
+          <label for="connectionMode">Mode connexion</label>
+          <select id="connectionMode">
+            <option value="usb" selected>USB</option>
+            <option value="ble">BLE</option>
+          </select>
+        </div>
+        <div class="c4">
           <label for="baudrate">Baudrate USB serie</label>
           <input id="baudrate" type="number" min="9600" step="100" value="115200">
         </div>
         <div class="c4">
           <label>&nbsp;</label>
-          <button id="connectBtn">Connecter USB</button>
+          <button id="connectBtn">Connecter</button>
         </div>
         <div class="c4">
           <label>&nbsp;</label>
@@ -292,7 +299,7 @@
         </div>
         <div class="c3">
           <label for="useTempRadio">Preset OTA temporaire</label>
-          <input id="useTempRadio" type="checkbox">
+          <input id="useTempRadio" type="checkbox" checked>
         </div>
         <div class="c3">
           <label for="tempRadioFreq">Freq OTA (MHz)</label>
@@ -335,7 +342,7 @@
       <textarea id="log" readonly></textarea>
     </section>
   </main>
-  <footer>Prototype OTA via companion serial protocol over USB OTG.</footer>
-  <script defer src="./app.js?v=20260302-3"></script>
+  <footer>Prototype OTA via companion protocol over USB OTG or BLE.</footer>
+  <script defer src="./app.js?v=20260307-ble1"></script>
 </body>
 </html>
