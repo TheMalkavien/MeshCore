@@ -43,6 +43,9 @@ const WEBUSB_REQ_SET_CONTROL_LINE_STATE = 0x22;
 const WEBUSB_CDC_CLASS_CONTROL = 0x02;
 const WEBUSB_CDC_CLASS_DATA = 0x0a;
 const WEBUSB_DEFAULT_PACKET_SIZE = 64;
+const MESHCORE_BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const MESHCORE_BLE_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+const MESHCORE_BLE_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 const WEBUSB_DEVICE_FILTERS = [
   { vendorId: 0x2e8a }, // Raspberry Pi / RP2040
   { vendorId: 0x10c4 }, // Silicon Labs CP210x
@@ -124,6 +127,14 @@ function isWebUsbDeviceLike(device) {
     && typeof device.open === "function"
     && typeof device.transferIn === "function"
     && typeof device.transferOut === "function"
+  );
+}
+
+function isWebBleDeviceLike(device) {
+  return Boolean(
+    device
+    && device.gatt
+    && typeof device.gatt.connect === "function"
   );
 }
 
@@ -554,6 +565,12 @@ class MeshCoreSerialClient {
     this.usbOutEndpoint = null;
     this.usbInPacketSize = WEBUSB_DEFAULT_PACKET_SIZE;
     this.usbOutPacketSize = WEBUSB_DEFAULT_PACKET_SIZE;
+    this.bleDevice = null;
+    this.bleServer = null;
+    this.bleRxCharacteristic = null;
+    this.bleTxCharacteristic = null;
+    this.bleNotificationHandler = null;
+    this.bleDisconnectHandler = null;
     this.transport = null;
     this.connected = false;
     this.rxPending = [];
@@ -566,6 +583,7 @@ class MeshCoreSerialClient {
     this.contactsByKey = {};
     this.contactsScanTmp = {};
     this.onEvent = null;
+    this.writeChain = Promise.resolve();
   }
 
   async connect(portOrDevice, baudrate) {
@@ -577,7 +595,11 @@ class MeshCoreSerialClient {
       await this.connectWebUsb(portOrDevice, baudrate);
       return;
     }
-    throw new Error("transport USB non supporte");
+    if (isWebBleDeviceLike(portOrDevice)) {
+      await this.connectBle(portOrDevice);
+      return;
+    }
+    throw new Error("transport non supporte");
   }
 
   async connectSerial(port, baudrate) {
@@ -732,6 +754,44 @@ class MeshCoreSerialClient {
     this.readLoopWebUsb();
   }
 
+  async connectBle(device) {
+    if (!device) throw new Error("peripherique BLE manquant");
+    this.bleDevice = device;
+    this.bleDisconnectHandler = async () => {
+      if (!this.connected) return;
+      this.log("Connexion BLE interrompue.");
+      await this.disconnect();
+    };
+    this.bleDevice.addEventListener("gattserverdisconnected", this.bleDisconnectHandler);
+
+    this.bleServer = await this.bleDevice.gatt.connect();
+    const service = await this.bleServer.getPrimaryService(MESHCORE_BLE_SERVICE_UUID);
+    const characteristics = await service.getCharacteristics();
+
+    this.bleRxCharacteristic = characteristics.find(
+      (c) => String(c.uuid || "").toLowerCase() === MESHCORE_BLE_RX_UUID
+    ) || null;
+    this.bleTxCharacteristic = characteristics.find(
+      (c) => String(c.uuid || "").toLowerCase() === MESHCORE_BLE_TX_UUID
+    ) || null;
+    if (!this.bleRxCharacteristic || !this.bleTxCharacteristic) {
+      throw new Error("service BLE MeshCore detecte, mais caracteristiques RX/TX introuvables");
+    }
+
+    this.bleNotificationHandler = (event) => {
+      const value = event?.target?.value;
+      if (!value || value.byteLength < 1) return;
+      const frame = new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+      this.handleFrame(frame);
+    };
+    await this.bleTxCharacteristic.startNotifications();
+    this.bleTxCharacteristic.addEventListener("characteristicvaluechanged", this.bleNotificationHandler);
+
+    this.transport = "web_ble";
+    this.connected = true;
+    this.rxPending = [];
+  }
+
   async disconnect() {
     this.connected = false;
     this.waiters.forEach((w) => {
@@ -776,7 +836,32 @@ class MeshCoreSerialClient {
     this.usbOutEndpoint = null;
     this.usbInPacketSize = WEBUSB_DEFAULT_PACKET_SIZE;
     this.usbOutPacketSize = WEBUSB_DEFAULT_PACKET_SIZE;
+    if (this.bleTxCharacteristic && this.bleNotificationHandler) {
+      try {
+        this.bleTxCharacteristic.removeEventListener("characteristicvaluechanged", this.bleNotificationHandler);
+      } catch {}
+    }
+    if (this.bleTxCharacteristic) {
+      try { await this.bleTxCharacteristic.stopNotifications(); } catch {}
+    }
+    this.bleNotificationHandler = null;
+    this.bleTxCharacteristic = null;
+    this.bleRxCharacteristic = null;
+    if (this.bleDevice && this.bleDisconnectHandler) {
+      try {
+        this.bleDevice.removeEventListener("gattserverdisconnected", this.bleDisconnectHandler);
+      } catch {}
+    }
+    this.bleDisconnectHandler = null;
+    if (this.bleServer) {
+      try { this.bleServer.disconnect(); } catch {}
+      this.bleServer = null;
+    } else if (this.bleDevice?.gatt?.connected) {
+      try { this.bleDevice.gatt.disconnect(); } catch {}
+    }
+    this.bleDevice = null;
     this.transport = null;
+    this.writeChain = Promise.resolve();
   }
 
   async readLoopSerial() {
@@ -1098,6 +1183,10 @@ class MeshCoreSerialClient {
     if (!(payload instanceof Uint8Array)) {
       payload = new Uint8Array(payload);
     }
+    if (this.transport === "web_ble") {
+      await this.writeRaw(payload);
+      return;
+    }
     const frame = new Uint8Array(3 + payload.length);
     frame[0] = 0x3c;
     frame[1] = payload.length & 0xff;
@@ -1107,6 +1196,25 @@ class MeshCoreSerialClient {
   }
 
   async writeRaw(bytes) {
+    if (this.bleRxCharacteristic) {
+      return this.enqueueWrite(async () => {
+        if (
+          this.bleRxCharacteristic.properties?.writeWithoutResponse
+          && typeof this.bleRxCharacteristic.writeValueWithoutResponse === "function"
+        ) {
+          await this.bleRxCharacteristic.writeValueWithoutResponse(bytes);
+          return;
+        }
+        if (
+          this.bleRxCharacteristic.properties?.write
+          && typeof this.bleRxCharacteristic.writeValueWithResponse === "function"
+        ) {
+          await this.bleRxCharacteristic.writeValueWithResponse(bytes);
+          return;
+        }
+        await this.bleRxCharacteristic.writeValue(bytes);
+      });
+    }
     if (this.writer) {
       await this.writer.write(bytes);
       return;
@@ -1127,6 +1235,12 @@ class MeshCoreSerialClient {
     throw new Error("transport ecriture indisponible");
   }
 
+  enqueueWrite(task) {
+    const next = this.writeChain.catch(() => {}).then(task);
+    this.writeChain = next.catch(() => {});
+    return next;
+  }
+
   async sendCommand(payload, expectedTypes = [], predicate = null, timeoutMs = 5000) {
     const wantsReply = Array.isArray(expectedTypes) ? expectedTypes.length > 0 : Boolean(expectedTypes);
     const waiter = wantsReply ? this.waitForEvent(expectedTypes, predicate, timeoutMs) : null;
@@ -1135,16 +1249,19 @@ class MeshCoreSerialClient {
     return waiter;
   }
 
-  async sendAppStart() {
-    const payload = new Uint8Array(11);
+  async sendAppStart(timeoutMs = null) {
+    const appName = textEncoder.encode("mccli-web");
+    const payload = new Uint8Array(8 + appName.length);
     payload[0] = 0x01;
-    payload[1] = 0x03;
-    payload.set(textEncoder.encode("mccli"), 2);
-    return this.sendCommand(payload, ["self_info", "ok", "error"], null, 5000);
+    payload[1] = 0x01;
+    payload.set(appName, 8);
+    const waitMs = timeoutMs ?? (this.transport === "web_ble" ? 12000 : 5000);
+    return this.sendCommand(payload, ["self_info", "ok", "error"], null, waitMs);
   }
 
-  async sendDeviceQuery() {
-    return this.sendCommand(Uint8Array.of(0x16, 0x03), ["device_info", "error"], null, 5000);
+  async sendDeviceQuery(timeoutMs = null) {
+    const waitMs = timeoutMs ?? (this.transport === "web_ble" ? 10000 : 5000);
+    return this.sendCommand(Uint8Array.of(0x16, 0x03), ["device_info", "error"], null, waitMs);
   }
 
   async setLocalRadioParams(freqMhz, bwKhz, sf, cr, repeat = 0) {
@@ -1485,6 +1602,7 @@ const ui = {
   startOtaBtn: document.querySelector("#startOtaBtn"),
   cancelOtaBtn: document.querySelector("#cancelOtaBtn"),
   refreshTargetsBtn: document.querySelector("#refreshTargetsBtn"),
+  connectionMode: document.querySelector("#connectionMode"),
   baudrate: document.querySelector("#baudrate"),
   targetSelect: document.querySelector("#targetSelect"),
   targetKey: document.querySelector("#targetKey"),
@@ -1534,6 +1652,19 @@ function setOtaStatus(text) {
 function setProgress(percent) {
   const p = Math.max(0, Math.min(100, Number(percent) || 0));
   ui.progressBar.style.width = `${p}%`;
+}
+
+function getTransportLabel(transport) {
+  if (transport === "web_usb") return "WebUSB";
+  if (transport === "web_ble") return "Web Bluetooth";
+  return "Web Serial";
+}
+
+function updateConnectionModeUi() {
+  const mode = String(ui.connectionMode?.value || "usb");
+  const isBle = mode === "ble";
+  if (ui.baudrate) ui.baudrate.disabled = isBle;
+  if (ui.connectBtn) ui.connectBtn.textContent = isBle ? "Connecter BLE" : "Connecter USB";
 }
 
 function formatRadioPresetText(presetLike) {
@@ -2522,15 +2653,45 @@ function updateSelfInfoUi(selfInfo, logRadio = false) {
 
 async function syncSelfInfoFromNode(logErrors = false) {
   let selfInfo = null;
+  const appStartTimeoutMs = client?.transport === "web_ble" ? 12000 : 5000;
+  const deviceQueryTimeoutMs = client?.transport === "web_ble" ? 10000 : 5000;
+
+  if (client?.transport !== "web_ble") {
+    try {
+      await client.sendDeviceQuery(deviceQueryTimeoutMs);
+    } catch (e) {
+      if (logErrors) appendLog(`DEVICE_QUERY timeout: ${e.message}`);
+    }
+  }
+
+  if (client?.transport === "web_ble") {
+    await sleep(250);
+  }
+
   try {
-    const startEvt = await client.sendAppStart();
+    const startEvt = await client.sendAppStart(appStartTimeoutMs);
     if (startEvt?.type === "self_info") {
       selfInfo = startEvt.payload;
     } else if (startEvt?.type === "error") {
       if (logErrors) appendLog(`APP_START error code=${startEvt.payload?.error_code}`);
     }
   } catch (e) {
-    if (logErrors) appendLog(`APP_START timeout: ${e.message}`);
+    if (client?.transport === "web_ble") {
+      if (logErrors) appendLog(`APP_START timeout: ${e.message} (retry)`);
+      await sleep(400);
+      try {
+        const retryEvt = await client.sendAppStart(appStartTimeoutMs);
+        if (retryEvt?.type === "self_info") {
+          selfInfo = retryEvt.payload;
+        } else if (retryEvt?.type === "error" && logErrors) {
+          appendLog(`APP_START retry error code=${retryEvt.payload?.error_code}`);
+        }
+      } catch (retryErr) {
+        if (logErrors) appendLog(`APP_START retry timeout: ${retryErr.message}`);
+      }
+    } else if (logErrors) {
+      appendLog(`APP_START timeout: ${e.message}`);
+    }
   }
   updateSelfInfoUi(selfInfo, false);
   return selfInfo;
@@ -2559,17 +2720,14 @@ async function refreshKnownRepeaters(logToConsole = false) {
 async function initClientSession(baudrate) {
   const selfInfo = await syncSelfInfoFromNode(true);
 
-  try {
-    await client.sendDeviceQuery();
-  } catch {}
-
   await refreshKnownRepeaters(true);
 
   updateSelfInfoUi(selfInfo, true);
   if (ui.autoTune?.checked) recalcAutoFromCurrentSelection("connect");
 
-  const mode = client.transport === "web_usb" ? "WebUSB" : "Web Serial";
-  setConnectionStatus(`Connecte ${mode} (${baudrate} bps)`, true);
+  const mode = getTransportLabel(client.transport);
+  const speedSuffix = client.transport === "web_ble" ? "" : ` (${baudrate} bps)`;
+  setConnectionStatus(`Connecte ${mode}${speedSuffix}`, true);
 }
 
 function readTempRadioPresetFromUi() {
@@ -2659,6 +2817,32 @@ async function restoreLocalRadioPresetAfterOta(previousPreset) {
   appendLog("Preset radio client restaure.");
 }
 
+function attachClientDebugHooks(c) {
+  c.onEvent = (type, payload) => {
+    if (type === "contact_msg_recv" && payload?.txt_type === 1) {
+      const txt = String(payload.text || "").trim();
+      if (txt.startsWith("[OTA]")) {
+        appendLog(`RX OTA: ${payload.pubkey_prefix} ${txt}`);
+      }
+    }
+  };
+}
+
+async function connectClientViaBle() {
+  if (!("bluetooth" in navigator)) {
+    throw new Error("Web Bluetooth non supporte par ce navigateur");
+  }
+  appendLog("Tentative de connexion Web Bluetooth...");
+  const device = await navigator.bluetooth.requestDevice({
+    filters: [{ services: [MESHCORE_BLE_SERVICE_UUID] }],
+  });
+  const c = new MeshCoreSerialClient(appendLog);
+  attachClientDebugHooks(c);
+  await c.connectBle(device);
+  client = c;
+  appendLog(`BLE connecte (${device.name || "MeshCore"}).`);
+}
+
 async function connectClientWithBestUsbTransport(baudrate) {
   const preference = getUsbBrowserPreference();
   let serialErr = null;
@@ -2672,14 +2856,7 @@ async function connectClientWithBestUsbTransport(baudrate) {
     appendLog("Tentative de connexion Web Serial...");
     const port = await navigator.serial.requestPort();
     const c = new MeshCoreSerialClient(appendLog);
-    c.onEvent = (type, payload) => {
-      if (type === "contact_msg_recv" && payload?.txt_type === 1) {
-        const txt = String(payload.text || "").trim();
-        if (txt.startsWith("[OTA]")) {
-          appendLog(`RX OTA: ${payload.pubkey_prefix} ${txt}`);
-        }
-      }
-    };
+    attachClientDebugHooks(c);
     await c.connectSerial(port, baudrate);
     client = c;
     appendLog("USB serie connecte via Web Serial.");
@@ -2694,14 +2871,7 @@ async function connectClientWithBestUsbTransport(baudrate) {
     appendLog("Tentative de connexion WebUSB...");
     const device = await navigator.usb.requestDevice({ filters: WEBUSB_DEVICE_FILTERS });
     const c = new MeshCoreSerialClient(appendLog);
-    c.onEvent = (type, payload) => {
-      if (type === "contact_msg_recv" && payload?.txt_type === 1) {
-        const txt = String(payload.text || "").trim();
-        if (txt.startsWith("[OTA]")) {
-          appendLog(`RX OTA: ${payload.pubkey_prefix} ${txt}`);
-        }
-      }
-    };
+    attachClientDebugHooks(c);
     await c.connectWebUsb(device, baudrate);
     client = c;
     appendLog(`USB connecte via WebUSB (${formatUsbDeviceLabel(device)}).`);
@@ -2713,14 +2883,7 @@ async function connectClientWithBestUsbTransport(baudrate) {
       appendLog("Tentative de connexion Web Serial...");
       const port = await navigator.serial.requestPort();
       const c = new MeshCoreSerialClient(appendLog);
-      c.onEvent = (type, payload) => {
-        if (type === "contact_msg_recv" && payload?.txt_type === 1) {
-          const txt = String(payload.text || "").trim();
-          if (txt.startsWith("[OTA]")) {
-            appendLog(`RX OTA: ${payload.pubkey_prefix} ${txt}`);
-          }
-        }
-      };
+      attachClientDebugHooks(c);
       await c.connectSerial(port, baudrate);
       client = c;
       appendLog("USB serie connecte via Web Serial.");
@@ -2741,14 +2904,7 @@ async function connectClientWithBestUsbTransport(baudrate) {
   try {
     const device = await navigator.usb.requestDevice({ filters: WEBUSB_DEVICE_FILTERS });
     const c = new MeshCoreSerialClient(appendLog);
-    c.onEvent = (type, payload) => {
-      if (type === "contact_msg_recv" && payload?.txt_type === 1) {
-        const txt = String(payload.text || "").trim();
-        if (txt.startsWith("[OTA]")) {
-          appendLog(`RX OTA: ${payload.pubkey_prefix} ${txt}`);
-        }
-      }
-    };
+    attachClientDebugHooks(c);
     await c.connectWebUsb(device, baudrate);
     client = c;
     appendLog(`USB connecte via WebUSB (${formatUsbDeviceLabel(device)}).`);
@@ -2758,16 +2914,30 @@ async function connectClientWithBestUsbTransport(baudrate) {
   }
 }
 
-ui.connectBtn.addEventListener("click", async () => {
-  if (!("serial" in navigator) && !("usb" in navigator)) {
-    appendLog("Ni Web Serial ni WebUSB ne sont supportes par ce navigateur.");
+async function connectClientSelectedTransport(mode, baudrate) {
+  if (mode === "ble") {
+    await connectClientViaBle();
     return;
   }
+  await connectClientWithBestUsbTransport(baudrate);
+}
+
+ui.connectBtn.addEventListener("click", async () => {
   if (otaRunning) return;
 
   try {
+    const mode = String(ui.connectionMode?.value || "usb");
+    if (mode === "ble") {
+      if (!("bluetooth" in navigator)) {
+        appendLog("Web Bluetooth non supporte par ce navigateur.");
+        return;
+      }
+    } else if (!("serial" in navigator) && !("usb" in navigator)) {
+      appendLog("Ni Web Serial ni WebUSB ne sont supportes par ce navigateur.");
+      return;
+    }
     const baudrate = Number.parseInt(ui.baudrate.value, 10) || 115200;
-    await connectClientWithBestUsbTransport(baudrate);
+    await connectClientSelectedTransport(mode, baudrate);
     await initClientSession(baudrate);
   } catch (e) {
     appendLog(`Connexion impossible: ${e.message}`);
@@ -2827,7 +2997,7 @@ if (ui.refreshTargetsBtn) {
 
 ui.startOtaBtn.addEventListener("click", async () => {
   if (!client || !client.connected) {
-    appendLog("Pas de connexion USB.");
+    appendLog("Pas de connexion active.");
     return;
   }
   if (otaRunning) return;
@@ -2981,6 +3151,12 @@ if (ui.autoTune) {
   });
 }
 
+if (ui.connectionMode) {
+  ui.connectionMode.addEventListener("change", () => {
+    updateConnectionModeUi();
+  });
+}
+
 if (ui.useTempRadio) {
   ui.useTempRadio.addEventListener("change", () => {
     updateTempRadioInputsState();
@@ -2992,6 +3168,8 @@ if (ui.useTempRadio) {
     }
   });
 }
+
+updateConnectionModeUi();
 
 for (const el of [ui.tempRadioFreq, ui.tempRadioBw, ui.tempRadioSf, ui.tempRadioCr]) {
   if (!el) continue;
