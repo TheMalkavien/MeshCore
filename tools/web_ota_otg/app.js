@@ -127,6 +127,14 @@ function isWebUsbDeviceLike(device) {
   );
 }
 
+function getUsbBrowserPreference() {
+  const ua = String(navigator.userAgent || "").toLowerCase();
+  const platform = String(navigator.platform || "").toLowerCase();
+  if (ua.includes("android")) return "webusb";
+  if (platform.includes("win") || platform.includes("mac") || platform.includes("linux")) return "webserial";
+  return "auto";
+}
+
 function configurationHasBulkPair(cfg) {
   for (const iface of cfg?.interfaces || []) {
     for (const alt of iface.alternates || []) {
@@ -193,6 +201,40 @@ function listWebUsbBulkCandidates(device) {
     return rank(a) - rank(b);
   });
   return candidates;
+}
+
+function formatWebUsbCandidateLabel(candidate) {
+  return `if${candidate.interfaceNumber}/alt${candidate.alternateSetting}/cls0x${Number(candidate.classCode).toString(16)} in${candidate.inEndpoint} out${candidate.outEndpoint}`;
+}
+
+function selectPreferredWebUsbCandidates(candidates) {
+  const cdcData = candidates.filter((c) => c.classCode === WEBUSB_CDC_CLASS_DATA);
+  if (cdcData.length > 0) {
+    return {
+      claimCandidates: cdcData,
+      skippedCandidates: candidates.filter((c) => c.classCode !== WEBUSB_CDC_CLASS_DATA),
+      mode: "cdc_data",
+    };
+  }
+
+  const cdcAny = candidates.filter(
+    (c) => c.classCode === WEBUSB_CDC_CLASS_CONTROL || c.classCode === WEBUSB_CDC_CLASS_DATA
+  );
+  if (cdcAny.length > 0) {
+    return {
+      claimCandidates: cdcAny,
+      skippedCandidates: candidates.filter(
+        (c) => c.classCode !== WEBUSB_CDC_CLASS_CONTROL && c.classCode !== WEBUSB_CDC_CLASS_DATA
+      ),
+      mode: "cdc_any",
+    };
+  }
+
+  return {
+    claimCandidates: candidates,
+    skippedCandidates: [],
+    mode: "generic",
+  };
 }
 
 function maxOtaChunkForOffset(offset) {
@@ -585,13 +627,22 @@ class MeshCoreSerialClient {
     }
     this.log(
       `WebUSB candidates: ${candidates
-        .map((c) => `if${c.interfaceNumber}/alt${c.alternateSetting}/cls0x${Number(c.classCode).toString(16)} in${c.inEndpoint} out${c.outEndpoint}`)
-        .join(", ")}`
+        .map((c) => formatWebUsbCandidateLabel(c))
+        .join(", ")}` 
     );
+
+    const preferred = selectPreferredWebUsbCandidates(candidates);
+    if (preferred.skippedCandidates.length > 0) {
+      this.log(
+        `WebUSB ignored non-serial candidates: ${preferred.skippedCandidates
+          .map((c) => formatWebUsbCandidateLabel(c))
+          .join(", ")}`
+      );
+    }
 
     let selected = null;
     let lastClaimErr = null;
-    for (const c of candidates) {
+    for (const c of preferred.claimCandidates) {
       try {
         this.log(`WebUSB claim try: if${c.interfaceNumber}`);
         await this.usbDevice.claimInterface(c.interfaceNumber);
@@ -609,8 +660,10 @@ class MeshCoreSerialClient {
     }
 
     if (!selected) {
-      const hint = "interface USB verrouillee (souvent driver CDC Android).";
-      const details = candidates
+      const hint = preferred.mode === "generic"
+        ? "interface USB bulk indisponible."
+        : "interface CDC serie detectee mais verrouillee par l'OS; utiliser Web Serial si disponible.";
+      const details = preferred.claimCandidates
         .map((c) => `if${c.interfaceNumber}/cls0x${Number(c.classCode).toString(16)}`)
         .join(", ");
       throw new Error(`Unable to claim interface: ${hint} candidates=[${details}] ${lastClaimErr ? `(${lastClaimErr.message})` : ""}`.trim());
@@ -2607,7 +2660,53 @@ async function restoreLocalRadioPresetAfterOta(previousPreset) {
 }
 
 async function connectClientWithBestUsbTransport(baudrate) {
+  const preference = getUsbBrowserPreference();
   let serialErr = null;
+  let usbErr = null;
+
+  if (preference === "webserial") {
+    if (!("serial" in navigator)) {
+      throw new Error("Web Serial non supporte par ce navigateur desktop");
+    }
+    appendLog("Plateforme detectee: desktop, Web Serial force.");
+    appendLog("Tentative de connexion Web Serial...");
+    const port = await navigator.serial.requestPort();
+    const c = new MeshCoreSerialClient(appendLog);
+    c.onEvent = (type, payload) => {
+      if (type === "contact_msg_recv" && payload?.txt_type === 1) {
+        const txt = String(payload.text || "").trim();
+        if (txt.startsWith("[OTA]")) {
+          appendLog(`RX OTA: ${payload.pubkey_prefix} ${txt}`);
+        }
+      }
+    };
+    await c.connectSerial(port, baudrate);
+    client = c;
+    appendLog("USB serie connecte via Web Serial.");
+    return;
+  }
+
+  if (preference === "webusb") {
+    if (!("usb" in navigator)) {
+      throw new Error("WebUSB non supporte par ce navigateur Android");
+    }
+    appendLog("Plateforme detectee: Android, WebUSB force.");
+    appendLog("Tentative de connexion WebUSB...");
+    const device = await navigator.usb.requestDevice({ filters: WEBUSB_DEVICE_FILTERS });
+    const c = new MeshCoreSerialClient(appendLog);
+    c.onEvent = (type, payload) => {
+      if (type === "contact_msg_recv" && payload?.txt_type === 1) {
+        const txt = String(payload.text || "").trim();
+        if (txt.startsWith("[OTA]")) {
+          appendLog(`RX OTA: ${payload.pubkey_prefix} ${txt}`);
+        }
+      }
+    };
+    await c.connectWebUsb(device, baudrate);
+    client = c;
+    appendLog(`USB connecte via WebUSB (${formatUsbDeviceLabel(device)}).`);
+    return;
+  }
 
   if ("serial" in navigator) {
     try {
@@ -2639,19 +2738,24 @@ async function connectClientWithBestUsbTransport(baudrate) {
   }
 
   appendLog("Tentative de connexion WebUSB...");
-  const device = await navigator.usb.requestDevice({ filters: WEBUSB_DEVICE_FILTERS });
-  const c = new MeshCoreSerialClient(appendLog);
-  c.onEvent = (type, payload) => {
-    if (type === "contact_msg_recv" && payload?.txt_type === 1) {
-      const txt = String(payload.text || "").trim();
-      if (txt.startsWith("[OTA]")) {
-        appendLog(`RX OTA: ${payload.pubkey_prefix} ${txt}`);
+  try {
+    const device = await navigator.usb.requestDevice({ filters: WEBUSB_DEVICE_FILTERS });
+    const c = new MeshCoreSerialClient(appendLog);
+    c.onEvent = (type, payload) => {
+      if (type === "contact_msg_recv" && payload?.txt_type === 1) {
+        const txt = String(payload.text || "").trim();
+        if (txt.startsWith("[OTA]")) {
+          appendLog(`RX OTA: ${payload.pubkey_prefix} ${txt}`);
+        }
       }
-    }
-  };
-  await c.connectWebUsb(device, baudrate);
-  client = c;
-  appendLog(`USB connecte via WebUSB (${formatUsbDeviceLabel(device)}).`);
+    };
+    await c.connectWebUsb(device, baudrate);
+    client = c;
+    appendLog(`USB connecte via WebUSB (${formatUsbDeviceLabel(device)}).`);
+  } catch (e) {
+    usbErr = e;
+    throw serialErr || usbErr;
+  }
 }
 
 ui.connectBtn.addEventListener("click", async () => {
