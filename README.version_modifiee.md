@@ -4,8 +4,8 @@ Resume tres succinct des ecarts par rapport au firmware de base (`main` / `v1.13
 
 ## Reseau / repeater
 
-- Ajout d'un retry conditionnel sur les floods de groupe: si aucun autre repeater n'est entendu, le packet est re-emis automatiquement (jusqu'a la limite configuree).
-- Ajout d'indicateurs de retry dans les stats packets: `relay.grp trk/ok/fail/retry/loss`.
+- Ajout d'un retry conditionnel sur les floods relayes: si aucun autre repeater n'est entendu, le packet est re-emis automatiquement (jusqu'a la limite configuree).
+- Ajout d'indicateurs de retry dans les stats packets: `relay.flood trk/ok/fail/retry/loss`.
 - Ajustement de la commande existante `set flood.advert.interval`: plage valide `1-168` heures (au lieu de `3-168`).
 
 ## Energie / USB (RP2040)
