@@ -111,21 +111,15 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 **Usage:** 
 - `stats-core`
 
-**Serial Only:** Yes
-
 ---
 
 ### Radio Stats - Noise floor, Last RSSI/SNR, Airtime, Receive errors
 **Usage:** `stats-radio`
 
-**Serial Only:** Yes
-
 ---
 
 ### Packet stats - Packet counters: Received, Sent
 **Usage:** `stats-packets`
-
-**Serial Only:** Yes
 
 ---
 
