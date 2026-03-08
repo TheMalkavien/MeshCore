@@ -706,13 +706,6 @@ void MyMesh::begin(FILESYSTEM *fs) {
   applyGpsPrefs();
 #endif
 #ifdef WITH_MQTT_BRIDGE
-  // Ensure analyzer servers are enabled by default (in case no prefs were loaded) - same as repeater
-  if (_prefs.mqtt_analyzer_us_enabled == 0 && _prefs.mqtt_analyzer_eu_enabled == 0) {
-    _prefs.mqtt_analyzer_us_enabled = 1; // enabled
-    _prefs.mqtt_analyzer_eu_enabled = 1; // enabled
-    MESH_DEBUG_PRINTLN("Setting analyzer servers to enabled by default");
-  }
-  
   // Set MQTT origin to actual device name (not build-time ADVERT_NAME) - same as repeater
   StrHelper::strncpy(_prefs.mqtt_origin, _prefs.node_name, sizeof(_prefs.mqtt_origin));
   MESH_DEBUG_PRINTLN("MQTT origin set to device name: %s", _prefs.mqtt_origin);
