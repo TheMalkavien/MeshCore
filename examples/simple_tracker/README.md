@@ -26,6 +26,8 @@ Tracker payload format (compact JSON, versioned):
 - `tracker group.name <name>`
 - `tracker group.psk <base64-psk>`
 - `tracker sleep on|off`
+- `tracker extpower`
+- `tracker extpower ignore on|off`
 - `tracker now` (or `tracker send`)
 
 ## Build target

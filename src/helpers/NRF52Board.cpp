@@ -156,6 +156,18 @@ void nrf52_sleep_vbus_prepare() {
     NRF_POWER->INTENSET = POWER_INTENSET_USBDETECTED_Msk;
   }
 }
+
+void nrf52_sleep_vbus_disable() {
+  uint8_t sd_enabled = 0;
+  sd_softdevice_is_enabled(&sd_enabled);
+
+  if (sd_enabled) {
+    sd_power_usbdetected_enable(0);
+  } else {
+    NRF_POWER->EVENTS_USBDETECTED = 0;
+    NRF_POWER->INTENCLR = POWER_INTENSET_USBDETECTED_Msk;
+  }
+}
 }  // namespace
 #endif
 
@@ -420,7 +432,11 @@ void NRF52Board::sleep(uint32_t secs) {
   nrf52_sleep_button_prepare();
     #endif
     #if defined(NRF52_SLEEP_WAKE_VBUS) && (NRF52_SLEEP_WAKE_VBUS == 1)
-  nrf52_sleep_vbus_prepare();
+  if (ignore_vbus_wake) {
+    nrf52_sleep_vbus_disable();
+  } else {
+    nrf52_sleep_vbus_prepare();
+  }
     #endif
   for (;;) {
   #endif
@@ -453,7 +469,9 @@ void NRF52Board::sleep(uint32_t secs) {
       wake_from_button = nrf52_sleep_button_pressed();
     #endif
     #if defined(NRF52_SLEEP_WAKE_VBUS) && (NRF52_SLEEP_WAKE_VBUS == 1)
-      wake_from_vbus = nrf52_sleep_vbus_present();
+      if (!ignore_vbus_wake) {
+        wake_from_vbus = nrf52_sleep_vbus_present();
+      }
     #endif
       if ((secs == 0) || wake_from_timer || wake_from_deadline || wake_from_button || wake_from_vbus) {
         break;
