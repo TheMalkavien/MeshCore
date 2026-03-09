@@ -67,6 +67,7 @@ private:
   bool _group_psk_is_default = true;
   char _group_name[GROUP_NAME_SIZE] = TRACKER_DEFAULT_GROUP_NAME;
   char _group_psk[GROUP_PSK_SIZE] = TRACKER_DEFAULT_GROUP_PSK;
+  bool _ignore_external_power = false;
   bool _external_power_paused = false;
   bool _tracking_in_progress = false;
   unsigned long _tracking_started_millis = 0;

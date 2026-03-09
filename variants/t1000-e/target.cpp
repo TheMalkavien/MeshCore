@@ -75,7 +75,24 @@ static void gps_uart_begin(uint32_t baud) {
   gps_uart_started = true;
 }
 
+static void gps_uart_end() {
+  if (!gps_uart_started) {
+    return;
+  }
+  Serial1.end();
+  gps_uart_started = false;
+#if defined(GPS_RX_PIN)
+  pinMode(GPS_RX_PIN, INPUT);
+#endif
+#if defined(GPS_TX_PIN)
+  pinMode(GPS_TX_PIN, INPUT);
+#endif
+}
+
 static void gps_uart_drain_rx() {
+  if (!gps_uart_started) {
+    return;
+  }
   while (Serial1.available() > 0) {
     Serial1.read();
   }
@@ -172,12 +189,7 @@ void T1000SensorManager::start_gps() {
 #if T1000_GPS_BAUD_FALLBACK == 1
   gps_baud_phase = 0;
 #endif
-  gps_uart_begin(115200);
-  gps_uart_drain_rx();
-  // Drop any previously parsed fix so wake cycles require fresh GNSS sentences.
-  _nmea->syncTime();
-  //_nmea->begin();
-  // this init sequence should be better 
+  // this init sequence should be better
   // comes from seeed examples and deals with all gps pins
   pinMode(GPS_EN, OUTPUT);
   digitalWrite(GPS_EN, HIGH);
@@ -200,6 +212,11 @@ void T1000SensorManager::start_gps() {
   pinMode(GPS_RTC_INT, OUTPUT);
   digitalWrite(GPS_RTC_INT, LOW);
   pinMode(GPS_RESETB, INPUT_PULLUP);
+
+  gps_uart_begin(115200);
+  gps_uart_drain_rx();
+  // Drop any previously parsed fix so wake cycles require fresh GNSS sentences.
+  _nmea->syncTime();
 }
 
 void T1000SensorManager::sleep_gps() {
@@ -228,7 +245,7 @@ void T1000SensorManager::sleep_gps() {
 #else
   pinMode(GPS_RESETB, INPUT_PULLUP);
 #endif
-  //_nmea->stop();
+  gps_uart_end();
 }
 
 void T1000SensorManager::stop_gps() {
@@ -245,13 +262,11 @@ void T1000SensorManager::stop_gps() {
   digitalWrite(GPS_RTC_INT, LOW);
   pinMode(GPS_RESETB, OUTPUT);
   digitalWrite(GPS_RESETB, LOW);
-  //_nmea->stop();
+  gps_uart_end();
 }
 
 
 bool T1000SensorManager::begin() {
-  // init GPS
-  gps_uart_begin(115200);
   return true;
 }
 
@@ -269,6 +284,10 @@ bool T1000SensorManager::querySensors(uint8_t requester_permissions, CayenneLPP&
 
 void T1000SensorManager::loop() {
   static long next_gps_update = 0;
+
+  if (!gps_active || !gps_uart_started) {
+    return;
+  }
 
   int avail = Serial1.available();
   if (gps_active && avail > 0) {
