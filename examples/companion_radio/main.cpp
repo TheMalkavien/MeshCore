@@ -131,8 +131,16 @@ void halt() {
 #endif
 
 #if defined(ESP32) && defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
+#ifndef PM_MAX_FREQ_MHZ
+  #define PM_MAX_FREQ_MHZ 80
+#endif
+
+#ifndef PM_MIN_FREQ_MHZ
+  #define PM_MIN_FREQ_MHZ 40
+#endif
+
 static void configureESP32PowerManagement() {
-  // Keep CPU scaling dynamic but capped at 80 MHz for low-power operation.
+  // Keep CPU scaling dynamic but allow env-specific caps for low-power tuning.
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
   esp_pm_config_esp32s3_t pm_config = {};
 #elif defined(CONFIG_IDF_TARGET_ESP32S2)
@@ -144,8 +152,8 @@ static void configureESP32PowerManagement() {
 #else
   return;
 #endif
-  pm_config.max_freq_mhz = 80;
-  pm_config.min_freq_mhz = 40;
+  pm_config.max_freq_mhz = PM_MAX_FREQ_MHZ;
+  pm_config.min_freq_mhz = PM_MIN_FREQ_MHZ;
   pm_config.light_sleep_enable = true;
   (void)esp_pm_configure(&pm_config);
 }
@@ -214,10 +222,6 @@ void setup() {
 
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.begin();
-#endif
-
-#if defined(ESP32) && defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
-  configureESP32PowerManagement();
 #endif
 
 #ifdef DISPLAY_CLASS
@@ -338,6 +342,10 @@ void setup() {
 
 #ifdef DISPLAY_CLASS
   ui_task.begin(disp, &sensors, the_mesh.getNodePrefs());  // still want to pass this in as dependency, as prefs might be moved
+#endif
+
+#if defined(ESP32) && defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
+  configureESP32PowerManagement();
 #endif
 
   board.onBootComplete();
