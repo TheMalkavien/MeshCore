@@ -31,6 +31,10 @@
   #define UI_MSG_PREVIEW_REFRESH_MILLIS 3000
 #endif
 
+#ifndef UI_HOME_REFRESH_MILLIS
+  #define UI_HOME_REFRESH_MILLIS 15000
+#endif
+
 #if UI_HAS_JOYSTICK
   #define PRESS_LABEL "press Enter"
 #else
@@ -410,7 +414,7 @@ public:
         display.drawTextCentered(display.width() / 2, 64 - 11, "hibernate:" PRESS_LABEL);
       }
     }
-    return 15000;   // next render after 15000 ms
+    return UI_HOME_REFRESH_MILLIS;
   }
 
   bool handleInput(char c) override {

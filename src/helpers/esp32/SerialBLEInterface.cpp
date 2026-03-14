@@ -114,8 +114,20 @@ void SerialBLEInterface::onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) {
   if (cmpl.success) {
     BLE_DEBUG_PRINTLN(" - SecurityCallback - Authentication Success");
     deviceConnected = true;
+
+    if (_conn_params_pending) {
+      pServer->updateConnParams(
+        _pending_bda,
+        BLE_CONN_INTERVAL_MIN,
+        BLE_CONN_INTERVAL_MAX,
+        BLE_CONN_LATENCY,
+        BLE_CONN_TIMEOUT
+      );
+      _conn_params_pending = false;
+    }
   } else {
     BLE_DEBUG_PRINTLN(" - SecurityCallback - Authentication Failure*");
+    _conn_params_pending = false;
 
     //pServer->removePeerDevice(pServer->getConnId(), true);
     pServer->disconnect(pServer->getConnId());
@@ -135,15 +147,8 @@ void SerialBLEInterface::onConnect(BLEServer* pServer) {
 void SerialBLEInterface::onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) {
   BLE_DEBUG_PRINTLN("onConnect(), conn_id=%d, mtu=%d", param->connect.conn_id, pServer->getPeerMTU(param->connect.conn_id));
   last_conn_id = param->connect.conn_id;
-
-  // Request low-power connection parameters for established links.
-  pServer->updateConnParams(
-    param->connect.remote_bda,
-    BLE_CONN_INTERVAL_MIN,
-    BLE_CONN_INTERVAL_MAX,
-    BLE_CONN_LATENCY,
-    BLE_CONN_TIMEOUT
-  );
+  memcpy(_pending_bda, param->connect.remote_bda, sizeof(_pending_bda));
+  _conn_params_pending = true;
 
   if (_isEnabled) {
     pServer->getAdvertising()->stop();
@@ -157,6 +162,7 @@ void SerialBLEInterface::onMtuChanged(BLEServer* pServer, esp_ble_gatts_cb_param
 
 void SerialBLEInterface::onDisconnect(BLEServer* pServer) {
   BLE_DEBUG_PRINTLN("onDisconnect()");
+  _conn_params_pending = false;
   if (_isEnabled) {
     adv_restart_time = millis() + ADVERT_RESTART_DELAY;
 
