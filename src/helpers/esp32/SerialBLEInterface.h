@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../BaseSerialInterface.h"
+#include <cstring>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -17,6 +18,8 @@ class SerialBLEInterface : public BaseSerialInterface, BLESecurityCallbacks, BLE
   uint32_t _pin_code;
   unsigned long _last_write;
   unsigned long adv_restart_time;
+  bool _conn_params_pending;
+  esp_bd_addr_t _pending_bda;
 
   struct Frame {
     uint8_t len;
@@ -61,6 +64,8 @@ public:
     _isEnabled = false;
     _last_write = 0;
     last_conn_id = 0;
+    _conn_params_pending = false;
+    memset(_pending_bda, 0, sizeof(_pending_bda));
     send_queue_len = recv_queue_len = 0;
   }
 
