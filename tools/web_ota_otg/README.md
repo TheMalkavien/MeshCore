@@ -35,6 +35,7 @@ En mode `USB`, il tente:
 ## Limitations connues
 
 - En mode binaire, `ota begin` est envoye sans MD5 (size + ack_every), donc verification MD5 non active dans ce prototype.
+- Si tu charges un `.uf2`, l'interface web reconstruit le `.bin` puis le recompresse en `.gz` avant l'envoi OTA quand le navigateur le supporte, sinon elle envoie le `.bin` extrait.
 - Web Serial depend du support navigateur/OS. Sur Android, le prototype force plutot WebUSB.
 - Le fallback WebUSB depend des interfaces USB exposees par le firmware companion (CDC-ACM bulk IN/OUT requis).
 - Si erreur `Unable to claim interface`: Android peut deja attacher le driver CDC systeme sur l'interface serie USB. Dans ce cas, WebUSB navigateur ne peut pas toujours la prendre.
@@ -61,7 +62,7 @@ Puis ouvrir:
 3. Cliquer `Connecter`.
 4. Renseigner la cible OTA (pubkey hex, min 12 chars = prefix 6 bytes).
 5. (Optionnel) renseigner `Mot de passe` pour faire un login avant OTA.
-6. Selectionner le firmware `.bin` ou `.bin.gz`.
+6. Selectionner le firmware `.bin`, `.bin.gz` ou `.uf2`.
 7. Regler `chunk size`, `ack every`, `gap`, `checkpoint timeout`.
 8. (Optionnel) activer `Preset OTA temporaire` et regler `freq,bw,sf,cr` (defaut: `869.4,250,5,5`).
 9. Cliquer `Lancer OTA`.
