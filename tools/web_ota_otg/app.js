@@ -46,6 +46,14 @@ const WEBUSB_DEFAULT_PACKET_SIZE = 64;
 const MESHCORE_BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const MESHCORE_BLE_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 const MESHCORE_BLE_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+const XIP_BASE = 0x10000000;
+const UF2_MAGIC_START0 = 0x0a324655;
+const UF2_MAGIC_START1 = 0x9e5d5157;
+const UF2_MAGIC_END = 0x0ab16f30;
+const UF2_FLAG_NO_FLASH = 0x00000001;
+const UF2_FLAG_FAMILY_ID_PRESENT = 0x00002000;
+const UF2_RP2040_FAMILY_ID = 0xe48bff56;
+const UF2_MAX_PADDING_BYTES = 16 * 1024 * 1024;
 const WEBUSB_DEVICE_FILTERS = [
   { vendorId: 0x2e8a }, // Raspberry Pi / RP2040
   { vendorId: 0x10c4 }, // Silicon Labs CP210x
@@ -109,6 +117,132 @@ function concatBytes(...parts) {
     out.set(p, offset);
     offset += p.length;
   }
+  return out;
+}
+
+function lowerFileName(file) {
+  return String(file?.name || "").trim().toLowerCase();
+}
+
+function formatByteCount(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} o`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${(value / (1024 * 1024)).toFixed(2)} MiB`;
+}
+
+function parseUf2FamilyIds(bytes) {
+  const ids = new Set();
+  const blockCount = Math.floor(bytes.length / 512);
+  for (let blockNo = 0; blockNo < blockCount; blockNo += 1) {
+    const offset = blockNo * 512;
+    const magic0 = parseU32LE(bytes, offset);
+    const magic1 = parseU32LE(bytes, offset + 4);
+    const magicEnd = parseU32LE(bytes, offset + 508);
+    if (magic0 !== UF2_MAGIC_START0 || magic1 !== UF2_MAGIC_START1 || magicEnd !== UF2_MAGIC_END) {
+      continue;
+    }
+    const flags = parseU32LE(bytes, offset + 8);
+    if ((flags & UF2_FLAG_NO_FLASH) !== 0) {
+      continue;
+    }
+    if ((flags & UF2_FLAG_FAMILY_ID_PRESENT) !== 0) {
+      ids.add(parseU32LE(bytes, offset + 28) >>> 0);
+    }
+  }
+  return ids;
+}
+
+function convertUf2ToBin(bytes) {
+  appendLog(`UF2: analyse ${Math.floor(bytes.length / 512)} blocs (${formatByteCount(bytes.length)})`);
+  if (!(bytes instanceof Uint8Array) || bytes.length < 512 || (bytes.length % 512) !== 0) {
+    throw new Error("UF2 invalide (taille non multiple de 512)");
+  }
+
+  const familyIds = parseUf2FamilyIds(bytes);
+  if (familyIds.size > 0) {
+    appendLog(`UF2: families detectees ${Array.from(familyIds, (id) => `0x${id.toString(16).padStart(8, "0")}`).join(", ")}`);
+  } else {
+    appendLog("UF2: aucun family id explicite, poursuite en mode compatible");
+  }
+  if (familyIds.size > 0 && !familyIds.has(UF2_RP2040_FAMILY_ID)) {
+    const ids = Array.from(familyIds, (id) => `0x${id.toString(16).padStart(8, "0")}`).join(", ");
+    throw new Error(`UF2 non RP2040 (${ids})`);
+  }
+
+  const blockCount = bytes.length / 512;
+  const blocks = [];
+  for (let blockNo = 0; blockNo < blockCount; blockNo += 1) {
+    const offset = blockNo * 512;
+    const magic0 = parseU32LE(bytes, offset);
+    const magic1 = parseU32LE(bytes, offset + 4);
+    const magicEnd = parseU32LE(bytes, offset + 508);
+    if (magic0 !== UF2_MAGIC_START0 || magic1 !== UF2_MAGIC_START1 || magicEnd !== UF2_MAGIC_END) {
+      throw new Error(`UF2 invalide (bloc ${blockNo} corrompu)`);
+    }
+
+    const flags = parseU32LE(bytes, offset + 8);
+    if ((flags & UF2_FLAG_NO_FLASH) !== 0) {
+      continue;
+    }
+
+    const targetAddr = parseU32LE(bytes, offset + 12) >>> 0;
+    const payloadSize = parseU32LE(bytes, offset + 16) >>> 0;
+    const familyId = parseU32LE(bytes, offset + 28) >>> 0;
+    if (payloadSize === 0 || payloadSize > 476) {
+      throw new Error(`UF2 invalide (payload bloc ${blockNo})`);
+    }
+    if ((flags & UF2_FLAG_FAMILY_ID_PRESENT) !== 0 && familyId !== UF2_RP2040_FAMILY_ID) {
+      continue;
+    }
+
+    blocks.push({
+      targetAddr,
+      payload: bytes.slice(offset + 32, offset + 32 + payloadSize),
+    });
+  }
+
+  if (blocks.length === 0) {
+    throw new Error("UF2 vide ou sans bloc flash RP2040");
+  }
+
+  blocks.sort((a, b) => a.targetAddr - b.targetAddr);
+  const baseAddr = blocks[0].targetAddr >>> 0;
+  if (baseAddr !== XIP_BASE) {
+    throw new Error(`UF2 inattendu: adresse de base 0x${baseAddr.toString(16)}`);
+  }
+
+  const chunks = [];
+  let currentAddr = baseAddr;
+  for (const block of blocks) {
+    if (block.targetAddr < currentAddr) {
+      throw new Error("UF2 invalide (blocs hors ordre)");
+    }
+    const padding = block.targetAddr - currentAddr;
+    if (padding > UF2_MAX_PADDING_BYTES) {
+      throw new Error("UF2 invalide (trou trop grand)");
+    }
+    if (padding > 0) {
+      chunks.push(new Uint8Array(padding));
+    }
+    chunks.push(block.payload);
+    currentAddr = block.targetAddr + block.payload.length;
+  }
+
+  const out = concatBytes(...chunks);
+  appendLog(`UF2: ${blocks.length} blocs flash retenus, binaire reconstruit ${formatByteCount(out.length)}`);
+  return out;
+}
+
+async function gzipBytes(bytes) {
+  appendLog(`GZIP: compression demarree (${formatByteCount(bytes.length)})`);
+  const sourceStream = new Blob([bytes]).stream();
+  appendLog("GZIP: pipeline Blob.stream -> CompressionStream cree");
+  const compressed = await new Response(
+    sourceStream.pipeThrough(new CompressionStream("gzip"))
+  ).arrayBuffer();
+  const out = new Uint8Array(compressed);
+  appendLog(`GZIP: compression terminee (${formatByteCount(out.length)})`);
   return out;
 }
 
@@ -500,8 +634,8 @@ function estimateOtaRadioProfile(radioBwKhz, radioSf, radioCr) {
   else if (airFactor <= 10.0) ackEvery = 3;
 
   const noAckGapSec = clamp(0.015 + (0.025 * airFactor), 0.015, 0.45);
-  const checkpointTimeoutSec = clamp(0.35 + (0.6 * airFactor), 1.0, 12.0);
-  const statusTimeoutSec = clamp(0.35 + (0.8 * airFactor), 0.5, 10.0);
+  const checkpointTimeoutSec = clamp(0.9 + (0.9 * airFactor), 1.5, 12.0);
+  const statusTimeoutSec = clamp(1.4 + (1.2 * airFactor), 2.0, 12.0);
 
   return {
     bwKhz: bw,
@@ -1353,7 +1487,12 @@ class MeshCoreSerialClient {
 
   async sendBinaryReqCustom(targetFullKeyHex, requestType, dataBody = new Uint8Array(), waitReply = true, timeoutMs = 0, minTimeoutMs = 200) {
     const payload = this.buildBinaryReqPayload(targetFullKeyHex, requestType, dataBody);
-    const sentEvt = await this.sendCommand(payload, ["msg_sent", "error"], null, 5000);
+    let sentEvt = null;
+    try {
+      sentEvt = await this.sendCommand(payload, ["msg_sent", "error"], null, 5000);
+    } catch (e) {
+      return { replyText: null, error: e?.message || "timeout waiting send ack" };
+    }
     if (!sentEvt || sentEvt.type === "error") {
       const code = sentEvt?.payload?.error_code;
       return { replyText: null, error: `send error${code !== undefined ? ` (code=${code})` : ""}` };
@@ -1909,8 +2048,46 @@ function recalcAutoFromCurrentSelection(logReason = null) {
 }
 
 async function getFirmwareBytes(file) {
-  const arrayBuffer = await file.arrayBuffer();
-  return new Uint8Array(arrayBuffer);
+  const sourceBytes = new Uint8Array(await file.arrayBuffer());
+  const fileName = lowerFileName(file);
+  appendLog(`Lecture firmware: ${file.name} (${formatByteCount(sourceBytes.length)})`);
+
+  if (fileName.endsWith(".uf2")) {
+    appendLog("Firmware: format source detecte = uf2");
+    const binBytes = convertUf2ToBin(sourceBytes);
+    if (typeof CompressionStream === "function") {
+      appendLog("Firmware: CompressionStream disponible, conversion uf2 -> bin.gz");
+      const gzipPayload = await gzipBytes(binBytes);
+      return {
+        firmware: gzipPayload,
+        sourceFormat: "uf2",
+        uploadFormat: "bin.gz",
+        originalSize: sourceBytes.length,
+        extractedSize: binBytes.length,
+        uploadSize: gzipPayload.length,
+      };
+    }
+    appendLog("Firmware: CompressionStream indisponible, envoi du bin extrait sans gzip");
+    return {
+      firmware: binBytes,
+      sourceFormat: "uf2",
+      uploadFormat: "bin",
+      originalSize: sourceBytes.length,
+      extractedSize: binBytes.length,
+      uploadSize: binBytes.length,
+    };
+  }
+
+  const isGzip = fileName.endsWith(".gz");
+  appendLog(`Firmware: format source detecte = ${isGzip ? "bin.gz" : "bin"}`);
+  return {
+    firmware: sourceBytes,
+    sourceFormat: isGzip ? "bin.gz" : "bin",
+    uploadFormat: isGzip ? "bin.gz" : "bin",
+    originalSize: sourceBytes.length,
+    extractedSize: sourceBytes.length,
+    uploadSize: sourceBytes.length,
+  };
 }
 
 async function getOtaStatus(targetHex, timeoutSec = 10) {
@@ -1945,6 +2122,59 @@ async function getOtaStatusBinary(targetFullKeyHex, maxAttempts = 2, timeoutMs =
     if (attempt + 1 < maxAttempts) await sleep(150 * (attempt + 1));
   }
   return { reply: null, status: null, error: lastErr };
+}
+
+function isOkOtaReply(text) {
+  return String(text || "").trim().toLowerCase().startsWith("ok");
+}
+
+async function abortTargetOtaSession(targetHex, targetFullKeyHex = "", reason = "reset") {
+  const cleanFull = normalizeHex(targetFullKeyHex || "");
+  const cleanTarget = normalizeHex(targetHex || "");
+
+  appendLog(`OTA cleanup (${reason}): tentative de remise a zero de la session cible.`);
+
+  if (cleanFull.length >= 64) {
+    try {
+      const binRes = await client.sendOtaBinaryCmd(
+        cleanFull,
+        OTA_BIN_OP.ABORT,
+        new Uint8Array(),
+        true,
+        6000,
+        400
+      );
+      if (!binRes.error && isOkOtaReply(binRes.replyText)) {
+        appendLog(`OTA cleanup (${reason}): abort binaire confirme.`);
+        return true;
+      }
+      appendLog(
+        `OTA cleanup (${reason}): abort binaire non confirme`
+        + `${binRes.error ? ` (${binRes.error})` : ` (${String(binRes.replyText || "").trim() || "reponse vide"})`}.`
+      );
+    } catch (e) {
+      appendLog(`OTA cleanup (${reason}): exception abort binaire (${e.message}).`);
+    }
+  }
+
+  if (cleanTarget.length >= 12) {
+    try {
+      const textRes = await client.sendRepeaterCmdAndWaitReply(cleanTarget, "ota abort", 8);
+      if (!textRes.error && isOkOtaReply(textRes.reply)) {
+        appendLog(`OTA cleanup (${reason}): abort texte confirme.`);
+        return true;
+      }
+      appendLog(
+        `OTA cleanup (${reason}): abort texte non confirme`
+        + `${textRes.error ? ` (${textRes.error})` : ` (${String(textRes.reply || "").trim() || "reponse vide"})`}.`
+      );
+    } catch (e) {
+      appendLog(`OTA cleanup (${reason}): exception abort texte (${e.message}).`);
+    }
+  }
+
+  appendLog(`OTA cleanup (${reason}): remise a zero non confirmee.`);
+  return false;
 }
 
 async function runBinaryOta(params) {
@@ -2003,261 +2233,292 @@ async function runBinaryOta(params) {
   let lastProgressPct = -1;
   const writeMaxRetries = 3;
   const checkpointMaxRetries = 10;
+  let shouldCleanupTargetOta = false;
   updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
 
-  const startRes = await client.sendOtaBinaryCmd(
-    targetFullKeyHex,
-    OTA_BIN_OP.START,
-    new Uint8Array(),
-    true,
-    8000,
-    500
-  );
-
-  if (startRes.error) {
-    if (startRes.error.startsWith("timeout waiting binary reply")) {
-      appendLog("Binary OTA non disponible (pas de reponse binaire).");
-      return null;
-    }
-    throw new Error(`Start OTA failed (binary): ${startRes.error}`);
-  }
-
-  const startReply = String(startRes.replyText || "");
-  if (!startReply.toLowerCase().startsWith("ok")) {
-    const low = startReply.toLowerCase();
-    if (low.includes("already running")) {
-      const st = await getOtaStatusBinary(targetFullKeyHex, 2, statusTimeout);
-      if (st.error) {
-        throw new Error(`Start OTA failed (binary): ${startReply}; ${st.error}`);
-      }
-      if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
-        offset = st.status.done;
-        chunkIndex = Math.floor(offset / chunkSize);
-        appendLog(`Resuming OTA session at offset ${offset}/${fwSize}`);
-      } else {
-        throw new Error(`Start OTA failed (binary): ${startReply}; status=${st.reply}`);
-      }
-    } else if (low.includes("unknown") || low.includes("unsupported")) {
-      appendLog("Binary OTA unsupported by target.");
-      return null;
-    } else {
-      throw new Error(`Start OTA failed (binary): ${startReply}`);
-    }
-  }
-
-  if (offset === 0) {
-    const md5Bytes = hexToBytes(firmwareMd5);
-    if (md5Bytes.length !== 16) {
-      throw new Error("md5 firmware invalide (taille)");
-    }
-    const beginPayload = concatBytes(
-      u32ToBytesLE(fwSize),
-      Uint8Array.of(ackEvery & 0xff),
-      md5Bytes
-    );
-    const beginRes = await client.sendOtaBinaryCmd(
+  try {
+    let startRes = await client.sendOtaBinaryCmd(
       targetFullKeyHex,
-      OTA_BIN_OP.BEGIN,
-      beginPayload,
+      OTA_BIN_OP.START,
+      new Uint8Array(),
       true,
       8000,
       500
     );
-    if (beginRes.error) {
-      throw new Error(`OTA begin failed (binary): ${beginRes.error}`);
-    }
-    if (!String(beginRes.replyText || "").toLowerCase().startsWith("ok")) {
-      const rep = String(beginRes.replyText || "");
-      const low = rep.toLowerCase();
-      if (low.includes("unsupported") || low.includes("unknown")) {
-        appendLog("Binary OTA begin unsupported by target.");
+
+    if (startRes.error) {
+      if (startRes.error.startsWith("timeout waiting binary reply")) {
+        appendLog("Binary OTA non disponible (pas de reponse binaire).");
         return null;
       }
-      throw new Error(`OTA begin failed (binary): ${rep}`);
-    }
-  }
-
-  while (offset < fwSize) {
-    if (otaCancelRequested) {
-      await client.sendOtaBinaryCmd(
-        targetFullKeyHex,
-        OTA_BIN_OP.ABORT,
-        new Uint8Array(),
-        false,
-        0,
-        100
-      );
-      throw new Error("OTA annulee.");
+      throw new Error(`Start OTA failed (binary): ${startRes.error}`);
     }
 
-    const chunkLen = Math.min(chunkSize, fwSize - offset);
-    const chunk = firmware.subarray(offset, offset + chunkLen);
-    const isLastChunk = offset + chunkLen >= fwSize;
-    const checkpointDue = (chunksSinceAck + 1 >= ackEvery) || isLastChunk;
-    const writePayload = concatBytes(
-      u32ToBytesLE(offset),
-      Uint8Array.of(chunkLen & 0xff),
-      chunk
-    );
+    let startReply = String(startRes.replyText || "");
+    if (!isOkOtaReply(startReply)) {
+      const low = startReply.toLowerCase();
+      if (low.includes("already running")) {
+        const st = await getOtaStatusBinary(targetFullKeyHex, 2, statusTimeout);
+        if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
+          offset = st.status.done;
+          chunkIndex = Math.floor(offset / chunkSize);
+          appendLog(`Resuming OTA session at offset ${offset}/${fwSize}`);
+        } else {
+          appendLog(
+            `Binary OTA: session precedente incompatible, reset requis`
+            + `${st.error ? ` (${st.error})` : st.reply ? ` (${st.reply})` : ""}.`
+          );
+          const resetOk = await abortTargetOtaSession(targetHex, targetFullKeyHex, "restart binary");
+          if (!resetOk) {
+            throw new Error(
+              `Start OTA failed (binary): ${startReply}`
+              + `${st.error ? `; ${st.error}` : st.reply ? `; status=${st.reply}` : ""}`
+            );
+          }
+          startRes = await client.sendOtaBinaryCmd(
+            targetFullKeyHex,
+            OTA_BIN_OP.START,
+            new Uint8Array(),
+            true,
+            8000,
+            500
+          );
+          if (startRes.error) {
+            throw new Error(`Start OTA failed after abort (binary): ${startRes.error}`);
+          }
+          startReply = String(startRes.replyText || "");
+          if (!isOkOtaReply(startReply)) {
+            throw new Error(`Start OTA failed after abort (binary): ${startReply}`);
+          }
+        }
+      } else if (low.includes("unknown") || low.includes("unsupported")) {
+        appendLog("Binary OTA unsupported by target.");
+        return null;
+      } else {
+        throw new Error(`Start OTA failed (binary): ${startReply}`);
+      }
+    }
 
-    const writeOffset = offset;
-    let writeOk = false;
-    let failure = "write failed";
+    shouldCleanupTargetOta = true;
 
-    for (let attempt = 1; attempt <= writeMaxRetries; attempt += 1) {
-      chunkWriteAttempts += 1;
-      const writeRes = await client.sendOtaBinaryCmd(
-        targetFullKeyHex,
-        OTA_BIN_OP.WRITE,
-        writePayload,
-        false,
-        250,
-        100
+    if (offset === 0) {
+      const md5Bytes = hexToBytes(firmwareMd5);
+      if (md5Bytes.length !== 16) {
+        throw new Error("md5 firmware invalide (taille)");
+      }
+      const beginPayload = concatBytes(
+        u32ToBytesLE(fwSize),
+        Uint8Array.of(ackEvery & 0xff),
+        md5Bytes
       );
-      if (!writeRes.error) {
-        writeOk = true;
-        break;
+      const beginRes = await client.sendOtaBinaryCmd(
+        targetFullKeyHex,
+        OTA_BIN_OP.BEGIN,
+        beginPayload,
+        true,
+        8000,
+        500
+      );
+      if (beginRes.error) {
+        throw new Error(`OTA begin failed (binary): ${beginRes.error}`);
+      }
+      if (!isOkOtaReply(beginRes.replyText)) {
+        const rep = String(beginRes.replyText || "");
+        const low = rep.toLowerCase();
+        if (low.includes("unsupported") || low.includes("unknown")) {
+          appendLog("Binary OTA begin unsupported by target.");
+          return null;
+        }
+        throw new Error(`OTA begin failed (binary): ${rep}`);
+      }
+    }
+
+    while (offset < fwSize) {
+      if (otaCancelRequested) {
+        await client.sendOtaBinaryCmd(
+          targetFullKeyHex,
+          OTA_BIN_OP.ABORT,
+          new Uint8Array(),
+          false,
+          0,
+          100
+        );
+        shouldCleanupTargetOta = false;
+        throw new Error("OTA annulee.");
       }
 
-      chunkWriteFailures += 1;
-      failure = writeRes.error || failure;
+      const chunkLen = Math.min(chunkSize, fwSize - offset);
+      const chunk = firmware.subarray(offset, offset + chunkLen);
+      const isLastChunk = offset + chunkLen >= fwSize;
+      const checkpointDue = (chunksSinceAck + 1 >= ackEvery) || isLastChunk;
+      const writePayload = concatBytes(
+        u32ToBytesLE(offset),
+        Uint8Array.of(chunkLen & 0xff),
+        chunk
+      );
 
-      // On send error, query status quickly and resync if possible.
-      const st = await getOtaStatusBinary(targetFullKeyHex, 1, quickStatusTimeout);
-      if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
-        const srvOffset = st.status.done;
-        if (srvOffset !== offset) {
-          chunkServerRejects += estimateRejectedChunks(offset, srvOffset, chunkSize);
-          appendLog(`Resync offset to ${srvOffset}/${fwSize}`);
-          offset = srvOffset;
-          chunkIndex = Math.floor(offset / chunkSize);
-          chunksSinceAck = 0;
+      const writeOffset = offset;
+      let writeOk = false;
+      let failure = "write failed";
+
+      for (let attempt = 1; attempt <= writeMaxRetries; attempt += 1) {
+        chunkWriteAttempts += 1;
+        const writeRes = await client.sendOtaBinaryCmd(
+          targetFullKeyHex,
+          OTA_BIN_OP.WRITE,
+          writePayload,
+          false,
+          250,
+          100
+        );
+        if (!writeRes.error) {
           writeOk = true;
           break;
         }
+
+        chunkWriteFailures += 1;
+        failure = writeRes.error || failure;
+
+        const st = await getOtaStatusBinary(targetFullKeyHex, 1, quickStatusTimeout);
+        if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
+          const srvOffset = st.status.done;
+          if (srvOffset !== offset) {
+            chunkServerRejects += estimateRejectedChunks(offset, srvOffset, chunkSize);
+            appendLog(`Resync offset to ${srvOffset}/${fwSize}`);
+            offset = srvOffset;
+            chunkIndex = Math.floor(offset / chunkSize);
+            chunksSinceAck = 0;
+            writeOk = true;
+            break;
+          }
+        }
+
+        if (attempt < writeMaxRetries) {
+          appendLog(`Retry write (binary) at offset ${offset} (${attempt}/${writeMaxRetries}): ${failure}`);
+          await sleep(120 * attempt);
+          continue;
+        }
+
+        if (!st.error && st.reply) {
+          failure = `${failure}; status=${st.reply}`;
+        }
       }
 
-      if (attempt < writeMaxRetries) {
-        appendLog(`Retry write (binary) at offset ${offset} (${attempt}/${writeMaxRetries})`);
-        await sleep(120 * attempt);
+      if (!writeOk) {
+        throw new Error(`OTA write failed (binary) at offset ${offset}: ${failure}`);
+      }
+
+      if (offset === writeOffset) {
+        offset += chunkLen;
+        chunkIndex += 1;
+        chunksSinceAck += 1;
+        if (!checkpointDue && noAckGapMs > 0) await sleep(noAckGapMs);
+      } else {
         continue;
       }
 
-      if (!st.error && st.reply) {
-        failure = `${failure}; status=${st.reply}`;
-      }
-    }
+      if (checkpointDue) {
+        let checkpointOk = false;
+        failure = "checkpoint status missing";
 
-    if (!writeOk) {
-      throw new Error(`OTA write failed (binary) at offset ${offset}: ${failure}`);
-    }
-
-    // If no status-driven resync happened, advance local cursor.
-    if (offset === writeOffset) {
-      offset += chunkLen;
-      chunkIndex += 1;
-      chunksSinceAck += 1;
-      if (!checkpointDue && noAckGapMs > 0) await sleep(noAckGapMs);
-    } else {
-      // Resynced to server offset; continue from there.
-      continue;
-    }
-
-    if (checkpointDue) {
-      let checkpointOk = false;
-      failure = "checkpoint status missing";
-
-      for (let attempt = 1; attempt <= checkpointMaxRetries; attempt += 1) {
-        const st = await getOtaStatusBinary(
-          targetFullKeyHex,
-          1,
-          Math.max(500, checkpointTimeoutMs)
-        );
-        if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
-          if (st.status.done !== offset) {
-            chunkServerRejects += estimateRejectedChunks(offset, st.status.done, chunkSize);
-            appendLog(`Resync offset to ${st.status.done}/${fwSize}`);
+        for (let attempt = 1; attempt <= checkpointMaxRetries; attempt += 1) {
+          const st = await getOtaStatusBinary(
+            targetFullKeyHex,
+            1,
+            Math.max(1500, checkpointTimeoutMs, statusTimeout)
+          );
+          if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
+            if (st.status.done !== offset) {
+              chunkServerRejects += estimateRejectedChunks(offset, st.status.done, chunkSize);
+              appendLog(`Resync offset to ${st.status.done}/${fwSize}`);
+            }
+            offset = st.status.done;
+            chunkIndex = Math.floor(offset / chunkSize);
+            chunksSinceAck = 0;
+            checkpointOk = true;
+            break;
           }
-          offset = st.status.done;
-          chunkIndex = Math.floor(offset / chunkSize);
-          chunksSinceAck = 0;
-          checkpointOk = true;
-          break;
+
+          failure = st.error || (st.reply ? `status=${st.reply}` : "invalid status response");
+          if (attempt < checkpointMaxRetries) {
+            appendLog(`Retry checkpoint status (binary) at offset ${offset} (${attempt}/${checkpointMaxRetries}): ${failure}`);
+            await sleep(120 * attempt);
+          }
         }
 
-        failure = st.error || (st.reply ? `status=${st.reply}` : "invalid status response");
-        if (attempt < checkpointMaxRetries) {
-          appendLog(`Retry checkpoint status (binary) at offset ${offset} (${attempt}/${checkpointMaxRetries})`);
-          await sleep(120 * attempt);
+        if (!checkpointOk) {
+          throw new Error(`OTA checkpoint failed (binary) at offset ${offset}: ${failure}`);
         }
       }
 
-      if (!checkpointOk) {
-        throw new Error(`OTA checkpoint failed (binary) at offset ${offset}: ${failure}`);
+      const pct = Math.floor((offset * 100) / fwSize);
+      if (pct !== lastProgressPct && (pct % 2 === 0 || offset === fwSize)) {
+        setProgress(pct);
+        setOtaStatus(`Progress: ${pct}% (${chunkIndex}/${totalChunks})`);
+        updateLiveMetrics(
+          "binary_req",
+          offset,
+          fwSize,
+          tStart,
+          chunkWriteAttempts,
+          chunkWriteFailures,
+          chunkServerRejects
+        );
+        lastProgressPct = pct;
       }
     }
 
-    const pct = Math.floor((offset * 100) / fwSize);
-    if (pct !== lastProgressPct && (pct % 2 === 0 || offset === fwSize)) {
-      setProgress(pct);
-      setOtaStatus(`Progress: ${pct}% (${chunkIndex}/${totalChunks})`);
-      updateLiveMetrics(
-        "binary_req",
-        offset,
-        fwSize,
-        tStart,
-        chunkWriteAttempts,
-        chunkWriteFailures,
-        chunkServerRejects
-      );
-      lastProgressPct = pct;
+    const endRes = await client.sendOtaBinaryCmd(
+      targetFullKeyHex,
+      OTA_BIN_OP.END,
+      new Uint8Array(),
+      true,
+      12000,
+      500
+    );
+    if (endRes.error) {
+      throw new Error(`OTA end failed (binary): ${endRes.error}`);
     }
+    if (!isOkOtaReply(endRes.replyText)) {
+      throw new Error(`OTA end failed (binary): ${endRes.replyText}`);
+    }
+    shouldCleanupTargetOta = false;
+
+    await client.sendRepeaterCmdNoReply(targetHex, "reboot");
+
+    const durationSec = (performance.now() - tStart) / 1000.0;
+    const sendFailureRatePct = chunkWriteAttempts > 0
+      ? (chunkWriteFailures * 100.0) / chunkWriteAttempts
+      : 0;
+    const serverRejectRatePct = chunkWriteAttempts > 0
+      ? (chunkServerRejects * 100.0) / chunkWriteAttempts
+      : 0;
+    const totalRejects = chunkWriteFailures + chunkServerRejects;
+    const failureRatePct = chunkWriteAttempts > 0
+      ? (totalRejects * 100.0) / chunkWriteAttempts
+      : 0;
+
+    return {
+      transport: "binary_req",
+      fwSize,
+      totalChunks,
+      chunkSize,
+      ackEvery,
+      durationSec,
+      chunkWriteAttempts,
+      chunkWriteFailures,
+      chunkServerRejects,
+      totalRejects,
+      sendFailureRatePct,
+      serverRejectRatePct,
+      failureRatePct,
+    };
+  } catch (e) {
+    if (shouldCleanupTargetOta && !otaCancelRequested) {
+      await abortTargetOtaSession(targetHex, targetFullKeyHex, "binary failure");
+    }
+    throw e;
   }
-
-  const endRes = await client.sendOtaBinaryCmd(
-    targetFullKeyHex,
-    OTA_BIN_OP.END,
-    new Uint8Array(),
-    true,
-    12000,
-    500
-  );
-  if (endRes.error) {
-    throw new Error(`OTA end failed (binary): ${endRes.error}`);
-  }
-  if (!String(endRes.replyText || "").toLowerCase().startsWith("ok")) {
-    throw new Error(`OTA end failed (binary): ${endRes.replyText}`);
-  }
-
-  await client.sendRepeaterCmdNoReply(targetHex, "reboot");
-
-  const durationSec = (performance.now() - tStart) / 1000.0;
-  const sendFailureRatePct = chunkWriteAttempts > 0
-    ? (chunkWriteFailures * 100.0) / chunkWriteAttempts
-    : 0;
-  const serverRejectRatePct = chunkWriteAttempts > 0
-    ? (chunkServerRejects * 100.0) / chunkWriteAttempts
-    : 0;
-  const totalRejects = chunkWriteFailures + chunkServerRejects;
-  const failureRatePct = chunkWriteAttempts > 0
-    ? (totalRejects * 100.0) / chunkWriteAttempts
-    : 0;
-
-  return {
-    transport: "binary_req",
-    fwSize,
-    totalChunks,
-    chunkSize,
-    ackEvery,
-    durationSec,
-    chunkWriteAttempts,
-    chunkWriteFailures,
-    chunkServerRejects,
-    totalRejects,
-    sendFailureRatePct,
-    serverRejectRatePct,
-    failureRatePct,
-  };
 }
 
 async function runTextOta(params) {
@@ -2331,253 +2592,280 @@ async function runTextOta(params) {
   let chunkWriteFailures = 0;
   let chunkServerRejects = 0;
   let lastProgressPct = -1;
+  let shouldCleanupTargetOta = false;
   updateLiveMetrics("text_cmd", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
 
-  const startRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "start ota", startTimeoutSec);
-  if (startRes.error) {
-    throw new Error(`Start OTA failed: ${startRes.error}`);
-  }
-
-  let startReply = String(startRes.reply || "");
-  if (!startReply.toLowerCase().startsWith("ok")) {
-    if (startReply.toLowerCase().includes("already running")) {
-      const st = await getOtaStatus(targetHex, statusTimeoutSec);
-      if (st.error) {
-        throw new Error(`Start OTA failed: ${startReply}; ${st.error}`);
-      }
-      if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
-        offset = st.status.done;
-        chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
-        appendLog(`Resuming OTA session at offset ${offset}/${fwSize}`);
-      } else {
-        throw new Error(`Start OTA failed: ${startReply}; status=${st.reply}`);
-      }
-    } else {
-      throw new Error(`Start OTA failed: ${startReply}`);
-    }
-  }
-
-  if (offset === 0) {
-    let beginCmd = `ota begin ${fwSize} ${firmwareMd5} ${ackEvery}`;
-    let beginRes = await client.sendRepeaterCmdAndWaitReply(targetHex, beginCmd, beginTimeoutSec);
-    if (!beginRes.error && !String(beginRes.reply || "").toLowerCase().startsWith("ok") && ackEvery > 1) {
-      const r = String(beginRes.reply || "").toLowerCase();
-      if (r.includes("too many args") || r.includes("bad ack")) {
-        appendLog("Target ne supporte pas ack_every sur begin, fallback a ack_every=1.");
-        ackEvery = 1;
-        beginCmd = `ota begin ${fwSize} ${firmwareMd5}`;
-        beginRes = await client.sendRepeaterCmdAndWaitReply(targetHex, beginCmd, beginTimeoutSec);
-      }
-    }
-    if (beginRes.error) {
-      throw new Error(`OTA begin failed: ${beginRes.error}`);
-    }
-    if (!String(beginRes.reply || "").toLowerCase().startsWith("ok")) {
-      throw new Error(`OTA begin failed: ${beginRes.reply}`);
-    }
-  }
-
-  while (offset < fwSize) {
-    if (otaCancelRequested) {
-      await client.sendRepeaterCmdNoReply(targetHex, "ota abort");
-      throw new Error("OTA annulee.");
+  try {
+    let startRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "start ota", startTimeoutSec);
+    if (startRes.error) {
+      throw new Error(`Start OTA failed: ${startRes.error}`);
     }
 
-    const pendingOffsetErr = client.popLatestOffsetError(targetPrefix);
-    if (pendingOffsetErr && pendingOffsetErr.expected !== offset && pendingOffsetErr.expected <= fwSize) {
-      chunkWriteFailures += 1;
-      chunkServerRejects += estimateRejectedChunks(offset, pendingOffsetErr.expected, chunkSize);
-      offset = pendingOffsetErr.expected;
-      chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
-      chunksSinceAck = 0;
-      appendLog(`Resync offset to ${offset}/${fwSize}`);
-      continue;
-    }
-
-    const maxChunk = maxOtaChunkForOffset(offset);
-    if (maxChunk < 1) {
-      throw new Error(`OTA write failed at offset ${offset}: no room left for ota write command`);
-    }
-
-    const chunkLen = Math.min(chunkSize, maxChunk, fwSize - offset);
-    const chunk = firmware.subarray(offset, offset + chunkLen);
-    const chunkCmd = `ota write ${offset} ${bytesToHex(chunk)}`;
-    const isLastChunk = offset + chunkLen >= fwSize;
-    const checkpointDue = (chunksSinceAck + 1 >= ackEvery) || isLastChunk;
-
-    if (!checkpointDue) {
-      chunkWriteAttempts += 1;
-      const sendErr = await client.sendRepeaterCmdNoReply(targetHex, chunkCmd);
-      if (sendErr) {
-        chunkWriteFailures += 1;
+    let startReply = String(startRes.reply || "");
+    if (!isOkOtaReply(startReply)) {
+      if (startReply.toLowerCase().includes("already running")) {
         const st = await getOtaStatus(targetHex, statusTimeoutSec);
-        if (st.status && st.status.done !== offset) {
-          chunkServerRejects += estimateRejectedChunks(offset, st.status.done, chunkSize);
+        if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
           offset = st.status.done;
           chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
-          chunksSinceAck = 0;
-          appendLog(`Resync offset to ${offset}/${fwSize}`);
-          continue;
+          appendLog(`Resuming OTA session at offset ${offset}/${fwSize}`);
+        } else {
+          appendLog(
+            `Text OTA: session precedente incompatible, reset requis`
+            + `${st.error ? ` (${st.error})` : st.reply ? ` (${st.reply})` : ""}.`
+          );
+          const resetOk = await abortTargetOtaSession(targetHex, "", "restart text");
+          if (!resetOk) {
+            throw new Error(
+              `Start OTA failed: ${startReply}`
+              + `${st.error ? `; ${st.error}` : st.reply ? `; status=${st.reply}` : ""}`
+            );
+          }
+          startRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "start ota", startTimeoutSec);
+          if (startRes.error) {
+            throw new Error(`Start OTA failed after abort: ${startRes.error}`);
+          }
+          startReply = String(startRes.reply || "");
+          if (!isOkOtaReply(startReply)) {
+            throw new Error(`Start OTA failed after abort: ${startReply}`);
+          }
         }
-        const failure = st.error ? sendErr : `${sendErr}; status=${st.reply}`;
-        throw new Error(`OTA write failed at offset ${offset}: ${failure}`);
+      } else {
+        throw new Error(`Start OTA failed: ${startReply}`);
       }
-      offset += chunkLen;
-      chunkIndex += 1;
-      chunksSinceAck += 1;
+    }
 
-      const postSendErr = client.popLatestOffsetError(targetPrefix);
-      if (postSendErr && postSendErr.expected !== offset && postSendErr.expected <= fwSize) {
+    shouldCleanupTargetOta = true;
+
+    if (offset === 0) {
+      let beginCmd = `ota begin ${fwSize} ${firmwareMd5} ${ackEvery}`;
+      let beginRes = await client.sendRepeaterCmdAndWaitReply(targetHex, beginCmd, beginTimeoutSec);
+      if (!beginRes.error && !isOkOtaReply(beginRes.reply) && ackEvery > 1) {
+        const r = String(beginRes.reply || "").toLowerCase();
+        if (r.includes("too many args") || r.includes("bad ack")) {
+          appendLog("Target ne supporte pas ack_every sur begin, fallback a ack_every=1.");
+          ackEvery = 1;
+          beginCmd = `ota begin ${fwSize} ${firmwareMd5}`;
+          beginRes = await client.sendRepeaterCmdAndWaitReply(targetHex, beginCmd, beginTimeoutSec);
+        }
+      }
+      if (beginRes.error) {
+        throw new Error(`OTA begin failed: ${beginRes.error}`);
+      }
+      if (!isOkOtaReply(beginRes.reply)) {
+        throw new Error(`OTA begin failed: ${beginRes.reply}`);
+      }
+    }
+
+    while (offset < fwSize) {
+      if (otaCancelRequested) {
+        await client.sendRepeaterCmdNoReply(targetHex, "ota abort");
+        shouldCleanupTargetOta = false;
+        throw new Error("OTA annulee.");
+      }
+
+      const pendingOffsetErr = client.popLatestOffsetError(targetPrefix);
+      if (pendingOffsetErr && pendingOffsetErr.expected !== offset && pendingOffsetErr.expected <= fwSize) {
         chunkWriteFailures += 1;
-        chunkServerRejects += estimateRejectedChunks(offset, postSendErr.expected, chunkSize);
-        offset = postSendErr.expected;
+        chunkServerRejects += estimateRejectedChunks(offset, pendingOffsetErr.expected, chunkSize);
+        offset = pendingOffsetErr.expected;
         chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
         chunksSinceAck = 0;
         appendLog(`Resync offset to ${offset}/${fwSize}`);
         continue;
       }
-      if (noAckGapMs > 0) await sleep(noAckGapMs);
-    } else {
-      let chunkSent = false;
-      let failure = "checkpoint ack missing";
-      const checkpointMaxRetries = 10;
-      for (let attempt = 1; attempt <= checkpointMaxRetries; attempt += 1) {
+
+      const maxChunk = maxOtaChunkForOffset(offset);
+      if (maxChunk < 1) {
+        throw new Error(`OTA write failed at offset ${offset}: no room left for ota write command`);
+      }
+
+      const chunkLen = Math.min(chunkSize, maxChunk, fwSize - offset);
+      const chunk = firmware.subarray(offset, offset + chunkLen);
+      const chunkCmd = `ota write ${offset} ${bytesToHex(chunk)}`;
+      const isLastChunk = offset + chunkLen >= fwSize;
+      const checkpointDue = (chunksSinceAck + 1 >= ackEvery) || isLastChunk;
+
+      if (!checkpointDue) {
         chunkWriteAttempts += 1;
-        const timeoutSec = (ackEvery > 1 ? checkpointTimeoutMs / 1000.0 : writeAckTimeoutSec);
-        const writeRes = await client.sendRepeaterCmdAndWaitReply(targetHex, chunkCmd, timeoutSec);
-        const reply = String(writeRes.reply || "");
-        const okReply = reply === "" || reply.toLowerCase().startsWith("ok");
-
-        if (!writeRes.error && okReply) {
-          offset += chunkLen;
-          chunkIndex += 1;
-          chunksSinceAck = 0;
-          chunkSent = true;
-          break;
-        }
-
-        chunkWriteFailures += 1;
-
-        if (writeRes.error && ackEvery > 1 && writeRes.error.startsWith("timeout waiting reply")) {
-          offset += chunkLen;
-          chunkIndex += 1;
-          chunksSinceAck = 0;
-          chunkSent = true;
-          break;
-        }
-
-        const offErr = !writeRes.error ? parseOtaOffsetError(reply) : null;
-        if (offErr) {
-          if (offErr.expected < offset + chunkLen) {
-            chunkServerRejects += estimateRejectedChunks(offset + chunkLen, offErr.expected, chunkSize);
-          }
-          if (offErr.expected >= offset + chunkLen) {
-            offset = offErr.expected;
-            chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
-            chunksSinceAck = 0;
-            chunkSent = true;
-            break;
-          }
-          if (offErr.expected < offset) {
-            offset = offErr.expected;
-            chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
-            chunksSinceAck = 0;
-            chunkSent = true;
-            appendLog(`Resync offset to ${offset}/${fwSize}`);
-            break;
-          }
-        }
-
-        failure = writeRes.error || reply || failure;
-        if (attempt < checkpointMaxRetries) {
-          appendLog(`Retry checkpoint at offset ${offset} (${attempt}/${checkpointMaxRetries})`);
-          await sleep(120 * attempt);
-          continue;
-        }
-
-        const st = await getOtaStatus(targetHex, statusTimeoutSec);
-        if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
-          if (st.status.done >= offset + chunkLen) {
-            offset = st.status.done;
-            chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
-            chunksSinceAck = 0;
-            chunkSent = true;
-            break;
-          }
-          if (st.status.done < offset) {
+        const sendErr = await client.sendRepeaterCmdNoReply(targetHex, chunkCmd);
+        if (sendErr) {
+          chunkWriteFailures += 1;
+          const st = await getOtaStatus(targetHex, statusTimeoutSec);
+          if (st.status && st.status.done !== offset) {
             chunkServerRejects += estimateRejectedChunks(offset, st.status.done, chunkSize);
             offset = st.status.done;
             chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
             chunksSinceAck = 0;
-            chunkSent = true;
             appendLog(`Resync offset to ${offset}/${fwSize}`);
+            continue;
+          }
+          const failure = st.error ? sendErr : `${sendErr}; status=${st.reply}`;
+          throw new Error(`OTA write failed at offset ${offset}: ${failure}`);
+        }
+        offset += chunkLen;
+        chunkIndex += 1;
+        chunksSinceAck += 1;
+
+        const postSendErr = client.popLatestOffsetError(targetPrefix);
+        if (postSendErr && postSendErr.expected !== offset && postSendErr.expected <= fwSize) {
+          chunkWriteFailures += 1;
+          chunkServerRejects += estimateRejectedChunks(offset, postSendErr.expected, chunkSize);
+          offset = postSendErr.expected;
+          chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
+          chunksSinceAck = 0;
+          appendLog(`Resync offset to ${offset}/${fwSize}`);
+          continue;
+        }
+        if (noAckGapMs > 0) await sleep(noAckGapMs);
+      } else {
+        let chunkSent = false;
+        let failure = "checkpoint ack missing";
+        const checkpointMaxRetries = 10;
+        for (let attempt = 1; attempt <= checkpointMaxRetries; attempt += 1) {
+          chunkWriteAttempts += 1;
+          const timeoutSec = (ackEvery > 1 ? checkpointTimeoutMs / 1000.0 : writeAckTimeoutSec);
+          const writeRes = await client.sendRepeaterCmdAndWaitReply(targetHex, chunkCmd, timeoutSec);
+          const reply = String(writeRes.reply || "");
+          const okReply = reply === "" || isOkOtaReply(reply);
+
+          if (!writeRes.error && okReply) {
+            offset += chunkLen;
+            chunkIndex += 1;
+            chunksSinceAck = 0;
+            chunkSent = true;
             break;
           }
+
+          chunkWriteFailures += 1;
+
+          if (writeRes.error && ackEvery > 1 && writeRes.error.startsWith("timeout waiting reply")) {
+            offset += chunkLen;
+            chunkIndex += 1;
+            chunksSinceAck = 0;
+            chunkSent = true;
+            break;
+          }
+
+          const offErr = !writeRes.error ? parseOtaOffsetError(reply) : null;
+          if (offErr) {
+            if (offErr.expected < offset + chunkLen) {
+              chunkServerRejects += estimateRejectedChunks(offset + chunkLen, offErr.expected, chunkSize);
+            }
+            if (offErr.expected >= offset + chunkLen) {
+              offset = offErr.expected;
+              chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
+              chunksSinceAck = 0;
+              chunkSent = true;
+              break;
+            }
+            if (offErr.expected < offset) {
+              offset = offErr.expected;
+              chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
+              chunksSinceAck = 0;
+              chunkSent = true;
+              appendLog(`Resync offset to ${offset}/${fwSize}`);
+              break;
+            }
+          }
+
+          failure = writeRes.error || reply || failure;
+          if (attempt < checkpointMaxRetries) {
+            appendLog(`Retry checkpoint at offset ${offset} (${attempt}/${checkpointMaxRetries})`);
+            await sleep(120 * attempt);
+            continue;
+          }
+
+          const st = await getOtaStatus(targetHex, statusTimeoutSec);
+          if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
+            if (st.status.done >= offset + chunkLen) {
+              offset = st.status.done;
+              chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
+              chunksSinceAck = 0;
+              chunkSent = true;
+              break;
+            }
+            if (st.status.done < offset) {
+              chunkServerRejects += estimateRejectedChunks(offset, st.status.done, chunkSize);
+              offset = st.status.done;
+              chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
+              chunksSinceAck = 0;
+              chunkSent = true;
+              appendLog(`Resync offset to ${offset}/${fwSize}`);
+              break;
+            }
+          }
+          if (!st.error && st.reply) {
+            failure = `${failure}; status=${st.reply}`;
+          }
         }
-        if (!st.error && st.reply) {
-          failure = `${failure}; status=${st.reply}`;
+        if (!chunkSent) {
+          throw new Error(`OTA write failed at offset ${offset}: ${failure}`);
         }
+        if (ackSettleGapMs > 0) await sleep(ackSettleGapMs);
       }
-      if (!chunkSent) {
-        throw new Error(`OTA write failed at offset ${offset}: ${failure}`);
+
+      const pct = Math.floor((offset * 100) / fwSize);
+      if (pct !== lastProgressPct && (pct % 2 === 0 || offset === fwSize)) {
+        setProgress(pct);
+        setOtaStatus(`Progress: ${pct}% (${chunkIndex}/${totalChunks})`);
+        updateLiveMetrics(
+          "text_cmd",
+          offset,
+          fwSize,
+          tStart,
+          chunkWriteAttempts,
+          chunkWriteFailures,
+          chunkServerRejects
+        );
+        lastProgressPct = pct;
       }
-      if (ackSettleGapMs > 0) await sleep(ackSettleGapMs);
     }
 
-    const pct = Math.floor((offset * 100) / fwSize);
-    if (pct !== lastProgressPct && (pct % 2 === 0 || offset === fwSize)) {
-      setProgress(pct);
-      setOtaStatus(`Progress: ${pct}% (${chunkIndex}/${totalChunks})`);
-      updateLiveMetrics(
-        "text_cmd",
-        offset,
-        fwSize,
-        tStart,
-        chunkWriteAttempts,
-        chunkWriteFailures,
-        chunkServerRejects
-      );
-      lastProgressPct = pct;
+    const endRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "ota end", endTimeoutSec);
+    if (endRes.error) {
+      throw new Error(`OTA end failed: ${endRes.error}`);
     }
+    if (!isOkOtaReply(endRes.reply)) {
+      throw new Error(`OTA end failed: ${endRes.reply}`);
+    }
+    shouldCleanupTargetOta = false;
+
+    await client.sendRepeaterCmdNoReply(targetHex, "reboot");
+
+    const durationSec = (performance.now() - tStart) / 1000.0;
+    const sendFailureRatePct = chunkWriteAttempts > 0
+      ? (chunkWriteFailures * 100.0) / chunkWriteAttempts
+      : 0;
+    const serverRejectRatePct = chunkWriteAttempts > 0
+      ? (chunkServerRejects * 100.0) / chunkWriteAttempts
+      : 0;
+    const totalRejects = chunkWriteFailures + chunkServerRejects;
+    const failureRatePct = chunkWriteAttempts > 0
+      ? (totalRejects * 100.0) / chunkWriteAttempts
+      : 0;
+
+    return {
+      transport: "text_cmd",
+      fwSize,
+      totalChunks,
+      chunkSize,
+      ackEvery,
+      durationSec,
+      chunkWriteAttempts,
+      chunkWriteFailures,
+      chunkServerRejects,
+      totalRejects,
+      sendFailureRatePct,
+      serverRejectRatePct,
+      failureRatePct,
+    };
+  } catch (e) {
+    if (shouldCleanupTargetOta && !otaCancelRequested) {
+      await abortTargetOtaSession(targetHex, "", "text failure");
+    }
+    throw e;
   }
-
-  const endRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "ota end", endTimeoutSec);
-  if (endRes.error) {
-    throw new Error(`OTA end failed: ${endRes.error}`);
-  }
-  if (!String(endRes.reply || "").toLowerCase().startsWith("ok")) {
-    throw new Error(`OTA end failed: ${endRes.reply}`);
-  }
-
-  await client.sendRepeaterCmdNoReply(targetHex, "reboot");
-
-  const durationSec = (performance.now() - tStart) / 1000.0;
-  const sendFailureRatePct = chunkWriteAttempts > 0
-    ? (chunkWriteFailures * 100.0) / chunkWriteAttempts
-    : 0;
-  const serverRejectRatePct = chunkWriteAttempts > 0
-    ? (chunkServerRejects * 100.0) / chunkWriteAttempts
-    : 0;
-  const totalRejects = chunkWriteFailures + chunkServerRejects;
-  const failureRatePct = chunkWriteAttempts > 0
-    ? (totalRejects * 100.0) / chunkWriteAttempts
-    : 0;
-
-  return {
-    transport: "text_cmd",
-    fwSize,
-    totalChunks,
-    chunkSize,
-    ackEvery,
-    durationSec,
-    chunkWriteAttempts,
-    chunkWriteFailures,
-    chunkServerRejects,
-    totalRejects,
-    sendFailureRatePct,
-    serverRejectRatePct,
-    failureRatePct,
-  };
 }
 
 async function runOtaWithAutoTransport(params) {
@@ -2996,21 +3284,29 @@ if (ui.refreshTargetsBtn) {
 }
 
 ui.startOtaBtn.addEventListener("click", async () => {
+  appendLog("Lancer OTA: clic detecte.");
   if (!client || !client.connected) {
-    appendLog("Pas de connexion active.");
+    appendLog(`Lancer OTA: abandon, connexion inactive (client=${Boolean(client)}, connected=${Boolean(client?.connected)}).`);
     return;
   }
-  if (otaRunning) return;
+  if (otaRunning) {
+    appendLog("Lancer OTA: ignore, OTA deja en cours.");
+    return;
+  }
 
   const file = ui.firmwareFile.files && ui.firmwareFile.files[0];
   if (!file) {
-    appendLog("Selectionne un firmware (.bin/.bin.gz).");
+    appendLog("Lancer OTA: aucun firmware selectionne (.bin/.bin.gz/.uf2).");
     return;
   }
+  appendLog(`Lancer OTA: preparation du fichier ${file.name}.`);
 
   let firmware;
+  let firmwareInfo;
   try {
-    firmware = await getFirmwareBytes(file);
+    firmwareInfo = await getFirmwareBytes(file);
+    firmware = firmwareInfo.firmware;
+    appendLog(`Lancer OTA: payload pret (${formatByteCount(firmware.length)}, ${firmwareInfo.uploadFormat}).`);
   } catch (e) {
     appendLog(`Lecture firmware echouee: ${e.message}`);
     return;
@@ -3018,7 +3314,9 @@ ui.startOtaBtn.addEventListener("click", async () => {
 
   let firmwareMd5;
   try {
+    appendLog("Lancer OTA: calcul MD5...");
     firmwareMd5 = md5Hex(firmware);
+    appendLog("Lancer OTA: MD5 calcule.");
   } catch (e) {
     appendLog(`Calcul MD5 echoue: ${e.message}`);
     return;
@@ -3060,7 +3358,15 @@ ui.startOtaBtn.addEventListener("click", async () => {
         : Math.round(clamp(manualNoAckGap * 0.5, 10, 200)),
       radioProfile: autoSettings ? autoSettings.profile : null,
     };
-    appendLog(`Firmware: ${file.name} (${firmware.length} bytes)`);
+    if (firmwareInfo?.sourceFormat === "uf2") {
+      appendLog(
+        `Firmware: ${file.name} (${formatByteCount(firmwareInfo.originalSize)}) `
+        + `-> bin ${formatByteCount(firmwareInfo.extractedSize)} `
+        + `-> ${firmwareInfo.uploadFormat} ${formatByteCount(firmwareInfo.uploadSize)}`
+      );
+    } else {
+      appendLog(`Firmware: ${file.name} (${firmware.length} bytes, ${firmwareInfo?.uploadFormat || "bin"})`);
+    }
     appendLog(`MD5: ${firmwareMd5}`);
     updatePlanLine(true);
 
