@@ -38,6 +38,11 @@ static bool isUsbOffCommand(const char *cmd) {
 unsigned long lastActive = 0; // mark last active time
 unsigned long nextSleepinSecs = 60; // next sleep in seconds. The first sleep (if enabled) is after 1 minutes from boot
 
+#if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_)
+static unsigned long userBtnDownAt = 0;
+#define USER_BTN_HOLD_OFF_MILLIS 1500
+#endif
+
 void setup() {
   #ifdef MLK_PIN_SERIAL_RX
     Serial.setRX(MLK_PIN_SERIAL_RX);
@@ -146,6 +151,21 @@ void loop() {
 
     command[0] = 0;  // reset command buffer
   }
+
+#if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_)
+  // Hold the user button to power off the SenseCAP Solar repeater.
+  int btnState = digitalRead(PIN_USER_BTN);
+  if (btnState == LOW) {
+    if (userBtnDownAt == 0) {
+      userBtnDownAt = millis();
+    } else if ((unsigned long)(millis() - userBtnDownAt) >= USER_BTN_HOLD_OFF_MILLIS) {
+      Serial.println("Powering off...");
+      board.powerOff();  // does not return
+    }
+  } else {
+    userBtnDownAt = 0;
+  }
+#endif
 
   the_mesh.loop();
   sensors.loop();
