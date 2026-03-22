@@ -21,6 +21,7 @@ public:
   bool startSession(const char *id, char reply[]);
   bool handleCommand(const char *command, char reply[]);
   bool handleBinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]);
+  bool isSleepInhibited() const { return _armed || _active; }
 
 private:
   bool _armed;

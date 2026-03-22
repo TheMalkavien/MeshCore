@@ -4,6 +4,10 @@
 #include <MeshCore.h>
 #include <helpers/RP2040OTA.h>
 
+#if defined(ARDUINO_ARCH_RP2040)
+  #include <hardware/clocks.h>
+#endif
+
 // LoRa radio module pins for Waveshare RP2040-LoRa-HF/LF
 // https://files.waveshare.com/wiki/RP2040-LoRa/Rp2040-lora-sch.pdf
 
@@ -60,8 +64,32 @@ public:
   void reboot() override { rp2040.reboot(); }
 
   bool startOTAUpdate(const char *id, char reply[]) override;
-  bool handleOTACommand(const char *command, char reply[]) override { return ota.handleCommand(command, reply); }
-  bool handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) override {
-    return ota.handleBinaryCommand(opcode, payload, payload_len, reply);
-  }
+  bool handleOTACommand(const char *command, char reply[]) override;
+  bool handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) override;
 };
+
+#if defined(ARDUINO_ARCH_RP2040)
+#ifndef RP2040_ACTIVE_CLOCK_MHZ
+  #ifdef RP2040_CPU_FREQ_MHZ
+    #define RP2040_ACTIVE_CLOCK_MHZ RP2040_CPU_FREQ_MHZ
+  #else
+    #define RP2040_ACTIVE_CLOCK_MHZ 125
+  #endif
+#endif
+
+#ifndef RP2040_OTA_CLOCK_MHZ
+  #define RP2040_OTA_CLOCK_MHZ 125
+#endif
+
+inline void rp2040_apply_clock_profile(uint32_t clock_mhz) {
+  set_sys_clock_khz(clock_mhz * 1000, true);
+}
+
+inline void rp2040_restore_active_profile() {
+  rp2040_apply_clock_profile(RP2040_ACTIVE_CLOCK_MHZ);
+}
+
+inline void rp2040_enter_ota_profile() {
+  rp2040_apply_clock_profile(RP2040_OTA_CLOCK_MHZ);
+}
+#endif
