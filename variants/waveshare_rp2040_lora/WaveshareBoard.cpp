@@ -88,6 +88,9 @@ void WaveshareBoard::begin() {
 void WaveshareBoard::sleep(uint32_t secs) {
   // if MLK_RP2040_LOWPOWER is defined, we will disable usb insted of sleeping, as RP2040 doesn't have a real sleep mode, and disabling USB can save power significantly.
   #if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
+    if (ota.isSleepInhibited()) {
+      return;
+    }
     Serial.println("Disabling USB for low power sleep. Use commd usb on to re-enable.");
     meshcore_board_usb_off_demand();
   #endif
@@ -103,6 +106,23 @@ bool WaveshareBoard::startOTAUpdate(const char *id, char reply[]) {
     sprintf(reply, "Waking UP ESP32Flasher to flash the firmware.");
   return true;
   #else
+#if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
+    rp2040_restore_active_profile();
+#endif
     return ota.startSession(id, reply);
   #endif
+}
+
+bool WaveshareBoard::handleOTACommand(const char *command, char reply[]) {
+#if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
+  rp2040_restore_active_profile();
+#endif
+  return ota.handleCommand(command, reply);
+}
+
+bool WaveshareBoard::handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) {
+#if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
+  rp2040_restore_active_profile();
+#endif
+  return ota.handleBinaryCommand(opcode, payload, payload_len, reply);
 }

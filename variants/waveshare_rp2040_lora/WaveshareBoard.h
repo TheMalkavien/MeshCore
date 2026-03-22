@@ -84,10 +84,8 @@ public:
   void reboot() override { rp2040.reboot(); }
 
   bool startOTAUpdate(const char *id, char reply[]) override;
-  bool handleOTACommand(const char *command, char reply[]) override { return ota.handleCommand(command, reply); }
-  bool handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) override {
-    return ota.handleBinaryCommand(opcode, payload, payload_len, reply);
-  }
+  bool handleOTACommand(const char *command, char reply[]) override;
+  bool handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) override;
 };
 
 #ifdef MLK_RP2040_LOWPOWER
@@ -99,7 +97,7 @@ public:
 
 #ifndef RP2040_ACTIVE_CLOCK_MHZ
   #ifdef RP2040_CPU_FREQ_MHZ
-    #define RP2040_ACTIVE_CLOCK_MHZ RP2040_CPU_FREQ_MHZ
+    #define RP2040_ACTIVE_CLOCK_MHZ 125
   #else
     #define RP2040_ACTIVE_CLOCK_MHZ 125
   #endif
