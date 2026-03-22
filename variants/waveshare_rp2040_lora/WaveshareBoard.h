@@ -4,6 +4,13 @@
 #include <MeshCore.h>
 #include <helpers/RP2040OTA.h>
 
+#if defined(ARDUINO_ARCH_RP2040)
+  #include <hardware/clocks.h>
+#endif
+#ifdef MLK_RP2040_LOWPOWER
+  #include <hardware/vreg.h>
+#endif
+
 // LoRa radio module pins for Waveshare RP2040-LoRa-HF/LF
 // https://files.waveshare.com/wiki/RP2040-LoRa/Rp2040-lora-sch.pdf
 
@@ -59,8 +66,8 @@ public:
   bool setAdcMultiplier(float multiplier) override {
 #if defined(PIN_VBAT_READ) && defined(ADC_MULTIPLIER)
      if (multiplier == 0.0f) {
-      adc_mult = ADC_MULTIPLIER;}
-    else {
+      adc_mult = ADC_MULTIPLIER;
+    } else {
       adc_mult = multiplier;
     }
     return true;
@@ -88,19 +95,21 @@ public:
   bool handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) override;
 };
 
-#ifdef MLK_RP2040_LOWPOWER
-#include <hardware/vreg.h>
-
+#if defined(ARDUINO_ARCH_RP2040)
 #ifndef RP2040_SLEEP_CLOCK_MHZ
   #define RP2040_SLEEP_CLOCK_MHZ 18
 #endif
 
 #ifndef RP2040_ACTIVE_CLOCK_MHZ
   #ifdef RP2040_CPU_FREQ_MHZ
-    #define RP2040_ACTIVE_CLOCK_MHZ 125
+    #define RP2040_ACTIVE_CLOCK_MHZ RP2040_CPU_FREQ_MHZ
   #else
     #define RP2040_ACTIVE_CLOCK_MHZ 125
   #endif
+#endif
+
+#ifndef RP2040_OTA_CLOCK_MHZ
+  #define RP2040_OTA_CLOCK_MHZ 125
 #endif
 
 inline void rp2040_apply_clock_profile(uint32_t clock_mhz) {
@@ -108,23 +117,34 @@ inline void rp2040_apply_clock_profile(uint32_t clock_mhz) {
 
   // Keep SPI, ADC and RTC on coherent clock sources after changing clk_sys.
   clock_configure(clk_peri,
-                  0,                                      // No glitchless mux
+                  0,
                   CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
-                  clock_mhz * MHZ,                        // Input frequency
-                  clock_mhz * MHZ);                       // Output frequency
+                  clock_mhz * MHZ,
+                  clock_mhz * MHZ);
   clock_configure(clk_adc, 0,
                   CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
                   clock_mhz * MHZ, clock_mhz * MHZ);
   clock_configure(clk_rtc, 0, CLOCKS_CLK_RTC_CTRL_AUXSRC_VALUE_XOSC_CLKSRC, 12 * MHZ, 46875);
 }
 
+#ifdef MLK_RP2040_LOWPOWER
 inline void rp2040_enter_sleep_profile() {
   rp2040_apply_clock_profile(RP2040_SLEEP_CLOCK_MHZ);
   vreg_set_voltage(VREG_VOLTAGE_0_90);
 }
+#endif
 
 inline void rp2040_restore_active_profile() {
+#ifdef MLK_RP2040_LOWPOWER
   vreg_set_voltage(VREG_VOLTAGE_DEFAULT);
+#endif
   rp2040_apply_clock_profile(RP2040_ACTIVE_CLOCK_MHZ);
+}
+
+inline void rp2040_enter_ota_profile() {
+#ifdef MLK_RP2040_LOWPOWER
+  vreg_set_voltage(VREG_VOLTAGE_DEFAULT);
+#endif
+  rp2040_apply_clock_profile(RP2040_OTA_CLOCK_MHZ);
 }
 #endif

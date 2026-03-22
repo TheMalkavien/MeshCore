@@ -57,8 +57,8 @@ void WaveshareBoard::begin() {
   // for future use, sub-classes SHOULD call this from their begin()
   startup_reason = BD_STARTUP_NORMAL;
 
-#if defined(ARDUINO_ARCH_RP2040) && defined(RP2040_CPU_FREQ_MHZ)
-  set_sys_clock_khz(RP2040_CPU_FREQ_MHZ * 1000, true);
+#if defined(ARDUINO_ARCH_RP2040)
+  rp2040_restore_active_profile();
 #endif
 
 #ifdef P_LORA_TX_LED
@@ -104,25 +104,37 @@ bool WaveshareBoard::startOTAUpdate(const char *id, char reply[]) {
     delay(500);
     digitalWrite(MLK_ESP32_FLASHER_PIN, LOW); // stay low to avoid another wake up
     sprintf(reply, "Waking UP ESP32Flasher to flash the firmware.");
-  return true;
+    return true;
   #else
-#if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
-    rp2040_restore_active_profile();
+#if defined(ARDUINO_ARCH_RP2040)
+    rp2040_enter_ota_profile();
 #endif
     return ota.startSession(id, reply);
   #endif
 }
 
 bool WaveshareBoard::handleOTACommand(const char *command, char reply[]) {
-#if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
-  rp2040_restore_active_profile();
+#if defined(ARDUINO_ARCH_RP2040)
+  rp2040_enter_ota_profile();
 #endif
-  return ota.handleCommand(command, reply);
+  bool ok = ota.handleCommand(command, reply);
+#if defined(ARDUINO_ARCH_RP2040)
+  if (!ota.isSleepInhibited()) {
+    rp2040_restore_active_profile();
+  }
+#endif
+  return ok;
 }
 
 bool WaveshareBoard::handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) {
-#if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
-  rp2040_restore_active_profile();
+#if defined(ARDUINO_ARCH_RP2040)
+  rp2040_enter_ota_profile();
 #endif
-  return ota.handleBinaryCommand(opcode, payload, payload_len, reply);
+  bool ok = ota.handleBinaryCommand(opcode, payload, payload_len, reply);
+#if defined(ARDUINO_ARCH_RP2040)
+  if (!ota.isSleepInhibited()) {
+    rp2040_restore_active_profile();
+  }
+#endif
+  return ok;
 }
