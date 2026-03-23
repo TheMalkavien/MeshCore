@@ -68,6 +68,21 @@ struct NeighbourInfo {
   int8_t snr; // multiplied by 4, user should divide to get float value
 };
 
+struct PendingPing {
+  bool active;
+  bool success;
+  bool reply_remote;
+  mesh::Identity target;
+  mesh::Identity requester;
+  uint32_t tag;
+  unsigned long started_at;
+  unsigned long expiry_at;
+  int8_t remote_snr;
+  int8_t local_snr;
+  uint8_t requester_path_hash_size;
+  char cli_prefix[10];
+};
+
 #ifndef FIRMWARE_BUILD_DATE
   #define FIRMWARE_BUILD_DATE   "20 Mar 2026"
 #endif
@@ -117,6 +132,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 #if MAX_NEIGHBOURS
   NeighbourInfo neighbours[MAX_NEIGHBOURS];
 #endif
+  PendingPing pending_ping;
   CayenneLPP telemetry;
   unsigned long set_radio_at, revert_radio_at;
   float pending_freq;
@@ -124,6 +140,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t pending_sf;
   uint8_t pending_cr;
   int  matching_peer_indexes[MAX_CLIENTS];
+  ClientInfo* active_cli_client;
+  uint8_t active_cli_path_hash_size;
   FloodRetryEntry _flood_retry[4];
   uint32_t _flood_retry_tracked;
   uint32_t _flood_retry_confirmed;
@@ -141,6 +159,11 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void processFloodRetries();
   void clearFloodRetryState();
   void sendNodeDiscoverReq();
+  bool resolvePingTarget(const char* destination, mesh::Identity& target, char* error_reply);
+  bool sendTracePing(const mesh::Identity& target, bool reply_remote, const char* cli_prefix, char* error_reply);
+  void formatPendingPingReply(char* reply, bool timeout) const;
+  void sendPendingPingReply(bool timeout);
+  bool waitForPingResult(char* reply);
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
@@ -190,6 +213,8 @@ protected:
   void onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, const mesh::Identity& sender, uint8_t* data, size_t len) override;
   int searchPeersByHash(const uint8_t* hash) override;
   void getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) override;
+  void onTraceRecv(mesh::Packet* packet, uint32_t tag, uint32_t auth_code, uint8_t flags,
+                   const uint8_t* path_snrs, const uint8_t* path_hashes, uint8_t path_len) override;
   void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len);
   void onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx, const uint8_t* secret, uint8_t* data, size_t len) override;
   bool onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_t* secret, uint8_t* path, uint8_t path_len, uint8_t extra_type, uint8_t* extra, uint8_t extra_len) override;
