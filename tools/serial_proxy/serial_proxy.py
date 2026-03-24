@@ -38,6 +38,8 @@ MAX_COMPANION_FRAME_SIZE = 2048
 DEFAULT_HISTORY_BYTES = 512 * 1024
 DEFAULT_HISTORY_FRAMES = 4096
 DEFAULT_REPLAY_DELAY = 1.0
+DEFAULT_CLIENT_WRITE_TIMEOUT = 2.0
+DEFAULT_CLIENT_QUEUE_FRAMES = 512
 
 MESSAGE_PACKET_TYPES = {0x07, 0x08, 0x10, 0x11}
 PUSH_ACTIVITY_PACKET_TYPES = (set(range(0x80, 0x91)) - {PUSH_CODE_MSG_WAITING})
@@ -107,6 +109,8 @@ class ClientState:
     pending_message_frames: Deque[BufferedFrame] = field(default_factory=deque)
     serving_buffered_messages: bool = False
     awaiting_no_more_messages_for_push_replay: bool = False
+    outbound_queue: Optional[asyncio.Queue] = None
+    sender_task: Optional[asyncio.Task] = None
     replay_task: Optional[asyncio.Task] = None
     last_disconnect_at: float = 0.0
 
@@ -139,6 +143,8 @@ class SerialBroadcastProxy:
         history_bytes: int = DEFAULT_HISTORY_BYTES,
         history_frames: int = DEFAULT_HISTORY_FRAMES,
         replay_delay: float = DEFAULT_REPLAY_DELAY,
+        client_write_timeout: float = DEFAULT_CLIENT_WRITE_TIMEOUT,
+        client_queue_frames: int = DEFAULT_CLIENT_QUEUE_FRAMES,
         log: bool = True,
     ):
         self.listen_host = listen_host
@@ -151,6 +157,8 @@ class SerialBroadcastProxy:
         self.history_bytes = max(history_bytes, 0)
         self.history_frames = max(history_frames, 0)
         self.replay_delay = max(replay_delay, 0.0)
+        self.client_write_timeout = max(client_write_timeout, 0.1)
+        self.client_queue_frames = max(client_queue_frames, 1)
         self.log = log
 
         self.client_states: Dict[str, ClientState] = {}
@@ -258,6 +266,9 @@ class SerialBroadcastProxy:
         state.serving_buffered_messages = False
         state.awaiting_no_more_messages_for_push_replay = False
         state.last_disconnect_at = 0.0
+        state.outbound_queue = asyncio.Queue(maxsize=self.client_queue_frames)
+        self._cancel_sender_task(state)
+        state.sender_task = asyncio.create_task(self._client_sender(state, writer))
 
         return state
 
@@ -266,6 +277,55 @@ class SerialBroadcastProxy:
         state.replay_task = None
         if task and not task.done():
             task.cancel()
+
+    def _cancel_sender_task(self, state: ClientState) -> None:
+        task = state.sender_task
+        state.sender_task = None
+        if task and not task.done():
+            task.cancel()
+
+    def _reset_client_runtime_state(self, state: ClientState) -> None:
+        state.awaiting_replay_after_self_info = False
+        state.serving_buffered_messages = False
+        state.awaiting_no_more_messages_for_push_replay = False
+
+    async def _client_sender(
+        self, state: ClientState, writer: asyncio.StreamWriter
+    ) -> None:
+        queue = state.outbound_queue
+        if queue is None:
+            return
+
+        try:
+            while not self._stop.is_set():
+                payload = await queue.get()
+                if payload is None:
+                    break
+                if state.writer is not writer:
+                    break
+
+                writer.write(payload)
+                await asyncio.wait_for(writer.drain(), timeout=self.client_write_timeout)
+        except asyncio.TimeoutError:
+            self._p(f"[client] send timeout to {state.client_id}, closing stalled connection")
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        finally:
+            if state.writer is writer:
+                state.writer = None
+                self._reset_client_runtime_state(state)
+                state.last_disconnect_at = asyncio.get_running_loop().time()
+                self._cancel_replay_task(state)
+                state.outbound_queue = None
+            if state.sender_task is asyncio.current_task():
+                state.sender_task = None
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     def _capture_pending_history(self, state: ClientState) -> None:
         captured_messages = 0
@@ -306,18 +366,24 @@ class SerialBroadcastProxy:
     async def _send_bytes_to_client(self, state: ClientState, payload: bytes) -> bool:
         async with state.send_lock:
             writer = state.writer
-            if writer is None or self._stop.is_set():
+            queue = state.outbound_queue
+            if writer is None or queue is None or self._stop.is_set():
                 return False
 
             try:
-                writer.write(payload)
-                await writer.drain()
+                queue.put_nowait(payload)
                 return True
-            except Exception:
+            except asyncio.QueueFull:
+                self._p(
+                    f"[client] outbound queue full for {state.client_id}, closing stalled connection"
+                )
                 if state.writer is writer:
                     state.writer = None
-                    state.awaiting_replay_after_self_info = False
+                    self._reset_client_runtime_state(state)
+                    state.last_disconnect_at = asyncio.get_running_loop().time()
+                    state.outbound_queue = None
                 self._cancel_replay_task(state)
+                self._cancel_sender_task(state)
                 try:
                     writer.close()
                     await writer.wait_closed()
@@ -420,11 +486,11 @@ class SerialBroadcastProxy:
         finally:
             if state.writer is writer:
                 state.writer = None
-                state.awaiting_replay_after_self_info = False
-                state.serving_buffered_messages = False
-                state.awaiting_no_more_messages_for_push_replay = False
+                self._reset_client_runtime_state(state)
                 state.last_disconnect_at = asyncio.get_running_loop().time()
                 self._cancel_replay_task(state)
+                self._cancel_sender_task(state)
+                state.outbound_queue = None
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -494,10 +560,10 @@ class SerialBroadcastProxy:
         writers = [state.writer for state in self.client_states.values() if state.writer is not None]
         for state in self.client_states.values():
             state.writer = None
-            state.awaiting_replay_after_self_info = False
-            state.serving_buffered_messages = False
-            state.awaiting_no_more_messages_for_push_replay = False
+            self._reset_client_runtime_state(state)
             state.last_disconnect_at = asyncio.get_running_loop().time()
+            self._cancel_sender_task(state)
+            state.outbound_queue = None
 
         for writer in writers:
             try:
@@ -589,6 +655,8 @@ def parse_args():
     ap.add_argument("--history-bytes", type=int, default=DEFAULT_HISTORY_BYTES)
     ap.add_argument("--history-frames", type=int, default=DEFAULT_HISTORY_FRAMES)
     ap.add_argument("--replay-delay", type=float, default=DEFAULT_REPLAY_DELAY)
+    ap.add_argument("--client-write-timeout", type=float, default=DEFAULT_CLIENT_WRITE_TIMEOUT)
+    ap.add_argument("--client-queue-frames", type=int, default=DEFAULT_CLIENT_QUEUE_FRAMES)
     ap.add_argument("--quiet", action="store_true")
     return ap.parse_args()
 
@@ -606,6 +674,8 @@ async def main_async():
         history_bytes=args.history_bytes,
         history_frames=args.history_frames,
         replay_delay=args.replay_delay,
+        client_write_timeout=args.client_write_timeout,
+        client_queue_frames=args.client_queue_frames,
         log=not args.quiet,
     )
 
