@@ -106,7 +106,7 @@ static bool readPacketWireExact(mesh::Packet* dst, const uint8_t raw[], uint8_t 
 #endif
 
 #define LAZY_CONTACTS_WRITE_DELAY    5000
-#define PING_TIMEOUT_MILLIS          3500
+#define PING_TIMEOUT_MILLIS          5000
 
 static const char* skipCommandSpaces(const char* p) {
   while (*p == ' ') {
@@ -1559,14 +1559,19 @@ void MyMesh::formatPacketStatsReply(char *reply) {
                                        getNumRecvFlood(), getNumRecvDirect());
 #if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
   uint32_t loss_permille = (_flood_retry_tracked == 0) ? 0 : (_flood_retry_failed * 1000UL) / _flood_retry_tracked;
-  sprintf(&reply[strlen(reply)],
-          "\nrelay.flood trk=%lu ok=%lu fail=%lu retry=%lu loss=%lu.%lu%%",
-          _flood_retry_tracked,
-          _flood_retry_confirmed,
-          _flood_retry_failed,
-          _flood_retry_retransmits,
-          loss_permille / 10,
-          loss_permille % 10);
+  static const size_t CLI_REPLY_CAPACITY = 160;
+  size_t used = strlen(reply);
+  if (used < CLI_REPLY_CAPACITY - 1) {
+    snprintf(&reply[used],
+             CLI_REPLY_CAPACITY - used,
+             "\nrelay.flood trk=%lu ok=%lu fail=%lu retry=%lu loss=%lu.%lu%%",
+             _flood_retry_tracked,
+             _flood_retry_confirmed,
+             _flood_retry_failed,
+             _flood_retry_retransmits,
+             loss_permille / 10,
+             loss_permille % 10);
+  }
 #endif
 }
 
