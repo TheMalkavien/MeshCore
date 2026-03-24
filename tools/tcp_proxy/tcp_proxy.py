@@ -3,8 +3,8 @@
 TCP broadcast proxy for MeshCore companion links:
 - Multi clients -> single backend connection
 - Backend -> broadcast to all connected clients
-- Backend activity frames are buffered per logical client
-- Reconnecting clients receive buffered activity after APP_START/SELF_INFO
+- Backend message frames are buffered per logical client
+- Reconnecting clients can replay only missed messages
 """
 
 import argparse
@@ -19,18 +19,14 @@ CMD_APP_START = 0x01
 CMD_SYNC_NEXT_MESSAGE = 0x0A
 RESP_CODE_SELF_INFO = 0x05
 RESP_CODE_NO_MORE_MESSAGES = 0x0A
-PUSH_CODE_MSG_WAITING = 0x83
 
 MAX_COMPANION_FRAME_SIZE = 2048
 DEFAULT_HISTORY_BYTES = 512 * 1024
 DEFAULT_HISTORY_FRAMES = 4096
-DEFAULT_REPLAY_DELAY = 1.0
 DEFAULT_CLIENT_WRITE_TIMEOUT = 2.0
 DEFAULT_CLIENT_QUEUE_FRAMES = 512
 
 MESSAGE_PACKET_TYPES = {0x07, 0x08, 0x10, 0x11}
-PUSH_ACTIVITY_PACKET_TYPES = (set(range(0x80, 0x91)) - {PUSH_CODE_MSG_WAITING})
-ACTIVITY_PACKET_TYPES = PUSH_ACTIVITY_PACKET_TYPES | {PUSH_CODE_MSG_WAITING} | MESSAGE_PACKET_TYPES
 
 
 class CompanionStreamParser:
@@ -92,13 +88,10 @@ class ClientState:
     )
     awaiting_replay_after_self_info: bool = False
     replay_capture_seq: int = 0
-    pending_push_frames: Deque[BufferedFrame] = field(default_factory=deque)
     pending_message_frames: Deque[BufferedFrame] = field(default_factory=deque)
     serving_buffered_messages: bool = False
-    awaiting_no_more_messages_for_push_replay: bool = False
     outbound_queue: Optional[asyncio.Queue] = None
     sender_task: Optional[asyncio.Task] = None
-    replay_task: Optional[asyncio.Task] = None
     last_disconnect_at: float = 0.0
 
 
@@ -108,9 +101,8 @@ def get_packet_type(frame: bytes) -> Optional[int]:
     return frame[3]
 
 
-def is_activity_frame(frame: bytes) -> bool:
-    packet_type = get_packet_type(frame)
-    return packet_type in ACTIVITY_PACKET_TYPES
+def is_message_frame(frame: bytes) -> bool:
+    return get_packet_type(frame) in MESSAGE_PACKET_TYPES
 
 
 def build_backend_frame(packet_type: int) -> bytes:
@@ -127,7 +119,6 @@ class BroadcastProxy:
         backend_reconnect_delay: float = 1.0,
         history_bytes: int = DEFAULT_HISTORY_BYTES,
         history_frames: int = DEFAULT_HISTORY_FRAMES,
-        replay_delay: float = DEFAULT_REPLAY_DELAY,
         client_write_timeout: float = DEFAULT_CLIENT_WRITE_TIMEOUT,
         client_queue_frames: int = DEFAULT_CLIENT_QUEUE_FRAMES,
         log: bool = True,
@@ -139,7 +130,6 @@ class BroadcastProxy:
         self.backend_reconnect_delay = backend_reconnect_delay
         self.history_bytes = max(history_bytes, 0)
         self.history_frames = max(history_frames, 0)
-        self.replay_delay = max(replay_delay, 0.0)
         self.client_write_timeout = max(client_write_timeout, 0.1)
         self.client_queue_frames = max(client_queue_frames, 1)
         self.log = log
@@ -198,7 +188,7 @@ class BroadcastProxy:
             f"[proxy] listening on {addr} -> backend {self.backend_host}:{self.backend_port}"
         )
         self._p(
-            f"[proxy] activity history enabled: {self.history_frames} frames / {self.history_bytes} bytes"
+            f"[proxy] message history enabled: {self.history_frames} frames / {self.history_bytes} bytes"
         )
 
         self._backend_task = asyncio.create_task(self._backend_manager())
@@ -233,31 +223,26 @@ class BroadcastProxy:
         await self._close_all_clients()
         await self._close_backend()
 
-    async def _register_client(self, client_id: str, writer: asyncio.StreamWriter) -> ClientState:
-        state = self._find_reusable_client_state(client_id)
+    async def _register_client(self, peer_group: str, writer: asyncio.StreamWriter) -> ClientState:
+        state = self._find_reusable_client_state(peer_group)
         if state is None:
-            state = ClientState(client_id=self._allocate_client_id(client_id), peer_group=client_id)
+            state = ClientState(
+                client_id=self._allocate_client_id(peer_group),
+                peer_group=peer_group,
+            )
             self.client_states[state.client_id] = state
         else:
             state.client_parser.reset()
-            self._cancel_replay_task(state)
 
         state.writer = writer
         state.awaiting_replay_after_self_info = False
         state.serving_buffered_messages = False
-        state.awaiting_no_more_messages_for_push_replay = False
         state.last_disconnect_at = 0.0
         state.outbound_queue = asyncio.Queue(maxsize=self.client_queue_frames)
         self._cancel_sender_task(state)
         state.sender_task = asyncio.create_task(self._client_sender(state, writer))
 
         return state
-
-    def _cancel_replay_task(self, state: ClientState) -> None:
-        task = state.replay_task
-        state.replay_task = None
-        if task and not task.done():
-            task.cancel()
 
     def _cancel_sender_task(self, state: ClientState) -> None:
         task = state.sender_task
@@ -268,7 +253,6 @@ class BroadcastProxy:
     def _reset_client_runtime_state(self, state: ClientState) -> None:
         state.awaiting_replay_after_self_info = False
         state.serving_buffered_messages = False
-        state.awaiting_no_more_messages_for_push_replay = False
 
     async def _client_sender(
         self, state: ClientState, writer: asyncio.StreamWriter
@@ -298,7 +282,6 @@ class BroadcastProxy:
                 state.writer = None
                 self._reset_client_runtime_state(state)
                 state.last_disconnect_at = asyncio.get_running_loop().time()
-                self._cancel_replay_task(state)
                 state.outbound_queue = None
             if state.sender_task is asyncio.current_task():
                 state.sender_task = None
@@ -314,35 +297,14 @@ class BroadcastProxy:
             if buffered.seq <= state.replay_capture_seq:
                 continue
 
-            packet_type = get_packet_type(buffered.data)
-            if packet_type in MESSAGE_PACKET_TYPES:
+            if get_packet_type(buffered.data) in MESSAGE_PACKET_TYPES:
                 state.pending_message_frames.append(buffered)
                 captured_messages += 1
-            elif packet_type in PUSH_ACTIVITY_PACKET_TYPES:
-                state.pending_push_frames.append(buffered)
 
             state.replay_capture_seq = buffered.seq
 
         if captured_messages > 0:
             state.serving_buffered_messages = True
-
-    def _schedule_replay_flush(self, state: ClientState) -> None:
-        self._cancel_replay_task(state)
-        if state.writer is None:
-            return
-        state.replay_task = asyncio.create_task(self._flush_pending_replay_after_delay(state))
-
-    async def _flush_pending_replay_after_delay(self, state: ClientState) -> None:
-        try:
-            if self.replay_delay > 0:
-                await asyncio.sleep(self.replay_delay)
-            await self._flush_pending_push_frames(state)
-            if state.pending_message_frames:
-                self._p(
-                    f"[client] waiting for client sync to replay {len(state.pending_message_frames)} buffered messages to {state.client_id}"
-                )
-        except asyncio.CancelledError:
-            pass
 
     async def _send_bytes_to_client(self, state: ClientState, payload: bytes) -> bool:
         async with state.send_lock:
@@ -363,7 +325,6 @@ class BroadcastProxy:
                     self._reset_client_runtime_state(state)
                     state.last_disconnect_at = asyncio.get_running_loop().time()
                     state.outbound_queue = None
-                self._cancel_replay_task(state)
                 self._cancel_sender_task(state)
                 try:
                     writer.close()
@@ -371,18 +332,6 @@ class BroadcastProxy:
                 except Exception:
                     pass
                 return False
-
-    async def _flush_pending_push_frames(self, state: ClientState) -> None:
-        replayed = 0
-        while state.pending_push_frames and state.writer is not None:
-            buffered = state.pending_push_frames.popleft()
-            if not await self._send_bytes_to_client(state, buffered.data):
-                state.pending_push_frames.appendleft(buffered)
-                return
-            replayed += 1
-
-        if replayed:
-            self._p(f"[client] replayed {replayed} push activity frames to {state.client_id}")
 
     async def _serve_pending_message(self, state: ClientState) -> bool:
         if not state.pending_message_frames:
@@ -409,8 +358,8 @@ class BroadcastProxy:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         peer = writer.get_extra_info("peername")
-        client_id = self._make_client_id(peer)
-        state = await self._register_client(client_id, writer)
+        peer_group = self._make_client_id(peer)
+        state = await self._register_client(peer_group, writer)
         self._p(
             f"[client] connected {peer} as {state.client_id} (clients={self._connected_client_count()})"
         )
@@ -431,26 +380,12 @@ class BroadcastProxy:
                     if command == CMD_APP_START:
                         self._capture_pending_history(state)
                         state.awaiting_replay_after_self_info = True
-                        state.awaiting_no_more_messages_for_push_replay = False
-                        self._cancel_replay_task(state)
                         forward_frames.append(frame)
                     elif command == CMD_SYNC_NEXT_MESSAGE and (
                         state.pending_message_frames or state.serving_buffered_messages
                     ):
                         await self._serve_pending_message(state)
-                        if (
-                            not state.pending_message_frames
-                            and not state.serving_buffered_messages
-                            and state.pending_push_frames
-                        ):
-                            self._schedule_replay_flush(state)
                     else:
-                        if (
-                            command == CMD_SYNC_NEXT_MESSAGE
-                            and state.pending_push_frames
-                            and not state.pending_message_frames
-                        ):
-                            state.awaiting_no_more_messages_for_push_replay = True
                         forward_frames.append(frame)
 
                 if forward_frames:
@@ -469,7 +404,6 @@ class BroadcastProxy:
                 state.writer = None
                 self._reset_client_runtime_state(state)
                 state.last_disconnect_at = asyncio.get_running_loop().time()
-                self._cancel_replay_task(state)
                 self._cancel_sender_task(state)
                 state.outbound_queue = None
             try:
@@ -576,22 +510,29 @@ class BroadcastProxy:
 
     async def _handle_backend_frame(self, frame: bytes) -> None:
         packet_type = get_packet_type(frame)
-        if is_activity_frame(frame):
-            self._append_history(frame)
+        history_seq: Optional[int] = None
+        if is_message_frame(frame):
+            history_seq = self._append_history(frame)
 
         for state in list(self.client_states.values()):
             if state.writer is None:
                 continue
-            await self._send_frame_to_client(state, frame, packet_type)
+            await self._send_frame_to_client(state, frame, packet_type, history_seq)
 
     async def _send_frame_to_client(
         self,
         state: ClientState,
         frame: bytes,
         packet_type: Optional[int],
+        history_seq: Optional[int],
     ) -> None:
         if not await self._send_bytes_to_client(state, frame):
             return
+
+        # Advance the per-client cursor when a live message frame is accepted
+        # for delivery, so reconnect replay only covers messages missed offline.
+        if history_seq is not None and history_seq > state.replay_capture_seq:
+            state.replay_capture_seq = history_seq
 
         if packet_type == RESP_CODE_SELF_INFO and state.awaiting_replay_after_self_info:
             state.awaiting_replay_after_self_info = False
@@ -599,21 +540,11 @@ class BroadcastProxy:
                 self._p(
                     f"[client] waiting for client sync to replay {len(state.pending_message_frames)} buffered messages to {state.client_id}"
                 )
-            elif state.pending_push_frames:
-                self._p(
-                    f"[client] waiting for client sync completion to replay {len(state.pending_push_frames)} buffered push activity frames to {state.client_id}"
-                )
-        elif (
-            packet_type == RESP_CODE_NO_MORE_MESSAGES
-            and state.awaiting_no_more_messages_for_push_replay
-        ):
-            state.awaiting_no_more_messages_for_push_replay = False
-            self._schedule_replay_flush(state)
 
 
 def parse_args():
     ap = argparse.ArgumentParser(
-        description="TCP broadcast proxy with per-client activity replay for MeshCore companion links"
+        description="TCP broadcast proxy with per-client message replay for MeshCore companion links"
     )
     ap.add_argument("--listen-host", default="0.0.0.0")
     ap.add_argument("--listen-port", type=int, required=True)
@@ -622,7 +553,6 @@ def parse_args():
     ap.add_argument("--reconnect-delay", type=float, default=1.0)
     ap.add_argument("--history-bytes", type=int, default=DEFAULT_HISTORY_BYTES)
     ap.add_argument("--history-frames", type=int, default=DEFAULT_HISTORY_FRAMES)
-    ap.add_argument("--replay-delay", type=float, default=DEFAULT_REPLAY_DELAY)
     ap.add_argument("--client-write-timeout", type=float, default=DEFAULT_CLIENT_WRITE_TIMEOUT)
     ap.add_argument("--client-queue-frames", type=int, default=DEFAULT_CLIENT_QUEUE_FRAMES)
     ap.add_argument("--quiet", action="store_true")
@@ -639,7 +569,6 @@ async def main_async():
         backend_reconnect_delay=args.reconnect_delay,
         history_bytes=args.history_bytes,
         history_frames=args.history_frames,
-        replay_delay=args.replay_delay,
         client_write_timeout=args.client_write_timeout,
         client_queue_frames=args.client_queue_frames,
         log=not args.quiet,
