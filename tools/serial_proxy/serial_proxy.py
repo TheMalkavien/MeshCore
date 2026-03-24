@@ -106,6 +106,7 @@ class ClientState:
     pending_push_frames: Deque[BufferedFrame] = field(default_factory=deque)
     pending_message_frames: Deque[BufferedFrame] = field(default_factory=deque)
     serving_buffered_messages: bool = False
+    awaiting_no_more_messages_for_push_replay: bool = False
     replay_task: Optional[asyncio.Task] = None
     last_disconnect_at: float = 0.0
 
@@ -255,6 +256,7 @@ class SerialBroadcastProxy:
         state.writer = writer
         state.awaiting_replay_after_self_info = False
         state.serving_buffered_messages = False
+        state.awaiting_no_more_messages_for_push_replay = False
         state.last_disconnect_at = 0.0
 
         return state
@@ -382,15 +384,26 @@ class SerialBroadcastProxy:
                     if command == CMD_APP_START:
                         self._capture_pending_history(state)
                         state.awaiting_replay_after_self_info = True
+                        state.awaiting_no_more_messages_for_push_replay = False
                         self._cancel_replay_task(state)
                         forward_frames.append(frame)
                     elif command == CMD_SYNC_NEXT_MESSAGE and (
                         state.pending_message_frames or state.serving_buffered_messages
                     ):
                         await self._serve_pending_message(state)
-                    else:
-                        if state.awaiting_replay_after_self_info:
+                        if (
+                            not state.pending_message_frames
+                            and not state.serving_buffered_messages
+                            and state.pending_push_frames
+                        ):
                             self._schedule_replay_flush(state)
+                    else:
+                        if (
+                            command == CMD_SYNC_NEXT_MESSAGE
+                            and state.pending_push_frames
+                            and not state.pending_message_frames
+                        ):
+                            state.awaiting_no_more_messages_for_push_replay = True
                         forward_frames.append(frame)
 
                 if forward_frames:
@@ -409,6 +422,7 @@ class SerialBroadcastProxy:
                 state.writer = None
                 state.awaiting_replay_after_self_info = False
                 state.serving_buffered_messages = False
+                state.awaiting_no_more_messages_for_push_replay = False
                 state.last_disconnect_at = asyncio.get_running_loop().time()
                 self._cancel_replay_task(state)
             try:
@@ -482,6 +496,7 @@ class SerialBroadcastProxy:
             state.writer = None
             state.awaiting_replay_after_self_info = False
             state.serving_buffered_messages = False
+            state.awaiting_no_more_messages_for_push_replay = False
             state.last_disconnect_at = asyncio.get_running_loop().time()
 
         for writer in writers:
@@ -542,6 +557,19 @@ class SerialBroadcastProxy:
 
         if packet_type == RESP_CODE_SELF_INFO and state.awaiting_replay_after_self_info:
             state.awaiting_replay_after_self_info = False
+            if state.pending_message_frames:
+                self._p(
+                    f"[client] waiting for client sync to replay {len(state.pending_message_frames)} buffered messages to {state.client_id}"
+                )
+            elif state.pending_push_frames:
+                self._p(
+                    f"[client] waiting for client sync completion to replay {len(state.pending_push_frames)} buffered push activity frames to {state.client_id}"
+                )
+        elif (
+            packet_type == RESP_CODE_NO_MORE_MESSAGES
+            and state.awaiting_no_more_messages_for_push_replay
+        ):
+            state.awaiting_no_more_messages_for_push_replay = False
             self._schedule_replay_flush(state)
 
 
