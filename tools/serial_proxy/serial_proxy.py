@@ -90,6 +90,7 @@ class BufferedFrame:
 class ClientState:
     client_id: str
     peer_group: str
+    app_name: str = ""
     writer: Optional[asyncio.StreamWriter] = None
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     client_parser: CompanionStreamParser = field(
@@ -180,11 +181,14 @@ class SerialBroadcastProxy:
         self._next_client_slot += 1
         return client_id
 
-    def _find_reusable_client_state(self, peer_group: str) -> Optional[ClientState]:
+    def _find_matching_inactive_state(self, current: ClientState) -> Optional[ClientState]:
         reusable: List[ClientState] = [
             state
             for state in self.client_states.values()
-            if state.peer_group == peer_group and state.writer is None
+            if state is not current
+            and state.peer_group == current.peer_group
+            and state.writer is None
+            and state.app_name == current.app_name
         ]
         if not reusable:
             return None
@@ -239,16 +243,11 @@ class SerialBroadcastProxy:
         await self._close_backend()
 
     async def _register_client(self, peer_group: str, writer: asyncio.StreamWriter) -> ClientState:
-        state = self._find_reusable_client_state(peer_group)
-        if state is None:
-            state = ClientState(
-                client_id=self._allocate_client_id(peer_group),
-                peer_group=peer_group,
-            )
-            self.client_states[state.client_id] = state
-        else:
-            state.client_parser.reset()
-
+        state = ClientState(
+            client_id=self._allocate_client_id(peer_group),
+            peer_group=peer_group,
+        )
+        self.client_states[state.client_id] = state
         state.writer = writer
         state.awaiting_replay_after_self_info = False
         state.serving_buffered_messages = False
@@ -258,6 +257,27 @@ class SerialBroadcastProxy:
         state.sender_task = asyncio.create_task(self._client_sender(state, writer))
 
         return state
+
+    def _adopt_prior_state(self, state: ClientState) -> None:
+        if not state.app_name:
+            self._p(f"[client] {state.client_id} has no app_name, keeping fresh replay state")
+            return
+
+        previous = self._find_matching_inactive_state(state)
+        if previous is None:
+            self._p(
+                f"[client] {state.client_id} identified as {state.peer_group} / {state.app_name}, no prior state"
+            )
+            return
+
+        if previous.replay_capture_seq > state.replay_capture_seq:
+            state.replay_capture_seq = previous.replay_capture_seq
+
+        self._p(
+            f"[client] {state.client_id} identified as {state.peer_group} / {state.app_name}, "
+            f"adopting prior state from {previous.client_id} at seq={previous.replay_capture_seq}"
+        )
+        del self.client_states[previous.client_id]
 
     def _cancel_sender_task(self, state: ClientState) -> None:
         task = state.sender_task
@@ -320,6 +340,12 @@ class SerialBroadcastProxy:
 
         if captured_messages > 0:
             state.serving_buffered_messages = True
+            self._p(
+                f"[client] captured {captured_messages} buffered messages for {state.client_id} "
+                f"(up to seq={state.replay_capture_seq})"
+            )
+        else:
+            self._p(f"[client] no buffered messages to capture for {state.client_id}")
 
     async def _send_bytes_to_client(self, state: ClientState, payload: bytes) -> bool:
         async with state.send_lock:
@@ -393,6 +419,14 @@ class SerialBroadcastProxy:
 
                     command = frame[3]
                     if command == CMD_APP_START:
+                        if len(frame) > 11:
+                            app_name = frame[11:].decode("utf-8", errors="ignore").rstrip("\x00")
+                            state.app_name = app_name
+                        self._p(
+                            f"[client] APP_START from {state.client_id} app_name="
+                            f"{state.app_name or '<empty>'}"
+                        )
+                        self._adopt_prior_state(state)
                         self._capture_pending_history(state)
                         state.awaiting_replay_after_self_info = True
                         forward_frames.append(frame)
@@ -564,6 +598,8 @@ class SerialBroadcastProxy:
                 self._p(
                     f"[client] waiting for client sync to replay {len(state.pending_message_frames)} buffered messages to {state.client_id}"
                 )
+            else:
+                self._p(f"[client] no replay needed for {state.client_id} after SELF_INFO")
 
 
 def parse_args():
