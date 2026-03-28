@@ -1555,23 +1555,17 @@ void MyMesh::formatRadioStatsReply(char *reply) {
 }
 
 void MyMesh::formatPacketStatsReply(char *reply) {
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  uint32_t loss_pct = (_flood_retry_tracked == 0) ? 0 : (_flood_retry_failed * 100UL) / _flood_retry_tracked;
+  sprintf(reply,
+          "{\"sent\":%u,\"retries\":%lu,\"fail\":%lu,\"loss_pct\":%lu}",
+          radio_driver.getPacketsSent(),
+          _flood_retry_retransmits,
+          _flood_retry_failed,
+          loss_pct);
+#else
   StatsFormatHelper::formatPacketStats(reply, radio_driver, getNumSentFlood(), getNumSentDirect(), 
                                        getNumRecvFlood(), getNumRecvDirect());
-#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
-  uint32_t loss_permille = (_flood_retry_tracked == 0) ? 0 : (_flood_retry_failed * 1000UL) / _flood_retry_tracked;
-  static const size_t CLI_REPLY_CAPACITY = 160;
-  size_t used = strlen(reply);
-  if (used < CLI_REPLY_CAPACITY - 1) {
-    snprintf(&reply[used],
-             CLI_REPLY_CAPACITY - used,
-             "\nrelay.flood trk=%lu ok=%lu fail=%lu retry=%lu loss=%lu.%lu%%",
-             _flood_retry_tracked,
-             _flood_retry_confirmed,
-             _flood_retry_failed,
-             _flood_retry_retransmits,
-             loss_permille / 10,
-             loss_permille % 10);
-  }
 #endif
 }
 

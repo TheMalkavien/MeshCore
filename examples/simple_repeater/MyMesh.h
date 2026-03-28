@@ -142,7 +142,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   int  matching_peer_indexes[MAX_CLIENTS];
   ClientInfo* active_cli_client;
   uint8_t active_cli_path_hash_size;
-  FloodRetryEntry _flood_retry[4];
+  FloodRetryEntry _flood_retry[8];
   uint32_t _flood_retry_tracked;
   uint32_t _flood_retry_confirmed;
   uint32_t _flood_retry_failed;
