@@ -224,7 +224,7 @@ public:
   MyMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::MillisecondClock& ms, mesh::RNG& rng, mesh::RTCClock& rtc, mesh::MeshTables& tables);
 
   void begin(FILESYSTEM* fs);
-
+  void sendNodeDiscoverReq();
   const char* getFirmwareVer() override { return FIRMWARE_VERSION; }
   const char* getBuildDate() override { return FIRMWARE_BUILD_DATE; }
   const char* getRole() override { return FIRMWARE_ROLE; }
