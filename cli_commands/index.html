@@ -2996,7 +2996,8 @@
 <p><strong>Usage:</strong> 
 - <code>neighbor.remove &lt;pubkey_prefix&gt;</code></p>
 <p><strong>Parameters:</strong> 
-- <code>pubkey_prefix</code>: The public key of the node to remove from the neighbors list</p>
+- <code>pubkey_prefix</code>: The public key of the node to remove from the neighbors list. This can be a short prefix or the full key. All neighbors matching the provided prefix will be removed.</p>
+<p><strong>Note:</strong> You can remove all neighbors by sending a space character as the prefix. The space indicates an empty prefix, which matches all existing neighbors.</p>
 <hr />
 <h2 id="statistics">Statistics</h2>
 <h3 id="clear-stats">Clear Stats</h3>
