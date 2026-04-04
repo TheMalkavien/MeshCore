@@ -2,347 +2,640 @@
 <html lang="fr">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MeshCore OTA OTG Prototype</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>MeshCore OTA</title>
   <style>
     :root {
-      --bg-a: #0f1a28;
-      --bg-b: #1f3a56;
-      --panel: #0f1520d9;
-      --panel-border: #2a3950;
-      --text: #e8f2ff;
-      --muted: #a0b4cc;
-      --ok: #5fd48c;
-      --warn: #ffd16a;
-      --danger: #ff7878;
-      --accent: #70d6ff;
-      --accent-2: #8bffb0;
-      --font-main: "Space Grotesk", "Segoe UI Variable", "Trebuchet MS", sans-serif;
-      --font-mono: "IBM Plex Mono", "Consolas", "Menlo", monospace;
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --surface2:  #1c2330;
+      --border:    #30363d;
+      --border-hi: #484f58;
+      --text:      #e6edf3;
+      --muted:     #7d8590;
+      --accent:    #2f81f7;
+      --accent-lo: #1a3a6b;
+      --green:     #3fb950;
+      --green-lo:  #1a3d22;
+      --orange:    #d29922;
+      --red:       #f85149;
+      --red-lo:    #4a1515;
+      --mono:      "SF Mono", "Menlo", "Consolas", monospace;
+      --sans:      -apple-system, "Segoe UI", Roboto, sans-serif;
+      --r:         10px;
+      --r-sm:      6px;
     }
 
-    * { box-sizing: border-box; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html { -webkit-tap-highlight-color: transparent; }
 
     body {
-      margin: 0;
-      min-height: 100vh;
+      font-family: var(--sans);
+      background: var(--bg);
       color: var(--text);
-      font-family: var(--font-main);
-      background:
-        radial-gradient(1200px 600px at 100% -10%, #2b5f8a66, transparent),
-        radial-gradient(900px 500px at -10% 10%, #3aa37444, transparent),
-        linear-gradient(160deg, var(--bg-a), var(--bg-b));
-      display: grid;
-      grid-template-rows: auto 1fr auto;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      font-size: 15px;
+      line-height: 1.5;
     }
 
+    /* ── Header ── */
     header {
-      padding: 16px 18px;
-      border-bottom: 1px solid #ffffff26;
-      backdrop-filter: blur(4px);
-    }
-
-    h1 {
-      margin: 0;
-      font-size: 1.12rem;
-      letter-spacing: 0.02em;
-      font-weight: 700;
-    }
-
-    main {
-      width: min(980px, 100%);
-      margin: 0 auto;
-      padding: 14px;
-      display: grid;
-      grid-template-columns: 1fr;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: #161b22e8;
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 16px;
+      height: 56px;
+      display: flex;
+      align-items: center;
       gap: 12px;
-      animation: fadeIn 260ms ease-out;
     }
 
-    @keyframes fadeIn {
-      from { opacity: 0; transform: translateY(6px); }
-      to { opacity: 1; transform: translateY(0); }
+    .logo {
+      width: 32px; height: 32px;
+      background: linear-gradient(135deg, var(--accent), #58a6ff);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 17px; flex-shrink: 0;
     }
 
-    .card {
-      border: 1px solid var(--panel-border);
-      border-radius: 14px;
-      background: var(--panel);
-      box-shadow: 0 12px 24px #00000022;
-      padding: 12px;
-    }
+    .header-title { font-size: 1rem; font-weight: 600; letter-spacing: -0.01em; }
+    .header-sub   { font-size: 0.72rem; color: var(--muted); }
 
-    .row {
-      display: grid;
-      grid-template-columns: repeat(12, 1fr);
+    #connectionStatus {
+      margin-left: auto;
+      font-size: 0.75rem;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      background: var(--surface);
+      white-space: nowrap;
+      transition: color .2s, border-color .2s, background .2s;
+    }
+    #connectionStatus.ok     { color: var(--green); border-color: #238636; background: var(--green-lo); }
+    #connectionStatus.err    { color: var(--red);   border-color: #6e2020; background: var(--red-lo); }
+
+    /* ── Main ── */
+    main {
+      flex: 1;
+      width: 100%;
+      max-width: 680px;
+      margin: 0 auto;
+      padding: 16px 12px 80px;
+      display: flex;
+      flex-direction: column;
       gap: 10px;
-      margin-bottom: 10px;
     }
+
+    /* ── Node pills ── */
+    .node-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .pill {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      padding: 3px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--border-hi);
+      background: var(--surface2);
+      color: #58a6ff;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* ── Card ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      overflow: hidden;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 13px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .step-badge {
+      width: 24px; height: 24px;
+      border-radius: 50%;
+      background: var(--accent-lo);
+      border: 1px solid var(--accent);
+      color: #58a6ff;
+      font-size: 0.72rem;
+      font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+    }
+    .step-badge.done { background: var(--green-lo); border-color: var(--green); color: var(--green); }
+
+    .card-title {
+      font-size: 0.9rem;
+      font-weight: 600;
+      flex: 1;
+    }
+
+    .card-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+
+    /* ── Form fields ── */
+    .field { display: flex; flex-direction: column; gap: 5px; }
 
     label {
-      display: block;
-      font-size: 0.82rem;
+      font-size: 0.78rem;
+      font-weight: 500;
       color: var(--muted);
-      margin-bottom: 4px;
+      letter-spacing: 0.01em;
     }
 
-    input, select, button {
+    input, select, textarea {
       width: 100%;
-      border-radius: 10px;
-      border: 1px solid #39506d;
-      background: #121b28;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
       color: var(--text);
-      padding: 10px 11px;
+      font-family: var(--sans);
       font-size: 0.92rem;
-      font-family: var(--font-main);
+      padding: 10px 12px;
+      transition: border-color .15s, box-shadow .15s;
+      -webkit-appearance: none;
+      appearance: none;
     }
 
     input[type="file"] {
-      padding: 7px 9px;
-    }
-
-    input:focus, select:focus, button:focus {
-      outline: 2px solid #73c6ff88;
-      outline-offset: 1px;
-    }
-
-    button {
+      padding: 8px 10px;
       cursor: pointer;
-      background: linear-gradient(120deg, #18507f, #2f6c9f);
-      border-color: #4a7ea9;
-      font-weight: 600;
-      transition: transform 120ms ease, filter 120ms ease;
     }
 
-    button:hover:not(:disabled) {
-      filter: brightness(1.08);
-      transform: translateY(-1px);
+    input[type="checkbox"] {
+      width: 18px; height: 18px;
+      border-radius: 4px;
+      cursor: pointer;
+      flex-shrink: 0;
+      accent-color: var(--accent);
+      padding: 0;
     }
 
-    button:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
+    .check-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+    }
+    .check-row label { cursor: pointer; color: var(--text); font-size: 0.88rem; }
+
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px #2f81f722;
     }
 
-    .secondary {
-      background: linear-gradient(120deg, #2e3f53, #3b4b5f);
-      border-color: #55687f;
+    select { cursor: pointer; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%237d8590' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 12px center; padding-right: 32px; }
+
+    /* ── Grid helpers ── */
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    .grid-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; }
+
+    @media (max-width: 480px) {
+      .grid-3, .grid-4 { grid-template-columns: 1fr 1fr; }
     }
 
-    .danger {
-      background: linear-gradient(120deg, #6b2d3a, #8f3f50);
-      border-color: #a65d6d;
-    }
-
-    .status-line {
+    /* ── Buttons ── */
+    button {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      width: 100%;
+      min-height: 44px;
+      padding: 10px 16px;
+      border-radius: var(--r-sm);
+      border: 1px solid transparent;
+      font-family: var(--sans);
       font-size: 0.9rem;
-      color: var(--muted);
-      margin-top: 2px;
-      min-height: 1.2em;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity .15s, transform .1s, filter .15s;
+      -webkit-appearance: none;
+      appearance: none;
+      user-select: none;
+    }
+    button:active:not(:disabled) { transform: scale(0.97); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    .btn-primary {
+      background: var(--accent);
+      border-color: #388bfd;
+      color: #fff;
+    }
+    .btn-primary:hover:not(:disabled) { filter: brightness(1.1); }
+
+    .btn-secondary {
+      background: var(--surface2);
+      border-color: var(--border-hi);
+      color: var(--text);
+    }
+    .btn-secondary:hover:not(:disabled) { border-color: #6e7681; }
+
+    .btn-danger {
+      background: #3d1a1a;
+      border-color: #6e2020;
+      color: var(--red);
+    }
+    .btn-danger:hover:not(:disabled) { background: var(--red-lo); }
+
+    .btn-success {
+      background: var(--green-lo);
+      border-color: #238636;
+      color: var(--green);
     }
 
-    .status-line strong { color: var(--accent-2); }
+    .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .btn-full { grid-column: 1 / -1; }
 
-    .pill {
-      display: inline-block;
-      font-family: var(--font-mono);
-      font-size: 0.78rem;
-      border: 1px solid #456485;
-      color: var(--accent);
-      border-radius: 999px;
-      padding: 4px 9px;
-      margin-right: 8px;
+    /* ── Advanced toggle ── */
+    .advanced-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 0 0;
+      font-size: 0.8rem;
+      color: var(--muted);
+      cursor: pointer;
+      border: none;
+      background: none;
+      width: auto;
+      min-height: unset;
+      border-radius: 0;
+      justify-content: flex-start;
+      transition: color .15s;
+    }
+    .advanced-toggle:hover { color: var(--text); }
+    .advanced-toggle svg { transition: transform .2s; }
+    .advanced-toggle.open svg { transform: rotate(180deg); }
+
+    .advanced-body {
+      display: none;
+      flex-direction: column;
+      gap: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
       margin-top: 4px;
     }
+    .advanced-body.open { display: flex; }
 
+    /* ── Section label ── */
+    .section-label {
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    /* ── Progress ── */
     .progress-wrap {
+      position: relative;
       width: 100%;
-      background: #0f1927;
-      border: 1px solid #2d4461;
+      background: var(--bg);
+      border: 1px solid var(--border);
       border-radius: 999px;
-      height: 16px;
+      height: 10px;
       overflow: hidden;
-      margin-top: 8px;
     }
 
     .progress-bar {
       height: 100%;
       width: 0%;
-      background: linear-gradient(90deg, #56cbff, #74f0ad);
-      transition: width 100ms linear;
+      background: linear-gradient(90deg, var(--accent), var(--green));
+      transition: width 120ms linear;
+      border-radius: 999px;
     }
 
+    .progress-bar.indeterminate {
+      width: 35% !important;
+      animation: indeterminate 1.2s ease-in-out infinite;
+    }
+
+    @keyframes indeterminate {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(400%); }
+    }
+
+    /* ── Status ── */
+    .status-block {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    #otaStatus {
+      font-size: 0.88rem;
+      color: var(--muted);
+      min-height: 1.4em;
+    }
+    #otaStatus.ok  { color: var(--green); }
+    #otaStatus.err { color: var(--red); }
+    #otaStatus.run { color: #58a6ff; }
+
+    #metricsLine {
+      font-size: 0.78rem;
+      font-family: var(--mono);
+      color: var(--muted);
+      min-height: 1.2em;
+    }
+
+    /* ── Log ── */
     #log {
       width: 100%;
-      height: min(38vh, 360px);
+      height: 220px;
       resize: vertical;
-      border-radius: 10px;
-      border: 1px solid #334962;
-      padding: 10px;
-      font-family: var(--font-mono);
-      font-size: 0.78rem;
-      line-height: 1.35;
-      background: #0a1119;
-      color: #d8ebff;
+      border-radius: var(--r-sm);
+      border: 1px solid var(--border);
+      padding: 10px 12px;
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      line-height: 1.5;
+      background: var(--bg);
+      color: #adbac7;
     }
 
-    .muted {
-      color: var(--muted);
-      font-size: 0.83rem;
-    }
-
+    /* ── Footer ── */
     footer {
-      padding: 8px 14px 14px;
+      text-align: center;
+      font-size: 0.72rem;
+      color: var(--muted);
+      padding: 10px 16px 20px;
+    }
+
+    /* ── Divider ── */
+    .divider { height: 1px; background: var(--border); }
+
+    /* ── File info ── */
+    .file-info {
       font-size: 0.78rem;
       color: var(--muted);
-      text-align: center;
+      font-family: var(--mono);
+      display: none;
+      padding: 5px 8px;
+      background: var(--surface2);
+      border-radius: var(--r-sm);
+      border: 1px solid var(--border);
     }
-
-    .c4 { grid-column: span 4; }
-    .c3 { grid-column: span 3; }
-    .c2 { grid-column: span 2; }
-    .c6 { grid-column: span 6; }
-    .c8 { grid-column: span 8; }
-    .c12 { grid-column: span 12; }
-
-    @media (max-width: 760px) {
-      .c2, .c3, .c4, .c6, .c8 { grid-column: span 12; }
-      h1 { font-size: 1rem; }
-      main { padding: 10px; }
-    }
+    .file-info.visible { display: block; }
   </style>
 </head>
 <body>
+
   <header>
-    <h1>MeshCore OTA OTG - Prototype Web (USB / BLE)</h1>
-    <div class="status-line" id="connectionStatus">Non connecte</div>
+    <div class="logo">⚡</div>
+    <div>
+      <div class="header-title">MeshCore OTA</div>
+      <div class="header-sub">USB OTG / BLE</div>
+    </div>
+    <div id="connectionStatus">Déconnecté</div>
   </header>
+
   <main>
-    <section class="card">
-      <div class="row">
-        <div class="c4">
-          <label for="connectionMode">Mode connexion</label>
-          <select id="connectionMode">
-            <option value="usb" selected>USB</option>
-            <option value="ble">BLE</option>
-          </select>
-        </div>
-        <div class="c4">
-          <label for="baudrate">Baudrate USB serie</label>
-          <input id="baudrate" type="number" min="9600" step="100" value="115200">
-        </div>
-        <div class="c4">
-          <label>&nbsp;</label>
-          <button id="connectBtn">Connecter</button>
-        </div>
-        <div class="c4">
-          <label>&nbsp;</label>
-          <button id="disconnectBtn" class="secondary" disabled>Deconnecter</button>
-        </div>
-      </div>
-      <div>
-        <span class="pill" id="selfName">Noeud: -</span>
-        <span class="pill" id="selfKey">PubKey: -</span>
-        <span class="pill" id="selfRadio">Radio: -</span>
-      </div>
-    </section>
 
-    <section class="card">
-      <div class="row">
-        <div class="c4">
-          <label for="targetSelect">Cible OTA (repetiteurs connus)</label>
+    <!-- ── Step 1 : Connexion ── -->
+    <div class="card">
+      <div class="card-header">
+        <div class="step-badge" id="step1badge">1</div>
+        <div class="card-title">Connexion</div>
+      </div>
+      <div class="card-body">
+        <div class="grid-2">
+          <div class="field">
+            <label for="connectionMode">Mode</label>
+            <select id="connectionMode">
+              <option value="usb" selected>USB série</option>
+              <option value="ble">BLE</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="baudrate">Baudrate</label>
+            <input id="baudrate" type="number" min="9600" step="100" value="115200">
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="connectBtn" class="btn-primary">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 8h10M8 3l5 5-5 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Connecter
+          </button>
+          <button id="disconnectBtn" class="btn-secondary" disabled>
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M12 4L4 12M4 4l8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            Déconnecter
+          </button>
+        </div>
+        <div class="node-pills" id="nodePills" style="display:none">
+          <span class="pill" id="selfName">-</span>
+          <span class="pill" id="selfKey">-</span>
+          <span class="pill" id="selfRadio">-</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Step 2 : Cible & Firmware ── -->
+    <div class="card">
+      <div class="card-header">
+        <div class="step-badge" id="step2badge">2</div>
+        <div class="card-title">Cible &amp; Firmware</div>
+      </div>
+      <div class="card-body">
+        <div class="field">
+          <label for="targetSelect">Répéteur cible</label>
           <select id="targetSelect">
-            <option value="">Selectionner un repetiteur...</option>
+            <option value="">Sélectionner un répéteur…</option>
           </select>
         </div>
-        <div class="c2">
-          <label>&nbsp;</label>
-          <button id="refreshTargetsBtn" class="secondary" disabled>Rafraichir</button>
+        <div class="grid-2">
+          <button id="refreshTargetsBtn" class="btn-secondary" disabled>
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M13.5 2.5A6.5 6.5 0 1 1 2 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M13.5 2.5V6h-3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Rafraîchir
+          </button>
+          <div><!-- spacer --></div>
         </div>
-        <div class="c3">
-          <label for="firmwareFile">Firmware (.bin, .bin.gz ou .uf2)</label>
-          <input id="firmwareFile" type="file" accept=".bin,.gz,.bin.gz,.uf2,application/octet-stream">
-        </div>
-        <div class="c3">
-          <label for="targetPassword">Mot de passe (optionnel)</label>
-          <input id="targetPassword" type="password" placeholder="login repeater">
-        </div>
-      </div>
-      <div class="row">
-        <div class="c12">
-          <label for="targetKey">Cible OTA manuelle (pubkey hex, optionnel)</label>
-          <input id="targetKey" type="text" placeholder="ex: 0a0c54d31f75 ou cle complete">
-        </div>
-      </div>
-      <div class="row">
-        <div class="c3">
-          <label for="chunkSize">Chunk size (binaire max 132)</label>
-          <input id="chunkSize" type="number" min="16" max="132" step="1" value="96">
-        </div>
-        <div class="c3">
-          <label for="ackEvery">Ack every N chunks</label>
-          <input id="ackEvery" type="number" min="1" max="64" step="1" value="1">
-        </div>
-        <div class="c3">
-          <label for="noAckGap">Gap no-ack (ms)</label>
-          <input id="noAckGap" type="number" min="0" max="1000" step="5" value="50">
-        </div>
-        <div class="c3">
-          <label for="checkpointTimeout">Timeout checkpoint (ms)</label>
-          <input id="checkpointTimeout" type="number" min="1000" max="15000" step="100" value="1000">
-        </div>
-      </div>
-      <div class="row">
-        <div class="c3">
-          <label for="autoTune">Auto selon preset radio</label>
-          <input id="autoTune" type="checkbox" checked>
-        </div>
-        <div class="c3">
-          <label for="useTempRadio">Preset OTA temporaire</label>
-          <input id="useTempRadio" type="checkbox" checked>
-        </div>
-        <div class="c3">
-          <label for="tempRadioFreq">Freq OTA (MHz)</label>
-          <input id="tempRadioFreq" type="number" min="300" max="2500" step="0.001" value="869.4">
-        </div>
-        <div class="c3">
-          <label for="tempRadioBw">BW OTA (kHz)</label>
-          <input id="tempRadioBw" type="number" min="7.8" max="500" step="0.1" value="250">
-        </div>
-      </div>
-      <div class="row">
-        <div class="c4">
-          <label for="tempRadioSf">SF OTA</label>
-          <input id="tempRadioSf" type="number" min="5" max="12" step="1" value="5">
-        </div>
-        <div class="c4">
-          <label for="tempRadioCr">CR OTA</label>
-          <input id="tempRadioCr" type="number" min="5" max="8" step="1" value="5">
-        </div>
-        <div class="c4">
-          <label for="tempRadioMins">Duree temp (min)</label>
-          <input id="tempRadioMins" type="number" min="1" max="240" step="1" value="20">
-        </div>
-      </div>
-      <div class="row">
-        <div class="c6">
-          <button id="startOtaBtn" disabled>Lancer OTA</button>
-        </div>
-        <div class="c6">
-          <button id="cancelOtaBtn" class="danger" disabled>Annuler OTA</button>
-        </div>
-      </div>
-      <div class="status-line" id="otaStatus">Pret</div>
-      <div class="progress-wrap"><div class="progress-bar" id="progressBar"></div></div>
-      <div class="muted" id="metricsLine">Aucune mise a jour lancee.</div>
-    </section>
 
-    <section class="card">
-      <label for="log">Journal</label>
-      <textarea id="log" readonly></textarea>
-    </section>
+        <div class="field">
+          <label for="targetKey">Pubkey manuelle (optionnel)</label>
+          <input id="targetKey" type="text" placeholder="0a0c54d3… (hex partiel ou complet)" autocomplete="off" autocorrect="off" spellcheck="false">
+        </div>
+
+        <div class="field">
+          <label for="targetPassword">Mot de passe</label>
+          <input id="targetPassword" type="password" placeholder="Laisser vide si non requis">
+        </div>
+
+        <div class="field">
+          <label for="firmwareFile">Fichier firmware (.bin, .bin.gz, .uf2)</label>
+          <input id="firmwareFile" type="file" accept=".bin,.gz,.bin.gz,.uf2,application/octet-stream">
+          <div class="file-info" id="fileInfo">—</div>
+        </div>
+
+        <!-- Advanced -->
+        <button type="button" class="advanced-toggle" id="advancedToggle" aria-expanded="false">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 4l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Paramètres avancés
+        </button>
+
+        <div class="advanced-body" id="advancedBody">
+
+          <div class="section-label">Transfert binaire</div>
+          <div class="grid-3">
+            <div class="field">
+              <label for="chunkSize">Chunk (max 132)</label>
+              <input id="chunkSize" type="number" min="16" max="132" step="1" value="96">
+            </div>
+            <div class="field">
+              <label for="ackEvery">Ack tous les N</label>
+              <input id="ackEvery" type="number" min="1" max="64" step="1" value="1">
+            </div>
+            <div class="field">
+              <label for="noAckGap">Gap no-ack (ms)</label>
+              <input id="noAckGap" type="number" min="0" max="1000" step="5" value="50">
+            </div>
+          </div>
+          <div class="field">
+            <label for="checkpointTimeout">Timeout checkpoint (ms)</label>
+            <input id="checkpointTimeout" type="number" min="1000" max="15000" step="100" value="1000">
+          </div>
+
+          <div class="section-label">Radio OTA temporaire</div>
+          <div class="check-row">
+            <input id="autoTune" type="checkbox" checked>
+            <label for="autoTune">Auto-ajuster selon preset radio courant</label>
+          </div>
+          <div class="check-row">
+            <input id="useTempRadio" type="checkbox" checked>
+            <label for="useTempRadio">Activer preset radio OTA temporaire</label>
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label for="tempRadioFreq">Fréquence (MHz)</label>
+              <input id="tempRadioFreq" type="number" min="300" max="2500" step="0.001" value="869.4">
+            </div>
+            <div class="field">
+              <label for="tempRadioBw">Bande passante (kHz)</label>
+              <input id="tempRadioBw" type="number" min="7.8" max="500" step="0.1" value="250">
+            </div>
+          </div>
+          <div class="grid-3">
+            <div class="field">
+              <label for="tempRadioSf">SF</label>
+              <input id="tempRadioSf" type="number" min="5" max="12" step="1" value="5">
+            </div>
+            <div class="field">
+              <label for="tempRadioCr">CR</label>
+              <input id="tempRadioCr" type="number" min="5" max="8" step="1" value="5">
+            </div>
+            <div class="field">
+              <label for="tempRadioMins">Durée (min)</label>
+              <input id="tempRadioMins" type="number" min="1" max="240" step="1" value="20">
+            </div>
+          </div>
+        </div><!-- /advanced-body -->
+      </div>
+    </div>
+
+    <!-- ── Step 3 : Flash ── -->
+    <div class="card">
+      <div class="card-header">
+        <div class="step-badge" id="step3badge">3</div>
+        <div class="card-title">Flash OTA</div>
+      </div>
+      <div class="card-body">
+        <div class="btn-row">
+          <button id="startOtaBtn" class="btn-success btn-full" disabled>
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 2v8M4 7l4 5 4-5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M2 13h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            Lancer l'OTA
+          </button>
+          <button id="cancelOtaBtn" class="btn-danger btn-full" disabled>
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/><path d="M6 6l4 4M10 6l-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+            Annuler
+          </button>
+        </div>
+
+        <div class="status-block">
+          <div id="otaStatus">Prêt</div>
+          <div class="progress-wrap">
+            <div class="progress-bar" id="progressBar"></div>
+          </div>
+          <div id="metricsLine">Aucune mise à jour lancée.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Log ── -->
+    <div class="card">
+      <div class="card-header" style="border-bottom:none; padding-bottom:0;">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="10" rx="1.5" stroke="currentColor" stroke-width="1.4"/><path d="M5 6h6M5 9h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        <div class="card-title">Journal</div>
+      </div>
+      <div class="card-body" style="padding-top:8px;">
+        <textarea id="log" readonly></textarea>
+      </div>
+    </div>
+
   </main>
-  <footer>Prototype OTA via companion protocol over USB OTG or BLE.</footer>
+
+  <footer>Prototype OTA via companion protocol — USB OTG ou BLE</footer>
+
+  <script>
+    // ── Advanced toggle ──
+    const toggle = document.getElementById('advancedToggle');
+    const body   = document.getElementById('advancedBody');
+    toggle.addEventListener('click', () => {
+      const open = body.classList.toggle('open');
+      toggle.classList.toggle('open', open);
+      toggle.setAttribute('aria-expanded', open);
+    });
+
+    // ── File info display ──
+    document.getElementById('firmwareFile').addEventListener('change', function() {
+      const info = document.getElementById('fileInfo');
+      if (this.files && this.files[0]) {
+        const f = this.files[0];
+        const kb = (f.size / 1024).toFixed(1);
+        info.textContent = `${f.name}  —  ${kb} KB`;
+        info.classList.add('visible');
+      } else {
+        info.classList.remove('visible');
+      }
+    });
+
+    // ── Connection status helper (call from app.js if needed) ──
+    window.setConnectionStatus = function(text, state) {
+      const el = document.getElementById('connectionStatus');
+      el.textContent = text;
+      el.className = state || '';
+      const pills = document.getElementById('nodePills');
+      if (state === 'ok') {
+        pills.style.display = 'flex';
+        document.getElementById('step1badge').classList.add('done');
+      } else {
+        pills.style.display = 'none';
+        document.getElementById('step1badge').classList.remove('done');
+      }
+    };
+  </script>
+
   <script defer src="./app.js?v=20260307-ble1"></script>
 </body>
 </html>
