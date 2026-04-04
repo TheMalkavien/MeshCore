@@ -18,3 +18,4 @@ compile_commands.json
 venv/
 tools/tcp_proxy/__pycache__/tcp_proxy.cpython-313.pyc
 tools/serial_proxy/__pycache__/serial_proxy.cpython-313.pyc
+platformio.local.ini
