@@ -273,6 +273,15 @@ class SerialBroadcastProxy:
         if previous.replay_capture_seq > state.replay_capture_seq:
             state.replay_capture_seq = previous.replay_capture_seq
 
+        if previous.pending_message_frames:
+            state.pending_message_frames = previous.pending_message_frames
+            previous.pending_message_frames = deque()
+            state.serving_buffered_messages = True
+            self._p(
+                f"[client] {state.client_id} transferred {len(state.pending_message_frames)} "
+                f"unserved messages from {previous.client_id}"
+            )
+
         self._p(
             f"[client] {state.client_id} identified as {state.peer_group} / {state.app_name}, "
             f"adopting prior state from {previous.client_id} at seq={previous.replay_capture_seq}"
@@ -379,9 +388,15 @@ class SerialBroadcastProxy:
             if state.serving_buffered_messages:
                 state.serving_buffered_messages = False
                 self._p(f"[client] buffered message replay complete for {state.client_id}")
-                return await self._send_bytes_to_client(
+                result = await self._send_bytes_to_client(
                     state, build_backend_frame(RESP_CODE_NO_MORE_MESSAGES)
                 )
+                # Syncs from the client were absorbed during replay; kick the backend
+                # queue with one synthetic sync so any remaining queued messages are
+                # delivered (the chain continues naturally from there).
+                if self.backend_connected.is_set():
+                    await self._send_to_backend(bytes((ord("<"), 1, 0, CMD_SYNC_NEXT_MESSAGE)))
+                return result
             return False
 
         buffered = state.pending_message_frames.popleft()
@@ -584,6 +599,13 @@ class SerialBroadcastProxy:
         packet_type: Optional[int],
         history_seq: Optional[int],
     ) -> None:
+        # CMD_SYNC_NEXT_MESSAGE and RESP_CODE_NO_MORE_MESSAGES share value 0x0A.
+        # When the backend signals end-of-queue to a client that is mid-replay,
+        # suppress it: the proxy will send its own RESP_CODE_NO_MORE_MESSAGES at
+        # the end of the replay buffer, preventing a premature stop of the flow.
+        if packet_type == RESP_CODE_NO_MORE_MESSAGES and state.serving_buffered_messages:
+            return
+
         if not await self._send_bytes_to_client(state, frame):
             return
 
