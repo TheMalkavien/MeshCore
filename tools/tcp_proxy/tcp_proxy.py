@@ -151,6 +151,7 @@ class BroadcastProxy:
         self._server: Optional[asyncio.base_events.Server] = None
         self._stop = asyncio.Event()
         self._backend_task: Optional[asyncio.Task] = None
+        self._sync_pending = False
 
     def _p(self, msg: str) -> None:
         if self.log:
@@ -379,7 +380,8 @@ class BroadcastProxy:
                 # Syncs from the client were absorbed during replay; kick the backend
                 # queue with one synthetic sync so any remaining queued messages are
                 # delivered (the chain continues naturally from there).
-                if self.backend_connected.is_set():
+                if self.backend_connected.is_set() and not self._sync_pending:
+                    self._sync_pending = True
                     await self._send_to_backend(bytes((ord("<"), 1, 0, CMD_SYNC_NEXT_MESSAGE)))
                 return result
             return False
@@ -434,6 +436,12 @@ class BroadcastProxy:
                         state.pending_message_frames or state.serving_buffered_messages
                     ):
                         await self._serve_pending_message(state)
+                    elif command == CMD_SYNC_NEXT_MESSAGE:
+                        if not self._sync_pending:
+                            self._sync_pending = True
+                            forward_frames.append(frame)
+                        # else: a sync is already in flight — the response will be
+                        # broadcast to all clients, so drop this duplicate.
                     else:
                         forward_frames.append(frame)
 
@@ -504,6 +512,7 @@ class BroadcastProxy:
     async def _close_backend(self) -> None:
         self.backend_connected.clear()
         self.backend_parser.reset()
+        self._sync_pending = False
         if self.backend_writer:
             try:
                 self.backend_writer.close()
@@ -562,6 +571,10 @@ class BroadcastProxy:
         history_seq: Optional[int] = None
         if is_message_frame(frame):
             history_seq = self._append_history(frame)
+
+        # A message frame or no-more-messages response concludes the in-flight sync.
+        if packet_type in MESSAGE_PACKET_TYPES or packet_type == RESP_CODE_NO_MORE_MESSAGES:
+            self._sync_pending = False
 
         for state in list(self.client_states.values()):
             if state.writer is None:
