@@ -64,7 +64,7 @@ extern "C" bool meshcore_board_usb_is_connected(void) {
   #define FLOOD_RETRY_MAX_RETRANSMITS 3
 #endif
 #ifndef FLOOD_RETRY_CONFIRM_WINDOW_MS
-  #define FLOOD_RETRY_CONFIRM_WINDOW_MS 1800
+  #define FLOOD_RETRY_CONFIRM_WINDOW_MS 2500
 #endif
 #ifndef FLOOD_RETRY_GAP_MIN_MS
   #define FLOOD_RETRY_GAP_MIN_MS 350
@@ -73,7 +73,7 @@ extern "C" bool meshcore_board_usb_is_connected(void) {
   #define FLOOD_RETRY_GAP_MAX_MS 1200
 #endif
 #ifndef FLOOD_RETRY_AIRTIME_FACTOR
-  #define FLOOD_RETRY_AIRTIME_FACTOR 6
+  #define FLOOD_RETRY_AIRTIME_FACTOR 8
 #endif
 
 static bool readPacketWireExact(mesh::Packet* dst, const uint8_t raw[], uint8_t raw_len) {
