@@ -182,6 +182,25 @@ void MyMesh::clearFloodRetryState() {
   _flood_retry_retransmits = 0;
 }
 
+void MyMesh::onFloodQueued(const mesh::Packet* packet, uint8_t priority, uint32_t delay_ms) {
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  // Track floods WE ORIGINATE (not just forwards) so that if no repeater is heard
+  // relaying them within the confirm window, we retransmit up to FLOOD_RETRY_MAX_RETRANSMITS times.
+  // Adverts and PATH packets are excluded: adverts are periodic, PATH packets are low-priority helpers.
+  uint8_t type = packet->getPayloadType();
+  if (type == PAYLOAD_TYPE_ADVERT || type == PAYLOAD_TYPE_PATH) {
+    return;
+  }
+  // Synthesise a DispatcherAction that trackFloodForward() expects:
+  //   bits[31:24] = priority + 1   (slot.priority = (action>>24)-1)
+  //   bits[23:0]  = initial delay  (base_delay for next_retry_at calculation)
+  mesh::DispatcherAction action = ACTION_RETRANSMIT_DELAYED(priority, delay_ms);
+  trackFloodForward(packet, action);
+#else
+  (void)packet; (void)priority; (void)delay_ms;
+#endif
+}
+
 void MyMesh::trackFloodForward(const mesh::Packet* pkt, mesh::DispatcherAction action) {
 #if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
   uint8_t hash[MAX_HASH_SIZE];

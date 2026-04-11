@@ -71,6 +71,16 @@ protected:
   virtual uint8_t getExtraAckTransmitCount() const;
 
   /**
+   * \brief  Called just before a flood packet is queued for transmission (either as originator
+   *         or after a transport-coded flood). Allows subclasses to track originated floods
+   *         for conditional retry purposes.
+   * \param  packet     the packet about to be sent (valid until after this call returns)
+   * \param  priority   the TX priority assigned to this flood
+   * \param  delay_ms   the initial TX delay in milliseconds
+   */
+  virtual void onFloodQueued(const Packet* packet, uint8_t priority, uint32_t delay_ms) {}
+
+  /**
    * \brief  Perform search of local DB of peers/contacts.
    * \returns  Number of peers with matching hash
    */

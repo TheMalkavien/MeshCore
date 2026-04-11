@@ -158,6 +158,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void markFloodHeard(const mesh::Packet* pkt);
   void processFloodRetries();
   void clearFloodRetryState();
+  void onFloodQueued(const mesh::Packet* packet, uint8_t priority, uint32_t delay_ms) override;
   bool resolvePingTarget(const char* destination, mesh::Identity& target, char* error_reply);
   bool sendTracePing(const mesh::Identity& target, bool reply_remote, const char* cli_prefix, char* error_reply);
   void formatPendingPingReply(char* reply, bool timeout) const;
