@@ -106,7 +106,7 @@ static bool readPacketWireExact(mesh::Packet* dst, const uint8_t raw[], uint8_t 
 #endif
 
 #define LAZY_CONTACTS_WRITE_DELAY    5000
-#define PING_TIMEOUT_MILLIS          5000
+#define PING_TIMEOUT_MILLIS          8000
 
 static const char* skipCommandSpaces(const char* p) {
   while (*p == ' ') {
@@ -1555,17 +1555,24 @@ void MyMesh::formatRadioStatsReply(char *reply) {
 }
 
 void MyMesh::formatPacketStatsReply(char *reply) {
-#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
-  uint32_t loss_pct = (_flood_retry_tracked == 0) ? 0 : (_flood_retry_failed * 100UL) / _flood_retry_tracked;
-  sprintf(reply,
-          "{\"sent\":%u,\"retries\":%lu,\"fail\":%lu,\"loss_pct\":%lu}",
-          radio_driver.getPacketsSent(),
-          _flood_retry_retransmits,
-          _flood_retry_failed,
-          loss_pct);
-#else
-  StatsFormatHelper::formatPacketStats(reply, radio_driver, getNumSentFlood(), getNumSentDirect(), 
+  StatsFormatHelper::formatPacketStats(reply, radio_driver, getNumSentFlood(), getNumSentDirect(),
                                        getNumRecvFlood(), getNumRecvDirect());
+}
+
+void MyMesh::formatFloodStatsReply(char *reply) {
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  uint32_t resolved = _flood_retry_confirmed + _flood_retry_failed;
+  uint32_t loss_permille = (resolved == 0) ? 0 : (_flood_retry_failed * 1000UL) / resolved;
+  sprintf(reply,
+          "{\"trk\":%lu,\"ok\":%lu,\"fail\":%lu,\"retry\":%lu,\"loss\":\"%lu.%lu%%\"}",
+          _flood_retry_tracked,
+          _flood_retry_confirmed,
+          _flood_retry_failed,
+          _flood_retry_retransmits,
+          loss_permille / 10,
+          loss_permille % 10);
+#else
+  strcpy(reply, "flood retry disabled");
 #endif
 }
 
