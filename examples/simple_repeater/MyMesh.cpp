@@ -1371,6 +1371,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.flood_advert_interval = 12; // 12 hours
   _prefs.flood_max = 64;
   _prefs.interference_threshold = 0; // disabled
+  _prefs.multi_acks = 1;             // default: send one extra ACK per hop for better ACK delivery
 
   // bridge defaults
   _prefs.bridge_enabled = 1;    // enabled
