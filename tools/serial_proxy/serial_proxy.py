@@ -103,6 +103,7 @@ class ClientState:
     outbound_queue: Optional[asyncio.Queue] = None
     sender_task: Optional[asyncio.Task] = None
     last_disconnect_at: float = 0.0
+    sync_dropped: bool = False
 
 
 def get_packet_type(frame: bytes) -> Optional[int]:
@@ -439,6 +440,12 @@ class SerialBroadcastProxy:
                         if len(frame) > 11:
                             app_name = frame[11:].decode("utf-8", errors="ignore").rstrip("\x00")
                             state.app_name = app_name
+                        # Use app_name as the stable peer identity so that two
+                        # different apps on the same IP are never mixed up, and
+                        # a reconnecting app recovers its own state regardless of
+                        # IP changes (e.g. mobile switching networks).
+                        if state.app_name:
+                            state.peer_group = state.app_name
                         self._p(
                             f"[client] APP_START from {state.client_id} app_name="
                             f"{state.app_name or '<empty>'}"
@@ -455,8 +462,12 @@ class SerialBroadcastProxy:
                         if not self._sync_pending:
                             self._sync_pending = True
                             forward_frames.append(frame)
-                        # else: a sync is already in flight — the response will be
-                        # broadcast to all clients, so drop this duplicate.
+                        else:
+                            # A sync is already in flight — its response will be
+                            # broadcast to all clients. Remember that this client
+                            # needs a follow-up sync so it is not left behind if
+                            # the in-flight sync is consumed by another client.
+                            state.sync_dropped = True
                     else:
                         forward_frames.append(frame)
 
@@ -604,6 +615,17 @@ class SerialBroadcastProxy:
             if state.writer is None:
                 continue
             await self._send_frame_to_client(state, frame, packet_type, history_seq)
+
+        # If any client had its sync dropped while the previous one was in flight,
+        # emit one follow-up sync now so those clients are not left waiting.
+        if not self._sync_pending:
+            for state in self.client_states.values():
+                if state.sync_dropped and state.writer is not None:
+                    state.sync_dropped = False
+                    self._sync_pending = True
+                    self._p(f"[proxy] re-emitting dropped sync on behalf of {state.client_id}")
+                    await self._send_to_backend(bytes((ord("<"), 1, 0, CMD_SYNC_NEXT_MESSAGE)))
+                    break
 
     async def _send_frame_to_client(
         self,
