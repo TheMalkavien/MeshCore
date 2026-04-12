@@ -76,6 +76,9 @@ extern "C" bool meshcore_board_usb_is_connected(void) {
   #define FLOOD_RETRY_AIRTIME_FACTOR 8
 #endif
 
+#define OTHER_PREFS_VERSION  1
+#define OTHER_PREFS_FILE     "/other_prefs"
+
 static bool readPacketWireExact(mesh::Packet* dst, const uint8_t raw[], uint8_t raw_len) {
   return dst->readFrom(raw, raw_len);
 }
@@ -174,6 +177,52 @@ mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
   return action;
 }
 
+void MyMesh::loadOtherPrefs() {
+  // Always start from compile-time defaults so missing fields fall back gracefully.
+  _other_prefs.flood_max_retries = FLOOD_RETRY_MAX_RETRANSMITS;
+  _other_prefs.flood_timeout_ms  = FLOOD_RETRY_CONFIRM_WINDOW_MS;
+
+  if (!_fs || !_fs->exists(OTHER_PREFS_FILE)) return;
+
+#if defined(RP2040_PLATFORM)
+  File f = _fs->open(OTHER_PREFS_FILE, "r");
+#else
+  File f = _fs->open(OTHER_PREFS_FILE);
+#endif
+  if (!f) return;
+
+  uint8_t ver = 0;
+  if (f.read(&ver, 1) != 1 || ver != OTHER_PREFS_VERSION) { f.close(); return; }
+
+  f.read(&_other_prefs.flood_max_retries, sizeof(_other_prefs.flood_max_retries));
+  f.read((uint8_t*)&_other_prefs.flood_timeout_ms, sizeof(_other_prefs.flood_timeout_ms));
+  f.close();
+
+  // Sanitize to prevent out-of-range values from a corrupted file.
+  _other_prefs.flood_max_retries = constrain((int)_other_prefs.flood_max_retries, 1, 10);
+  _other_prefs.flood_timeout_ms  = (uint16_t)constrain((int)_other_prefs.flood_timeout_ms, 500, 10000);
+}
+
+void MyMesh::saveOtherPrefs() {
+  if (!_fs) return;
+
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  _fs->remove(OTHER_PREFS_FILE);
+  File f = _fs->open(OTHER_PREFS_FILE, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  File f = _fs->open(OTHER_PREFS_FILE, "w");
+#else
+  File f = _fs->open(OTHER_PREFS_FILE, "w", true);
+#endif
+  if (!f) return;
+
+  uint8_t ver = OTHER_PREFS_VERSION;
+  f.write(&ver, 1);
+  f.write(&_other_prefs.flood_max_retries, sizeof(_other_prefs.flood_max_retries));
+  f.write((uint8_t*)&_other_prefs.flood_timeout_ms, sizeof(_other_prefs.flood_timeout_ms));
+  f.close();
+}
+
 void MyMesh::clearFloodRetryState() {
   memset(_flood_retry, 0, sizeof(_flood_retry));
   _flood_retry_tracked = 0;
@@ -242,8 +291,8 @@ void MyMesh::trackFloodForward(const mesh::Packet* pkt, mesh::DispatcherAction a
   uint32_t base_delay = action & 0xFFFFFF;
   uint32_t est_airtime = _radio->getEstAirtimeFor(pkt->getRawLength());
   uint32_t wait_ms = est_airtime * (uint32_t)FLOOD_RETRY_AIRTIME_FACTOR;
-  if (wait_ms < (uint32_t)FLOOD_RETRY_CONFIRM_WINDOW_MS) {
-    wait_ms = (uint32_t)FLOOD_RETRY_CONFIRM_WINDOW_MS;
+  if (wait_ms < (uint32_t)_other_prefs.flood_timeout_ms) {
+    wait_ms = (uint32_t)_other_prefs.flood_timeout_ms;
   }
   slot.wait_ms = wait_ms;
   slot.next_retry_at = futureMillis(base_delay + wait_ms);
@@ -292,7 +341,7 @@ void MyMesh::processFloodRetries() {
       continue;
     }
 
-    if (slot.retries_sent >= FLOOD_RETRY_MAX_RETRANSMITS) {
+    if (slot.retries_sent >= _other_prefs.flood_max_retries) {
       slot.active = 0;
       _flood_retry_failed++;
       continue;
@@ -1406,6 +1455,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   _fs = fs;
   // load persisted prefs
   _cli.loadPrefs(_fs);
+  loadOtherPrefs();
   acl.load(_fs, self_id);
   // TODO: key_store.begin();
   region_map.load(_fs);
@@ -1835,7 +1885,29 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
         waitForPingResult(reply);
       }
     }
-  } else{
+  } else if (memcmp(command, "set flood.maxretry ", 19) == 0) {
+    int val = atoi(command + 19);
+    if (val < 1 || val > 10) {
+      strcpy(reply, "Err - valid range: 1-10");
+    } else {
+      _other_prefs.flood_max_retries = (uint8_t)val;
+      saveOtherPrefs();
+      sprintf(reply, "OK flood.maxretry=%d", val);
+    }
+  } else if (memcmp(command, "set flood.timeout ", 18) == 0) {
+    int val = atoi(command + 18);
+    if (val < 500 || val > 10000) {
+      strcpy(reply, "Err - valid range: 500-10000 ms");
+    } else {
+      _other_prefs.flood_timeout_ms = (uint16_t)val;
+      saveOtherPrefs();
+      sprintf(reply, "OK flood.timeout=%d ms", val);
+    }
+  } else if (strcmp(command, "get flood") == 0) {
+    sprintf(reply, "flood.maxretry=%d flood.timeout=%d ms",
+            (int)_other_prefs.flood_max_retries,
+            (int)_other_prefs.flood_timeout_ms);
+  } else {
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
 }

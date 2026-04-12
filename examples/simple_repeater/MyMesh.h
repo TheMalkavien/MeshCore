@@ -108,6 +108,13 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
     uint32_t wait_ms;
   };
 
+  // Extensible custom prefs stored in /other_prefs, independent of NodePrefs.
+  // Add new fields at the end only; bump OTHER_PREFS_VERSION on breaking changes.
+  struct OtherPrefs {
+    uint8_t  flood_max_retries; // max retransmit attempts per flood packet
+    uint16_t flood_timeout_ms;  // minimum confirm window before first retry (ms)
+  };
+
   FILESYSTEM* _fs;
   uint32_t last_millis;
   uint64_t uptime_millis;
@@ -147,6 +154,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint32_t _flood_retry_confirmed;
   uint32_t _flood_retry_failed;
   uint32_t _flood_retry_retransmits;
+  OtherPrefs _other_prefs;
 #if defined(WITH_RS232_BRIDGE)
   RS232Bridge bridge;
 #elif defined(WITH_ESPNOW_BRIDGE)
@@ -158,6 +166,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void markFloodHeard(const mesh::Packet* pkt);
   void processFloodRetries();
   void clearFloodRetryState();
+  void loadOtherPrefs();
+  void saveOtherPrefs();
   void onFloodQueued(const mesh::Packet* packet, uint8_t priority, uint32_t delay_ms) override;
   bool resolvePingTarget(const char* destination, mesh::Identity& target, char* error_reply);
   bool sendTracePing(const mesh::Identity& target, bool reply_remote, const char* cli_prefix, char* error_reply);
