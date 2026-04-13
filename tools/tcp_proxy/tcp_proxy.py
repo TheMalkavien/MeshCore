@@ -2,9 +2,9 @@
 """
 TCP broadcast proxy for MeshCore companion links:
 - Multi clients -> single backend connection
-- Backend -> broadcast to all connected clients
-- Backend message frames are buffered per logical client
-- Reconnecting clients can replay only missed messages
+- Proxy polls backend at a fixed interval; results cached locally
+- Client CMD_SYNC_NEXT_MESSAGE always served from local cache (never forwarded)
+- Reconnecting clients replay only missed messages from the proxy history
 """
 
 import argparse
@@ -20,28 +20,116 @@ CMD_SYNC_NEXT_MESSAGE = 0x0A
 RESP_CODE_SELF_INFO = 0x05
 RESP_CODE_NO_MORE_MESSAGES = 0x0A
 
+# Packet types that are singleton in the cache: the latest frame replaces the
+# previous one (e.g. SELF_INFO / DEVICE_INFO which describe fixed node state).
+CACHE_SINGLETON_TYPES = {
+    0x05,  # RESP_CODE_SELF_INFO
+    0x0D,  # RESP_CODE_DEVICE_INFO
+}
+
+# Packet types deduplicated by pubkey (frame[4:36], 32 bytes).
+# The latest frame for a given pubkey replaces the previous one.
+# 0x03 = RESP_CODE_CONTACT, 0x8A = PUSH_CODE_NEW_ADVERT
+CACHE_DEDUP_BY_PUBKEY_TYPES = {0x03, 0x8A}
+PUBKEY_OFFSET = 4   # bytes: '>' + LSB + MSB + type
+PUBKEY_SIZE   = 32
+
+# Packet types deduplicated by a single key byte at frame[4].
+# 0x12 = RESP_CODE_CHANNEL_INFO  (key = channel_idx)
+CACHE_DEDUP_BY_IDX_TYPES = {0x12}
+IDX_OFFSET = 4
+
+# Packet types that must NOT be cached at all.
+CACHE_BLACKLIST_TYPES = {
+    0x00,  # OK              — transient command acknowledgment
+    0x01,  # ERR             — transient error
+    0x06,  # SENT            — transient send acknowledgment
+    0x09,  # CURR_TIME       — time value, always stale when replayed
+    0x0A,  # NO_MORE_MESSAGES — internal poll protocol, never forwarded
+    0x0C,  # BATT_AND_STORAGE — changes constantly, stale data not useful
+    0x0E,  # PRIVATE_KEY     — security-sensitive, must not be replayed
+    0x0F,  # DISABLED        — transient feature-flag response
+    0x13,  # SIGN_START      — transient signing session
+    0x14,  # SIGNATURE       — transient signing result
+    # Unsolicited push events (0x80–0x90): all transient except PUSH_NEW_ADVERT
+    # (0x8A) which carries a full contact structure and is worth caching.
+    0x80,  # PUSH_ADVERT                  — radio event, not persistent state
+    0x81,  # PUSH_PATH_UPDATED            — routing event
+    0x82,  # PUSH_SEND_CONFIRMED          — ACK event
+    0x83,  # PUSH_MSG_WAITING             — tickle, proxy handles polling
+    0x84,  # PUSH_RAW_DATA                — transient datagram
+    0x85,  # PUSH_LOGIN_SUCCESS           — transient auth event
+    0x86,  # PUSH_LOGIN_FAIL              — transient auth event
+    0x87,  # PUSH_STATUS_RESPONSE         — transient status reply
+    0x88,  # PUSH_LOG_RX_DATA             — debug radio log, very frequent
+    0x89,  # PUSH_TRACE_DATA              — transient trace result
+    0x8B,  # PUSH_TELEMETRY_RESPONSE      — transient sensor data
+    0x8C,  # PUSH_BINARY_RESPONSE         — transient binary reply
+    0x8D,  # PUSH_PATH_DISCOVERY_RESPONSE — transient
+    0x8E,  # PUSH_CONTROL_DATA            — transient
+    0x8F,  # PUSH_CONTACT_DELETED         — event (deletion handled by app state)
+    0x90,  # PUSH_CONTACTS_FULL           — transient overflow notification
+}
+
 MAX_COMPANION_FRAME_SIZE = 2048
 DEFAULT_HISTORY_BYTES = 512 * 1024
 DEFAULT_HISTORY_FRAMES = 4096
 DEFAULT_CLIENT_WRITE_TIMEOUT = 2.0
 DEFAULT_CLIENT_QUEUE_FRAMES = 512
+DEFAULT_POLL_INTERVAL = 1.0
 
+# RESP_CODE_CONTACT_MSG_RECV / CHANNEL_MSG_RECV  (v<3 : 0x07, 0x08)
+# RESP_CODE_CONTACT_MSG_RECV_V3 / CHANNEL_MSG_RECV_V3  (v≥3 : 0x10, 0x11)
 MESSAGE_PACKET_TYPES = {0x07, 0x08, 0x10, 0x11}
 
 PACKET_TYPE_NAMES: Dict[int, str] = {
-    0x01: "APP_START",
-    0x02: "SEND_TXT",
-    0x03: "SEND_DATA",
-    0x04: "SET_CONFIG",
+    # Responses to client commands
+    0x00: "OK",
+    0x01: "ERR",
+    0x02: "CONTACTS_START",
+    0x03: "CONTACT",
+    0x04: "END_OF_CONTACTS",
     0x05: "SELF_INFO",
-    0x06: "CONTACT_MSG",
-    0x07: "MSG_DIRECT",
-    0x08: "MSG_FLOOD",
-    0x09: "ACK",
-    0x0A: "SYNC/NO_MORE",
-    0x0B: "CHANNEL_MSG",
-    0x10: "MSG_CHANNEL",
-    0x11: "MSG_CHANNEL_FLOOD",
+    0x06: "SENT",
+    0x07: "MSG_RECV",
+    0x08: "CHANNEL_MSG_RECV",
+    0x09: "CURR_TIME",
+    0x0A: "NO_MORE_MESSAGES",
+    0x0B: "EXPORT_CONTACT",
+    0x0C: "BATT_AND_STORAGE",
+    0x0D: "DEVICE_INFO",
+    0x0E: "PRIVATE_KEY",
+    0x0F: "DISABLED",
+    0x10: "MSG_RECV_V3",
+    0x11: "CHANNEL_MSG_RECV_V3",
+    0x12: "CHANNEL_INFO",
+    0x13: "SIGN_START",
+    0x14: "SIGNATURE",
+    0x15: "CUSTOM_VARS",
+    0x16: "ADVERT_PATH",
+    0x17: "TUNING_PARAMS",
+    0x18: "STATS",
+    0x19: "AUTOADD_CONFIG",
+    0x1A: "ALLOWED_REPEAT_FREQ",
+    0x1B: "CHANNEL_DATA_RECV",
+    # Unsolicited push notifications (0x80–0x90)
+    0x80: "PUSH_ADVERT",
+    0x81: "PUSH_PATH_UPDATED",
+    0x82: "PUSH_SEND_CONFIRMED",
+    0x83: "PUSH_MSG_WAITING",
+    0x84: "PUSH_RAW_DATA",
+    0x85: "PUSH_LOGIN_SUCCESS",
+    0x86: "PUSH_LOGIN_FAIL",
+    0x87: "PUSH_STATUS_RESPONSE",
+    0x88: "PUSH_LOG_RX_DATA",
+    0x89: "PUSH_TRACE_DATA",
+    0x8A: "PUSH_NEW_ADVERT",
+    0x8B: "PUSH_TELEMETRY_RESPONSE",
+    0x8C: "PUSH_BINARY_RESPONSE",
+    0x8D: "PUSH_PATH_DISCOVERY_RESPONSE",
+    0x8E: "PUSH_CONTROL_DATA",
+    0x8F: "PUSH_CONTACT_DELETED",
+    0x90: "PUSH_CONTACTS_FULL",
 }
 
 
@@ -112,11 +200,13 @@ class ClientState:
     awaiting_replay_after_self_info: bool = False
     replay_capture_seq: int = 0
     pending_message_frames: Deque[BufferedFrame] = field(default_factory=deque)
-    serving_buffered_messages: bool = False
     outbound_queue: Optional[asyncio.Queue] = None
     sender_task: Optional[asyncio.Task] = None
     last_disconnect_at: float = 0.0
-    sync_dropped: bool = False
+    # Set after cache replay delivers contacts so the backend's subsequent
+    # contact dump (CONTACTS_START + CONTACT × N + END_OF_CONTACTS) is
+    # suppressed for this client — cache update still happens, just no forward.
+    suppress_contact_dump: bool = False
 
 
 def get_packet_type(frame: bytes) -> Optional[int]:
@@ -145,6 +235,7 @@ class BroadcastProxy:
         history_frames: int = DEFAULT_HISTORY_FRAMES,
         client_write_timeout: float = DEFAULT_CLIENT_WRITE_TIMEOUT,
         client_queue_frames: int = DEFAULT_CLIENT_QUEUE_FRAMES,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
         log: bool = True,
         debug: bool = False,
     ):
@@ -157,6 +248,7 @@ class BroadcastProxy:
         self.history_frames = max(history_frames, 0)
         self.client_write_timeout = max(client_write_timeout, 0.1)
         self.client_queue_frames = max(client_queue_frames, 1)
+        self.poll_interval = max(poll_interval, 0.1)
         self.log = log
         self.debug = debug
 
@@ -173,11 +265,20 @@ class BroadcastProxy:
         self.history_size_bytes = 0
         self.next_history_seq = 1
 
+        # Generic state cache: packet_type → list of distinct frames.
+        # Singleton types (CACHE_SINGLETON_TYPES) keep only the latest frame.
+        # All other non-blacklisted types accumulate one entry per distinct frame.
+        # Replayed to every client immediately after SELF_INFO.
+        self._state_cache: Dict[int, List[bytes]] = {}
+
         self._server: Optional[asyncio.base_events.Server] = None
         self._stop = asyncio.Event()
         self._backend_task: Optional[asyncio.Task] = None
-        self._sync_pending = False
-        self._sync_pending_client: Optional[str] = None
+        self._poll_task: Optional[asyncio.Task] = None
+        # Event set by _handle_backend_frame to wake the poll loop after each
+        # backend response (MSG or NO_MORE).
+        self._poll_event: asyncio.Event = asyncio.Event()
+        self._poll_got_message: bool = False
 
     def _p(self, msg: str) -> None:
         if self.log:
@@ -192,9 +293,7 @@ class BroadcastProxy:
         qsize = q.qsize() if q is not None else -1
         return (
             f"q={qsize}/{self.client_queue_frames} "
-            f"replay={state.serving_buffered_messages} "
             f"pending_msgs={len(state.pending_message_frames)} "
-            f"sync_dropped={state.sync_dropped} "
             f"cursor={state.replay_capture_seq} "
             f"connected={'yes' if state.writer is not None else 'NO'}"
         )
@@ -237,8 +336,10 @@ class BroadcastProxy:
         self._p(
             f"[proxy] message history enabled: {self.history_frames} frames / {self.history_bytes} bytes"
         )
+        self._p(f"[proxy] backend poll interval: {self.poll_interval}s")
 
         self._backend_task = asyncio.create_task(self._backend_manager())
+        self._poll_task = asyncio.create_task(self._poll_backend_loop())
 
         try:
             async with self._server:
@@ -253,12 +354,13 @@ class BroadcastProxy:
             await self._close_all_clients()
             await self._close_backend()
 
-            if self._backend_task and not self._backend_task.done():
-                self._backend_task.cancel()
-                try:
-                    await self._backend_task
-                except asyncio.CancelledError:
-                    pass
+            for task in (self._backend_task, self._poll_task):
+                if task and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
     async def stop(self) -> None:
         if self._stop.is_set():
@@ -270,6 +372,47 @@ class BroadcastProxy:
         await self._close_all_clients()
         await self._close_backend()
 
+    async def _poll_backend_loop(self) -> None:
+        """Continuously poll the backend for new messages.
+
+        Drains the backend queue as fast as possible when messages are
+        available, then waits poll_interval seconds before polling again.
+        Client CMD_SYNC_NEXT_MESSAGE frames are never forwarded to the backend;
+        they are always answered locally from pending_message_frames.
+        """
+        self._d("[poll] loop started")
+        SYNC_FRAME = bytes((ord("<"), 1, 0, CMD_SYNC_NEXT_MESSAGE))
+
+        while not self._stop.is_set():
+            if not self.backend_connected.is_set():
+                await asyncio.sleep(0.1)
+                continue
+
+            self._poll_event.clear()
+            self._poll_got_message = False
+            await self._send_to_backend(SYNC_FRAME)
+            self._d("[poll] SYNC sent → backend")
+
+            # Wait for _handle_backend_frame to signal us (MSG or NO_MORE)
+            try:
+                await asyncio.wait_for(self._poll_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                self._d("[poll] timeout waiting for backend response")
+                await asyncio.sleep(self.poll_interval)
+                continue
+
+            if not self.backend_connected.is_set():
+                # Woken by _close_backend; restart the outer loop
+                continue
+
+            if self._poll_got_message:
+                # A message was received — immediately poll again to drain the queue
+                self._d("[poll] message received, polling again immediately")
+            else:
+                # No more messages — wait before next poll
+                self._d(f"[poll] NO_MORE, sleeping {self.poll_interval}s")
+                await asyncio.sleep(self.poll_interval)
+
     async def _register_client(self, peer_group: str, writer: asyncio.StreamWriter) -> ClientState:
         state = ClientState(
             client_id=self._allocate_client_id(peer_group),
@@ -278,7 +421,6 @@ class BroadcastProxy:
         self.client_states[state.client_id] = state
         state.writer = writer
         state.awaiting_replay_after_self_info = False
-        state.serving_buffered_messages = False
         state.last_disconnect_at = 0.0
         state.outbound_queue = asyncio.Queue(maxsize=self.client_queue_frames)
         self._cancel_sender_task(state)
@@ -304,7 +446,6 @@ class BroadcastProxy:
         if previous.pending_message_frames:
             state.pending_message_frames = previous.pending_message_frames
             previous.pending_message_frames = deque()
-            state.serving_buffered_messages = True
             self._p(
                 f"[client] {state.client_id} transferred {len(state.pending_message_frames)} "
                 f"unserved messages from {previous.client_id}"
@@ -324,7 +465,7 @@ class BroadcastProxy:
 
     def _reset_client_runtime_state(self, state: ClientState) -> None:
         state.awaiting_replay_after_self_info = False
-        state.serving_buffered_messages = False
+        state.suppress_contact_dump = False
 
     async def _client_sender(
         self, state: ClientState, writer: asyncio.StreamWriter
@@ -382,7 +523,6 @@ class BroadcastProxy:
             state.replay_capture_seq = buffered.seq
 
         if captured_messages > 0:
-            state.serving_buffered_messages = True
             self._p(
                 f"[client] captured {captured_messages} buffered messages for {state.client_id} "
                 f"(up to seq={state.replay_capture_seq})"
@@ -395,12 +535,18 @@ class BroadcastProxy:
             writer = state.writer
             queue = state.outbound_queue
             if writer is None or queue is None or self._stop.is_set():
-                self._d(f"[send_bytes→{state.client_id}] SKIP — writer={writer is not None} queue={queue is not None} stop={self._stop.is_set()}")
+                self._d(
+                    f"[send_bytes→{state.client_id}] SKIP — "
+                    f"writer={writer is not None} queue={queue is not None} stop={self._stop.is_set()}"
+                )
                 return False
 
             try:
                 queue.put_nowait(payload)
-                self._d(f"[send_bytes→{state.client_id}] enqueued {len(payload)}B — q={queue.qsize()}/{self.client_queue_frames}")
+                self._d(
+                    f"[send_bytes→{state.client_id}] enqueued {len(payload)}B — "
+                    f"q={queue.qsize()}/{self.client_queue_frames}"
+                )
                 return True
             except asyncio.QueueFull:
                 self._p(
@@ -420,40 +566,31 @@ class BroadcastProxy:
                 return False
 
     async def _serve_pending_message(self, state: ClientState) -> bool:
-        if not state.pending_message_frames:
-            if state.serving_buffered_messages:
-                state.serving_buffered_messages = False
-                self._p(f"[client] buffered message replay complete for {state.client_id}")
-                self._d(f"[replay/{state.client_id}] queue empty → send NO_MORE_MSGS + synthetic SYNC")
-                result = await self._send_bytes_to_client(
-                    state, build_backend_frame(RESP_CODE_NO_MORE_MESSAGES)
-                )
-                # Syncs from the client were absorbed during replay; kick the backend
-                # queue with one synthetic sync so any remaining queued messages are
-                # delivered (the chain continues naturally from there).
-                if self.backend_connected.is_set() and not self._sync_pending:
-                    self._sync_pending = True
-                    self._d(f"[replay/{state.client_id}] emitting synthetic SYNC → backend")
-                    await self._send_to_backend(bytes((ord("<"), 1, 0, CMD_SYNC_NEXT_MESSAGE)))
-                return result
-            self._d(f"[replay/{state.client_id}] _serve called but nothing pending and not serving")
-            return False
+        """Serve the next pending message to the client, or send a local NO_MORE.
 
-        buffered = state.pending_message_frames.popleft()
-        self._d(
-            f"[replay/{state.client_id}] serving seq={buffered.seq} "
-            f"size={len(buffered.data)}B remaining={len(state.pending_message_frames)}"
-        )
-        if await self._send_bytes_to_client(state, buffered.data):
-            remaining = len(state.pending_message_frames)
-            self._p(
-                f"[client] served buffered message to {state.client_id} (remaining={remaining})"
+        Called whenever the client sends CMD_SYNC_NEXT_MESSAGE.  The backend is
+        never consulted; the proxy poll loop keeps pending_message_frames fresh.
+        """
+        if state.pending_message_frames:
+            buffered = state.pending_message_frames.popleft()
+            self._d(
+                f"[serve/{state.client_id}] seq={buffered.seq} size={len(buffered.data)}B "
+                f"remaining={len(state.pending_message_frames)}"
             )
-            return True
-
-        self._d(f"[replay/{state.client_id}] send failed — re-queuing seq={buffered.seq}")
-        state.pending_message_frames.appendleft(buffered)
-        return False
+            if await self._send_bytes_to_client(state, buffered.data):
+                self._p(
+                    f"[client] served message seq={buffered.seq} to {state.client_id} "
+                    f"(remaining={len(state.pending_message_frames)})"
+                )
+                return True
+            self._d(f"[serve/{state.client_id}] send failed — re-queuing seq={buffered.seq}")
+            state.pending_message_frames.appendleft(buffered)
+            return False
+        else:
+            self._d(f"[serve/{state.client_id}] nothing pending → local NO_MORE")
+            return await self._send_bytes_to_client(
+                state, build_backend_frame(RESP_CODE_NO_MORE_MESSAGES)
+            )
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -496,27 +633,31 @@ class BroadcastProxy:
                         self._capture_pending_history(state)
                         state.awaiting_replay_after_self_info = True
                         forward_frames.append(frame)
-                    elif command == CMD_SYNC_NEXT_MESSAGE and (
-                        state.pending_message_frames or state.serving_buffered_messages
-                    ):
-                        self._d(
-                            f"[cli→{state.client_id}] SYNC intercepted (replay) — "
-                            f"pending={len(state.pending_message_frames)} serving={state.serving_buffered_messages}"
-                        )
-                        await self._serve_pending_message(state)
                     elif command == CMD_SYNC_NEXT_MESSAGE:
-                        if not self._sync_pending:
-                            self._sync_pending = True
-                            self._sync_pending_client = state.client_id
-                            self._d(f"[cli→{state.client_id}] SYNC forwarded → backend (sync_pending set)")
-                            forward_frames.append(frame)
+                        # Always served locally from the proxy cache.
+                        # The poll loop keeps the cache fresh; client SYNCs are
+                        # never forwarded to the backend.
+                        self._d(f"[cli→{state.client_id}] SYNC → serving locally")
+                        await self._serve_pending_message(state)
+                    elif command == 0x1F and len(frame) >= 5:
+                        # CMD_GET_CHANNEL: serve from cache if available,
+                        # otherwise forward to backend.
+                        channel_idx = frame[4]
+                        cached_channels = self._state_cache.get(0x12, [])
+                        cached = next(
+                            (f for f in cached_channels if len(f) > IDX_OFFSET and f[IDX_OFFSET] == channel_idx),
+                            None,
+                        )
+                        if cached is not None:
+                            self._d(
+                                f"[cli→{state.client_id}] GET_CHANNEL idx={channel_idx} → cache hit"
+                            )
+                            await self._send_bytes_to_client(state, cached)
                         else:
-                            # A sync is already in flight — its response will be
-                            # broadcast to all clients. Remember that this client
-                            # needs a follow-up sync so it is not left behind if
-                            # the in-flight sync is consumed by another client.
-                            state.sync_dropped = True
-                            self._d(f"[cli→{state.client_id}] SYNC dropped (in-flight exists) — sync_dropped=True")
+                            self._d(
+                                f"[cli→{state.client_id}] GET_CHANNEL idx={channel_idx} → cache miss, forwarding"
+                            )
+                            forward_frames.append(frame)
                     else:
                         forward_frames.append(frame)
 
@@ -587,8 +728,8 @@ class BroadcastProxy:
     async def _close_backend(self) -> None:
         self.backend_connected.clear()
         self.backend_parser.reset()
-        self._sync_pending = False
-        self._sync_pending_client = None
+        # Unblock the poll loop if it is waiting for a backend response
+        self._poll_event.set()
         if self.backend_writer:
             try:
                 self.backend_writer.close()
@@ -651,24 +792,80 @@ class BroadcastProxy:
 
     async def _handle_backend_frame(self, frame: bytes) -> None:
         packet_type = get_packet_type(frame)
-        history_seq: Optional[int] = None
         is_msg = is_message_frame(frame)
+        history_seq: Optional[int] = None
+
         if is_msg:
             history_seq = self._append_history(frame)
 
         connected_clients = [s for s in self.client_states.values() if s.writer is not None]
         self._d(
             f"[bkd←frame] type={fmt_ptype(packet_type)} size={len(frame)}B "
-            f"is_msg={is_msg} seq={history_seq} sync_pending={self._sync_pending} "
+            f"is_msg={is_msg} seq={history_seq} "
             f"connected_clients={len(connected_clients)}/{len(self.client_states)}"
         )
 
-        # A message frame or no-more-messages response concludes the in-flight sync.
-        if packet_type in MESSAGE_PACKET_TYPES or packet_type == RESP_CODE_NO_MORE_MESSAGES:
-            if self._sync_pending:
-                self._d(f"[sync] cleared sync_pending (got {fmt_ptype(packet_type)})")
-            self._sync_pending = False
-            self._sync_pending_client = None
+        # Update generic state cache so reconnecting clients get a full snapshot.
+        if packet_type is not None and packet_type not in CACHE_BLACKLIST_TYPES and not is_msg:
+            if packet_type in CACHE_SINGLETON_TYPES:
+                self._state_cache[packet_type] = [frame]
+                self._d(f"[cache] singleton updated type={fmt_ptype(packet_type)}")
+            elif packet_type in CACHE_DEDUP_BY_PUBKEY_TYPES:
+                end = PUBKEY_OFFSET + PUBKEY_SIZE
+                if len(frame) >= end:
+                    pubkey = frame[PUBKEY_OFFSET:end]
+                    bucket = self._state_cache.setdefault(packet_type, [])
+                    for i, existing in enumerate(bucket):
+                        if existing[PUBKEY_OFFSET:end] == pubkey:
+                            if existing != frame:
+                                bucket[i] = frame
+                                self._d(
+                                    f"[cache] updated type={fmt_ptype(packet_type)} "
+                                    f"pubkey={pubkey[:4].hex()}… total={len(bucket)}"
+                                )
+                            break
+                    else:
+                        bucket.append(frame)
+                        self._d(
+                            f"[cache] new type={fmt_ptype(packet_type)} "
+                            f"pubkey={pubkey[:4].hex()}… total={len(bucket)}"
+                        )
+            elif packet_type in CACHE_DEDUP_BY_IDX_TYPES:
+                if len(frame) > IDX_OFFSET:
+                    idx = frame[IDX_OFFSET]
+                    bucket = self._state_cache.setdefault(packet_type, [])
+                    for i, existing in enumerate(bucket):
+                        if len(existing) > IDX_OFFSET and existing[IDX_OFFSET] == idx:
+                            if existing != frame:
+                                bucket[i] = frame
+                                self._d(
+                                    f"[cache] updated type={fmt_ptype(packet_type)} "
+                                    f"idx={idx} total={len(bucket)}"
+                                )
+                            break
+                    else:
+                        bucket.append(frame)
+                        self._d(
+                            f"[cache] new type={fmt_ptype(packet_type)} "
+                            f"idx={idx} total={len(bucket)}"
+                        )
+            else:
+                bucket = self._state_cache.setdefault(packet_type, [])
+                if frame not in bucket:
+                    bucket.append(frame)
+                    self._d(
+                        f"[cache] collected type={fmt_ptype(packet_type)} "
+                        f"total={len(bucket)}"
+                    )
+
+        # Signal the poll loop: got a message (poll again immediately) or
+        # queue empty (sleep before next poll).
+        if is_msg:
+            self._poll_got_message = True
+            self._poll_event.set()
+        elif packet_type == RESP_CODE_NO_MORE_MESSAGES:
+            self._poll_got_message = False
+            self._poll_event.set()
 
         for state in list(self.client_states.values()):
             if state.writer is None:
@@ -676,26 +873,45 @@ class BroadcastProxy:
                 continue
             await self._send_frame_to_client(state, frame, packet_type, history_seq)
 
-        # If any client had its sync dropped while the previous one was in flight,
-        # emit one follow-up sync now so those clients are not left waiting.
-        if not self._sync_pending:
-            for state in self.client_states.values():
-                if state.sync_dropped and state.writer is not None:
-                    state.sync_dropped = False
-                    if state.pending_message_frames or state.serving_buffered_messages:
-                        # Client already has buffered messages — serve the next one
-                        # directly instead of asking the backend (which would return
-                        # NO_MORE anyway and get suppressed, leaving the client with
-                        # an unanswered SYNC and a very long wait before retrying).
-                        self._d(f"[sync] serving pending directly for {state.client_id} (skip re-emit)")
-                        await self._serve_pending_message(state)
-                    else:
-                        self._sync_pending = True
-                        self._sync_pending_client = state.client_id
-                        self._p(f"[proxy] re-emitting dropped sync on behalf of {state.client_id}")
-                        self._d(f"[sync] re-emit → backend on behalf of {state.client_id}")
-                        await self._send_to_backend(bytes((ord("<"), 1, 0, CMD_SYNC_NEXT_MESSAGE)))
-                    break
+    async def _replay_state_cache(self, state: ClientState) -> None:
+        """Replay all cached backend state to a client that just received SELF_INFO.
+
+        Called once per connection, right after SELF_INFO is forwarded, so the
+        client gets a full state snapshot (contacts, channels, and any other
+        non-transient backend frames) without extra backend round-trips.
+        Pending messages will be served on the client's subsequent
+        CMD_SYNC_NEXT_MESSAGE calls.
+        """
+        total = 0
+        # Replay singleton types first (SELF_INFO already sent — skip it),
+        # then collections, preserving insertion order within each bucket.
+        for packet_type, frames in self._state_cache.items():
+            if packet_type == RESP_CODE_SELF_INFO:
+                continue  # already sent by the caller
+            for frame in frames:
+                await self._send_bytes_to_client(state, frame)
+                total += 1
+
+        # If contacts were in the cache replay, suppress the backend's upcoming
+        # contact dump for this client (cache will still be updated).
+        if self._state_cache.get(0x03):
+            state.suppress_contact_dump = True
+
+        n_types = sum(
+            1 for pt in self._state_cache if pt != RESP_CODE_SELF_INFO
+        )
+        self._p(
+            f"[client] replayed state cache to {state.client_id}: "
+            f"{total} frame(s) across {n_types} type(s) "
+            f"suppress_contacts={state.suppress_contact_dump}"
+        )
+        if state.pending_message_frames:
+            self._p(
+                f"[client] {len(state.pending_message_frames)} buffered message(s) pending "
+                f"for {state.client_id} — will serve on next SYNC"
+            )
+        else:
+            self._p(f"[client] no buffered messages pending for {state.client_id}")
 
     async def _send_frame_to_client(
         self,
@@ -704,63 +920,66 @@ class BroadcastProxy:
         packet_type: Optional[int],
         history_seq: Optional[int],
     ) -> None:
-        # CMD_SYNC_NEXT_MESSAGE and RESP_CODE_NO_MORE_MESSAGES share value 0x0A.
-        # When the backend signals end-of-queue to a client that is mid-replay,
-        # suppress it: the proxy will send its own RESP_CODE_NO_MORE_MESSAGES at
-        # the end of the replay buffer, preventing a premature stop of the flow.
-        if packet_type == RESP_CODE_NO_MORE_MESSAGES and state.serving_buffered_messages:
-            self._d(
-                f"[bkd→{state.client_id}] SUPPRESS NO_MORE_MSGS — mid-replay "
-                f"({len(state.pending_message_frames)} msgs left)"
-            )
+        # NO_MORE from the backend is handled by the poll loop; clients receive a
+        # locally-generated NO_MORE when they SYNC and nothing is pending.
+        if packet_type == RESP_CODE_NO_MORE_MESSAGES:
             return
 
-        # Message frames are only pushed directly to the client whose SYNC triggered
-        # the backend response. All other clients receive the message via their own
-        # SYNC → replay path, so apps that use a strict request/response state machine
-        # (e.g. meshcore-flutter) are not confused by unsolicited message frames.
-        if history_seq is not None and state.client_id != self._sync_pending_client:
+        # Message frames go into the client's pending queue and are served on the
+        # client's next CMD_SYNC_NEXT_MESSAGE.  This ensures every app receives
+        # messages in a proper SYNC request/response context.
+        if history_seq is not None:
             if history_seq > state.replay_capture_seq:
                 state.pending_message_frames.append(BufferedFrame(seq=history_seq, data=frame))
                 state.replay_capture_seq = history_seq
-                state.serving_buffered_messages = True
                 self._d(
-                    f"[bkd→{state.client_id}] DEFERRED seq={history_seq} → replay queue "
+                    f"[bkd→{state.client_id}] QUEUED seq={history_seq} "
                     f"pending={len(state.pending_message_frames)}"
                 )
-                self._p(f"[client] deferred message seq={history_seq} for {state.client_id} (will serve on next SYNC)")
+                self._p(
+                    f"[client] queued message seq={history_seq} for {state.client_id} "
+                    f"(pending={len(state.pending_message_frames)})"
+                )
+                # Notify the client that a message is waiting so it sends
+                # CMD_SYNC_NEXT_MESSAGE.  We do this AFTER queueing so there
+                # is no race between the notification and the pending queue
+                # being empty (which happened when the backend's own
+                # PUSH_MSG_WAITING arrived before the poll loop retrieved
+                # the message).
+                await self._send_bytes_to_client(state, build_backend_frame(0x83))
             else:
                 self._d(
-                    f"[bkd→{state.client_id}] SKIP msg seq={history_seq} — already at cursor={state.replay_capture_seq}"
+                    f"[bkd→{state.client_id}] SKIP msg seq={history_seq} — "
+                    f"already at cursor={state.replay_capture_seq}"
                 )
             return
 
-        self._d(
-            f"[bkd→{state.client_id}] QUEUE type={fmt_ptype(packet_type)} "
-            f"size={len(frame)}B seq={history_seq} | {self._q_info(state)}"
-        )
-
-        if not await self._send_bytes_to_client(state, frame):
-            self._d(f"[bkd→{state.client_id}] QUEUE FAILED — client dropped")
+        # Suppress the backend's contact dump for clients that received contacts
+        # via cache replay — the cache is already up-to-date from _handle_backend_frame.
+        if packet_type in (0x02, 0x03, 0x04) and state.suppress_contact_dump:
+            if packet_type == 0x04:  # END_OF_CONTACTS: dump is over
+                state.suppress_contact_dump = False
+                self._d(f"[bkd→{state.client_id}] contact dump suppressed (end)")
+            else:
+                self._d(
+                    f"[bkd→{state.client_id}] SUPPRESS type={fmt_ptype(packet_type)} "
+                    f"(contacts already in cache replay)"
+                )
             return
 
-        # Advance the per-client cursor when a live message frame is accepted
-        # for delivery, so reconnect replay only covers messages missed offline.
-        if history_seq is not None and history_seq > state.replay_capture_seq:
-            old_cursor = state.replay_capture_seq
-            state.replay_capture_seq = history_seq
-            self._d(
-                f"[bkd→{state.client_id}] cursor advanced {old_cursor}→{history_seq}"
-            )
+        # Suppress CHANNEL_INFO if this client got channels via cache replay AND
+        # the frame is identical to what was replayed (no actual change).
+        # All other frames (SELF_INFO, CUSTOM_VARS, ACK, …) are pushed directly.
+        self._d(
+            f"[bkd→{state.client_id}] PUSH type={fmt_ptype(packet_type)} size={len(frame)}B"
+        )
+        if not await self._send_bytes_to_client(state, frame):
+            self._d(f"[bkd→{state.client_id}] PUSH FAILED — client dropped")
+            return
 
         if packet_type == RESP_CODE_SELF_INFO and state.awaiting_replay_after_self_info:
             state.awaiting_replay_after_self_info = False
-            if state.pending_message_frames:
-                self._p(
-                    f"[client] waiting for client sync to replay {len(state.pending_message_frames)} buffered messages to {state.client_id}"
-                )
-            else:
-                self._p(f"[client] no replay needed for {state.client_id} after SELF_INFO")
+            await self._replay_state_cache(state)
 
 
 def parse_args():
@@ -776,6 +995,12 @@ def parse_args():
     ap.add_argument("--history-frames", type=int, default=DEFAULT_HISTORY_FRAMES)
     ap.add_argument("--client-write-timeout", type=float, default=DEFAULT_CLIENT_WRITE_TIMEOUT)
     ap.add_argument("--client-queue-frames", type=int, default=DEFAULT_CLIENT_QUEUE_FRAMES)
+    ap.add_argument(
+        "--poll-interval",
+        type=float,
+        default=DEFAULT_POLL_INTERVAL,
+        help="Seconds to wait between backend polls when the queue is empty (default: %(default)s)",
+    )
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
     return ap.parse_args()
@@ -793,6 +1018,7 @@ async def main_async():
         history_frames=args.history_frames,
         client_write_timeout=args.client_write_timeout,
         client_queue_frames=args.client_queue_frames,
+        poll_interval=args.poll_interval,
         log=not args.quiet,
         debug=args.debug,
     )
