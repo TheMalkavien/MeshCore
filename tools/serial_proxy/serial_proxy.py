@@ -37,6 +37,28 @@ DEFAULT_CLIENT_QUEUE_FRAMES = 512
 
 MESSAGE_PACKET_TYPES = {0x07, 0x08, 0x10, 0x11}
 
+PACKET_TYPE_NAMES: Dict[int, str] = {
+    0x01: "APP_START",
+    0x02: "SEND_TXT",
+    0x03: "SEND_DATA",
+    0x04: "SET_CONFIG",
+    0x05: "SELF_INFO",
+    0x06: "CONTACT_MSG",
+    0x07: "MSG_DIRECT",
+    0x08: "MSG_FLOOD",
+    0x09: "ACK",
+    0x0A: "SYNC/NO_MORE",
+    0x0B: "CHANNEL_MSG",
+    0x10: "MSG_CHANNEL",
+    0x11: "MSG_CHANNEL_FLOOD",
+}
+
+
+def fmt_ptype(pt: Optional[int]) -> str:
+    if pt is None:
+        return "NONE"
+    return PACKET_TYPE_NAMES.get(pt, f"0x{pt:02X}")
+
 
 class CompanionStreamParser:
     def __init__(self, header_byte: int, max_frame_size: int = MAX_COMPANION_FRAME_SIZE):
@@ -135,6 +157,7 @@ class SerialBroadcastProxy:
         client_write_timeout: float = DEFAULT_CLIENT_WRITE_TIMEOUT,
         client_queue_frames: int = DEFAULT_CLIENT_QUEUE_FRAMES,
         log: bool = True,
+        debug: bool = False,
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
@@ -148,6 +171,7 @@ class SerialBroadcastProxy:
         self.client_write_timeout = max(client_write_timeout, 0.1)
         self.client_queue_frames = max(client_queue_frames, 1)
         self.log = log
+        self.debug = debug
 
         self.client_states: Dict[str, ClientState] = {}
         self._next_client_slot = 1
@@ -165,10 +189,27 @@ class SerialBroadcastProxy:
         self._stop = asyncio.Event()
         self._backend_task: Optional[asyncio.Task] = None
         self._sync_pending = False
+        self._sync_pending_client: Optional[str] = None
 
     def _p(self, msg: str) -> None:
         if self.log:
             print(msg, flush=True)
+
+    def _d(self, msg: str) -> None:
+        if self.debug:
+            print(f"[DBG] {msg}", flush=True)
+
+    def _q_info(self, state: "ClientState") -> str:
+        q = state.outbound_queue
+        qsize = q.qsize() if q is not None else -1
+        return (
+            f"q={qsize}/{self.client_queue_frames} "
+            f"replay={state.serving_buffered_messages} "
+            f"pending_msgs={len(state.pending_message_frames)} "
+            f"sync_dropped={state.sync_dropped} "
+            f"cursor={state.replay_capture_seq} "
+            f"connected={'yes' if state.writer is not None else 'NO'}"
+        )
 
     def _make_client_id(self, peer) -> str:
         if isinstance(peer, tuple) and peer:
@@ -307,21 +348,27 @@ class SerialBroadcastProxy:
         if queue is None:
             return
 
+        self._d(f"[sender/{state.client_id}] started")
         try:
             while not self._stop.is_set():
                 payload = await queue.get()
                 if payload is None:
+                    self._d(f"[sender/{state.client_id}] sentinel received, exiting")
                     break
                 if state.writer is not writer:
+                    self._d(f"[sender/{state.client_id}] writer replaced, exiting")
                     break
 
                 writer.write(payload)
                 await asyncio.wait_for(writer.drain(), timeout=self.client_write_timeout)
         except asyncio.TimeoutError:
             self._p(f"[client] send timeout to {state.client_id}, closing stalled connection")
+            self._d(f"[sender/{state.client_id}] TIMEOUT after {self.client_write_timeout}s")
         except asyncio.CancelledError:
+            self._d(f"[sender/{state.client_id}] cancelled")
             pass
-        except Exception:
+        except Exception as exc:
+            self._d(f"[sender/{state.client_id}] exception: {exc}")
             pass
         finally:
             if state.writer is writer:
@@ -363,10 +410,12 @@ class SerialBroadcastProxy:
             writer = state.writer
             queue = state.outbound_queue
             if writer is None or queue is None or self._stop.is_set():
+                self._d(f"[send_bytes→{state.client_id}] SKIP — writer={writer is not None} queue={queue is not None} stop={self._stop.is_set()}")
                 return False
 
             try:
                 queue.put_nowait(payload)
+                self._d(f"[send_bytes→{state.client_id}] enqueued {len(payload)}B — q={queue.qsize()}/{self.client_queue_frames}")
                 return True
             except asyncio.QueueFull:
                 self._p(
@@ -390,6 +439,7 @@ class SerialBroadcastProxy:
             if state.serving_buffered_messages:
                 state.serving_buffered_messages = False
                 self._p(f"[client] buffered message replay complete for {state.client_id}")
+                self._d(f"[replay/{state.client_id}] queue empty → send NO_MORE_MSGS + synthetic SYNC")
                 result = await self._send_bytes_to_client(
                     state, build_backend_frame(RESP_CODE_NO_MORE_MESSAGES)
                 )
@@ -398,11 +448,17 @@ class SerialBroadcastProxy:
                 # delivered (the chain continues naturally from there).
                 if self.backend_connected.is_set() and not self._sync_pending:
                     self._sync_pending = True
+                    self._d(f"[replay/{state.client_id}] emitting synthetic SYNC → backend")
                     await self._send_to_backend(bytes((ord("<"), 1, 0, CMD_SYNC_NEXT_MESSAGE)))
                 return result
+            self._d(f"[replay/{state.client_id}] _serve called but nothing pending and not serving")
             return False
 
         buffered = state.pending_message_frames.popleft()
+        self._d(
+            f"[replay/{state.client_id}] serving seq={buffered.seq} "
+            f"size={len(buffered.data)}B remaining={len(state.pending_message_frames)}"
+        )
         if await self._send_bytes_to_client(state, buffered.data):
             remaining = len(state.pending_message_frames)
             self._p(
@@ -410,6 +466,7 @@ class SerialBroadcastProxy:
             )
             return True
 
+        self._d(f"[replay/{state.client_id}] send failed — re-queuing seq={buffered.seq}")
         state.pending_message_frames.appendleft(buffered)
         return False
 
@@ -457,10 +514,16 @@ class SerialBroadcastProxy:
                     elif command == CMD_SYNC_NEXT_MESSAGE and (
                         state.pending_message_frames or state.serving_buffered_messages
                     ):
+                        self._d(
+                            f"[cli→{state.client_id}] SYNC intercepted (replay) — "
+                            f"pending={len(state.pending_message_frames)} serving={state.serving_buffered_messages}"
+                        )
                         await self._serve_pending_message(state)
                     elif command == CMD_SYNC_NEXT_MESSAGE:
                         if not self._sync_pending:
                             self._sync_pending = True
+                            self._sync_pending_client = state.client_id
+                            self._d(f"[cli→{state.client_id}] SYNC forwarded → backend (sync_pending set)")
                             forward_frames.append(frame)
                         else:
                             # A sync is already in flight — its response will be
@@ -468,6 +531,7 @@ class SerialBroadcastProxy:
                             # needs a follow-up sync so it is not left behind if
                             # the in-flight sync is consumed by another client.
                             state.sync_dropped = True
+                            self._d(f"[cli→{state.client_id}] SYNC dropped (in-flight exists) — sync_dropped=True")
                     else:
                         forward_frames.append(frame)
 
@@ -547,6 +611,7 @@ class SerialBroadcastProxy:
         self.backend_connected.clear()
         self.backend_parser.reset()
         self._sync_pending = False
+        self._sync_pending_client = None
         conn = self.serial_conn
         self.serial_conn = None
         if conn:
@@ -592,27 +657,46 @@ class SerialBroadcastProxy:
         self.history.append(BufferedFrame(seq=seq, data=frame))
         self.history_size_bytes += len(frame)
 
+        evicted_count = 0
         while self.history and (
             (self.history_frames and len(self.history) > self.history_frames)
             or (self.history_bytes and self.history_size_bytes > self.history_bytes)
         ):
             evicted = self.history.popleft()
             self.history_size_bytes -= len(evicted.data)
+            evicted_count += 1
 
+        self._d(
+            f"[history] appended seq={seq} size={len(frame)}B "
+            f"total={len(self.history)} frames / {self.history_size_bytes}B "
+            f"evicted={evicted_count}"
+        )
         return seq
 
     async def _handle_backend_frame(self, frame: bytes) -> None:
         packet_type = get_packet_type(frame)
         history_seq: Optional[int] = None
-        if is_message_frame(frame):
+        is_msg = is_message_frame(frame)
+        if is_msg:
             history_seq = self._append_history(frame)
+
+        connected_clients = [s for s in self.client_states.values() if s.writer is not None]
+        self._d(
+            f"[bkd←frame] type={fmt_ptype(packet_type)} size={len(frame)}B "
+            f"is_msg={is_msg} seq={history_seq} sync_pending={self._sync_pending} "
+            f"connected_clients={len(connected_clients)}/{len(self.client_states)}"
+        )
 
         # A message frame or no-more-messages response concludes the in-flight sync.
         if packet_type in MESSAGE_PACKET_TYPES or packet_type == RESP_CODE_NO_MORE_MESSAGES:
+            if self._sync_pending:
+                self._d(f"[sync] cleared sync_pending (got {fmt_ptype(packet_type)})")
             self._sync_pending = False
+            self._sync_pending_client = None
 
         for state in list(self.client_states.values()):
             if state.writer is None:
+                self._d(f"[bkd→{state.client_id}] SKIP — not connected")
                 continue
             await self._send_frame_to_client(state, frame, packet_type, history_seq)
 
@@ -623,7 +707,9 @@ class SerialBroadcastProxy:
                 if state.sync_dropped and state.writer is not None:
                     state.sync_dropped = False
                     self._sync_pending = True
+                    self._sync_pending_client = state.client_id
                     self._p(f"[proxy] re-emitting dropped sync on behalf of {state.client_id}")
+                    self._d(f"[sync] re-emit → backend on behalf of {state.client_id}")
                     await self._send_to_backend(bytes((ord("<"), 1, 0, CMD_SYNC_NEXT_MESSAGE)))
                     break
 
@@ -639,15 +725,49 @@ class SerialBroadcastProxy:
         # suppress it: the proxy will send its own RESP_CODE_NO_MORE_MESSAGES at
         # the end of the replay buffer, preventing a premature stop of the flow.
         if packet_type == RESP_CODE_NO_MORE_MESSAGES and state.serving_buffered_messages:
+            self._d(
+                f"[bkd→{state.client_id}] SUPPRESS NO_MORE_MSGS — mid-replay "
+                f"({len(state.pending_message_frames)} msgs left)"
+            )
             return
 
+        # Message frames are only pushed directly to the client whose SYNC triggered
+        # the backend response. All other clients receive the message via their own
+        # SYNC → replay path, so apps that use a strict request/response state machine
+        # (e.g. meshcore-flutter) are not confused by unsolicited message frames.
+        if history_seq is not None and state.client_id != self._sync_pending_client:
+            if history_seq > state.replay_capture_seq:
+                state.pending_message_frames.append(BufferedFrame(seq=history_seq, data=frame))
+                state.replay_capture_seq = history_seq
+                state.serving_buffered_messages = True
+                self._d(
+                    f"[bkd→{state.client_id}] DEFERRED seq={history_seq} → replay queue "
+                    f"pending={len(state.pending_message_frames)}"
+                )
+                self._p(f"[client] deferred message seq={history_seq} for {state.client_id} (will serve on next SYNC)")
+            else:
+                self._d(
+                    f"[bkd→{state.client_id}] SKIP msg seq={history_seq} — already at cursor={state.replay_capture_seq}"
+                )
+            return
+
+        self._d(
+            f"[bkd→{state.client_id}] QUEUE type={fmt_ptype(packet_type)} "
+            f"size={len(frame)}B seq={history_seq} | {self._q_info(state)}"
+        )
+
         if not await self._send_bytes_to_client(state, frame):
+            self._d(f"[bkd→{state.client_id}] QUEUE FAILED — client dropped")
             return
 
         # Advance the per-client cursor when a live message frame is accepted
         # for delivery, so reconnect replay only covers messages missed offline.
         if history_seq is not None and history_seq > state.replay_capture_seq:
+            old_cursor = state.replay_capture_seq
             state.replay_capture_seq = history_seq
+            self._d(
+                f"[bkd→{state.client_id}] cursor advanced {old_cursor}→{history_seq}"
+            )
 
         if packet_type == RESP_CODE_SELF_INFO and state.awaiting_replay_after_self_info:
             state.awaiting_replay_after_self_info = False
@@ -677,6 +797,7 @@ def parse_args():
     ap.add_argument("--client-write-timeout", type=float, default=DEFAULT_CLIENT_WRITE_TIMEOUT)
     ap.add_argument("--client-queue-frames", type=int, default=DEFAULT_CLIENT_QUEUE_FRAMES)
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
     return ap.parse_args()
 
 
@@ -695,6 +816,7 @@ async def main_async():
         client_write_timeout=args.client_write_timeout,
         client_queue_frames=args.client_queue_frames,
         log=not args.quiet,
+        debug=args.debug,
     )
 
     loop = asyncio.get_running_loop()
