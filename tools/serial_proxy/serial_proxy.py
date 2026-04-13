@@ -706,11 +706,19 @@ class SerialBroadcastProxy:
             for state in self.client_states.values():
                 if state.sync_dropped and state.writer is not None:
                     state.sync_dropped = False
-                    self._sync_pending = True
-                    self._sync_pending_client = state.client_id
-                    self._p(f"[proxy] re-emitting dropped sync on behalf of {state.client_id}")
-                    self._d(f"[sync] re-emit → backend on behalf of {state.client_id}")
-                    await self._send_to_backend(bytes((ord("<"), 1, 0, CMD_SYNC_NEXT_MESSAGE)))
+                    if state.pending_message_frames or state.serving_buffered_messages:
+                        # Client already has buffered messages — serve the next one
+                        # directly instead of asking the backend (which would return
+                        # NO_MORE anyway and get suppressed, leaving the client with
+                        # an unanswered SYNC and a very long wait before retrying).
+                        self._d(f"[sync] serving pending directly for {state.client_id} (skip re-emit)")
+                        await self._serve_pending_message(state)
+                    else:
+                        self._sync_pending = True
+                        self._sync_pending_client = state.client_id
+                        self._p(f"[proxy] re-emitting dropped sync on behalf of {state.client_id}")
+                        self._d(f"[sync] re-emit → backend on behalf of {state.client_id}")
+                        await self._send_to_backend(bytes((ord("<"), 1, 0, CMD_SYNC_NEXT_MESSAGE)))
                     break
 
     async def _send_frame_to_client(
