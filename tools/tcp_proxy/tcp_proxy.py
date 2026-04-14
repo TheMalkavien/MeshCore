@@ -894,10 +894,18 @@ class BroadcastProxy:
         CMD_SYNC_NEXT_MESSAGE calls.
         """
         total = 0
+        # Log cache contents before replay for diagnostics.
+        self._p(
+            f"[cache] snapshot before replay to {state.client_id}: "
+            + ", ".join(
+                f"{fmt_ptype(pt)}×{len(fs)}"
+                for pt, fs in self._state_cache.items()
+            )
+        )
         # Replay singleton types first (SELF_INFO already sent — skip it),
         # then collections, preserving insertion order within each bucket.
         contact_frames = self._state_cache.get(0x03, [])
-        for packet_type, frames in self._state_cache.items():
+        for packet_type, frames in list(self._state_cache.items()):
             if packet_type == RESP_CODE_SELF_INFO:
                 continue  # already sent by the caller
             if packet_type == 0x03:
