@@ -10,6 +10,7 @@ Serial broadcast proxy for MeshCore companion links:
 import argparse
 import asyncio
 import signal
+import struct
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional
@@ -214,7 +215,6 @@ class ClientState:
     outbound_queue: Optional[asyncio.Queue] = None
     sender_task: Optional[asyncio.Task] = None
     last_disconnect_at: float = 0.0
-    suppress_contact_dump: bool = False
 
 
 def get_packet_type(frame: bytes) -> Optional[int]:
@@ -281,6 +281,12 @@ class SerialBroadcastProxy:
         # All other non-blacklisted types accumulate one entry per distinct frame.
         # Replayed to every client immediately after SELF_INFO.
         self._state_cache: Dict[int, List[bytes]] = {}
+
+        # Set to True while the backend is streaming a contact dump
+        # (between CONTACTS_START and END_OF_CONTACTS).  While True, contacts
+        # are still cached but forwarding to all clients is suppressed — they
+        # have already received the full contact list via cache replay.
+        self._in_contact_dump: bool = False
 
         self._server: Optional[asyncio.base_events.Server] = None
         self._stop = asyncio.Event()
@@ -479,7 +485,6 @@ class SerialBroadcastProxy:
 
     def _reset_client_runtime_state(self, state: ClientState) -> None:
         state.awaiting_replay_after_self_info = False
-        state.suppress_contact_dump = False
 
     async def _client_sender(
         self, state: ClientState, writer: asyncio.StreamWriter
@@ -881,6 +886,13 @@ class SerialBroadcastProxy:
                         f"total={len(bucket)}"
                     )
 
+        # Track whether we are currently inside a backend contact dump so that
+        # _send_frame_to_client can suppress forwarding to all clients.
+        if packet_type == 0x02:  # CONTACTS_START
+            self._in_contact_dump = True
+        elif packet_type == 0x04:  # END_OF_CONTACTS
+            self._in_contact_dump = False
+
         # Signal the poll loop: got a message (poll again immediately) or
         # queue empty (sleep before next poll).
         if is_msg:
@@ -916,8 +928,9 @@ class SerialBroadcastProxy:
                 # Wrap CONTACT frames with synthetic delimiters so the client
                 # receives a well-formed contact dump.
                 n = len(contact_frames)
-                # CONTACTS_START: '>' + LSB(n) + MSB(n) + 0x02  (count field)
-                contacts_start = bytes([ord(">"), n & 0xFF, (n >> 8) & 0xFF, 0x02])
+                # CONTACTS_START payload: code(1) + count(4, uint32_t LE)
+                # Wire frame: '>'(1) + payload_len_LE(2) + payload(5) = 8 bytes
+                contacts_start = bytes([ord(">"), 5, 0, 0x02]) + struct.pack("<I", n)
                 await self._send_bytes_to_client(state, contacts_start)
                 for frame in frames:
                     await self._send_bytes_to_client(state, frame)
@@ -929,16 +942,12 @@ class SerialBroadcastProxy:
                 await self._send_bytes_to_client(state, frame)
                 total += 1
 
-        if contact_frames:
-            state.suppress_contact_dump = True
-
         n_types = sum(
             1 for pt in self._state_cache if pt != RESP_CODE_SELF_INFO
         )
         self._p(
             f"[client] replayed state cache to {state.client_id}: "
-            f"{total} frame(s) across {n_types} type(s) "
-            f"suppress_contacts={state.suppress_contact_dump}"
+            f"{total} frame(s) across {n_types} type(s)"
         )
         if state.pending_message_frames:
             self._p(
@@ -989,15 +998,25 @@ class SerialBroadcastProxy:
                 )
             return
 
-        if packet_type in (0x02, 0x03, 0x04) and state.suppress_contact_dump:
-            if packet_type == 0x04:
-                state.suppress_contact_dump = False
-                self._d(f"[bkd→{state.client_id}] contact dump suppressed (end)")
-            else:
-                self._d(
-                    f"[bkd→{state.client_id}] SUPPRESS type={fmt_ptype(packet_type)} "
-                    f"(contacts already in cache replay)"
-                )
+        # Suppress the backend's contact dump for ALL clients when the cache
+        # already holds contacts.  Every backend APP_START triggers a full
+        # dump, but all clients already received their contacts via cache
+        # replay.  We still cache the frames in _handle_backend_frame so the
+        # cache stays fresh — we just don't forward the dump to any client.
+        if self._in_contact_dump and self._state_cache.get(0x03):
+            self._d(
+                f"[bkd→{state.client_id}] SUPPRESS type={fmt_ptype(packet_type)} "
+                f"(contacts in cache, dump suppressed for all clients)"
+            )
+            return
+        # Also suppress the END_OF_CONTACTS delimiter when the dump was
+        # suppressed (packet_type==0x04 clears _in_contact_dump before we
+        # reach here, so check via packet_type directly).
+        if packet_type == 0x04 and self._state_cache.get(0x03):
+            self._d(
+                f"[bkd→{state.client_id}] SUPPRESS END_OF_CONTACTS "
+                f"(contacts in cache, dump suppressed)"
+            )
             return
 
         # All other frames (SELF_INFO, CUSTOM_VARS, ACK, …) are pushed directly.
