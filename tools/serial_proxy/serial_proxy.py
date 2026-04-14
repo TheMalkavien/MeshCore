@@ -644,14 +644,32 @@ class SerialBroadcastProxy:
                         # IP changes (e.g. mobile switching networks).
                         if state.app_name:
                             state.peer_group = state.app_name
-                        self._p(
-                            f"[client] APP_START from {state.client_id} app_name="
-                            f"{state.app_name or '<empty>'}"
-                        )
                         self._adopt_prior_state(state)
                         self._capture_pending_history(state)
-                        state.awaiting_replay_after_self_info = True
-                        forward_frames.append(frame)
+
+                        cached_self_info = (self._state_cache.get(RESP_CODE_SELF_INFO) or [None])[0]
+                        if cached_self_info is not None:
+                            # Cache is warm: serve the response locally without
+                            # touching the backend.  Forwarding APP_START would
+                            # trigger a full contact dump from the backend which
+                            # blocks other client commands for several seconds.
+                            self._p(
+                                f"[client] APP_START from {state.client_id} "
+                                f"app_name={state.app_name or '<empty>'} — "
+                                f"served from cache (no backend round-trip)"
+                            )
+                            await self._send_bytes_to_client(state, cached_self_info)
+                            await self._replay_state_cache(state)
+                            # Do NOT append to forward_frames — backend never sees this APP_START.
+                        else:
+                            # Cache is cold (first ever connection): must ask the backend.
+                            self._p(
+                                f"[client] APP_START from {state.client_id} "
+                                f"app_name={state.app_name or '<empty>'} — "
+                                f"cache cold, forwarding to backend"
+                            )
+                            state.awaiting_replay_after_self_info = True
+                            forward_frames.append(frame)
                     elif command == CMD_SYNC_NEXT_MESSAGE:
                         # Always served locally from the proxy cache.
                         # The poll loop keeps the cache fresh; client SYNCs are
