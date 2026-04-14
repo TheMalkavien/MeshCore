@@ -33,6 +33,10 @@ CONTACT_LASTMOD_OFFSET = 147
 CACHE_SINGLETON_TYPES = {
     0x05,  # RESP_CODE_SELF_INFO
     0x0D,  # RESP_CODE_DEVICE_INFO
+    0x15,  # RESP_CODE_CUSTOM_VARS    — node config, one per device
+    0x17,  # RESP_CODE_TUNING_PARAMS  — radio config, one per device
+    0x19,  # RESP_CODE_AUTOADD_CONFIG — one per device
+    0x1A,  # RESP_ALLOWED_REPEAT_FREQ — one per device
 }
 
 # Packet types deduplicated by pubkey (frame[4:36], 32 bytes).
@@ -59,8 +63,11 @@ CACHE_BLACKLIST_TYPES = {
     0x0F,  # DISABLED        — transient feature-flag response
     0x02,  # CONTACTS_START  — delimiter, rebuilt from CONTACT cache on replay
     0x04,  # END_OF_CONTACTS — delimiter, rebuilt from CONTACT cache on replay
+    0x0B,  # EXPORT_CONTACT  — transient response to a specific command
     0x13,  # SIGN_START      — transient signing session
     0x14,  # SIGNATURE       — transient signing result
+    0x16,  # ADVERT_PATH     — per-contact routing info, stale on replay
+    0x18,  # STATS           — varies by stats_type, stale on replay
     # Unsolicited push events (0x80–0x90): all transient except PUSH_NEW_ADVERT
     # (0x8A) which carries a full contact structure and is worth caching.
     0x80,  # PUSH_ADVERT                  — radio event, not persistent state
@@ -978,25 +985,31 @@ class BroadcastProxy:
         )
         # Replay singleton types first (SELF_INFO already sent — skip it),
         # then collections, preserving insertion order within each bucket.
-        contact_frames = self._state_cache.get(0x03, [])
         for packet_type, frames in list(self._state_cache.items()):
             if packet_type == RESP_CODE_SELF_INFO:
                 continue  # already sent by the caller
             if packet_type == 0x03:
                 # Wrap CONTACT frames with synthetic delimiters so the client
                 # receives a well-formed contact dump.
-                n = len(contact_frames)
+                snapshot = list(frames)  # snapshot: list may mutate at await
+                n = len(snapshot)
                 # CONTACTS_START payload: code(1) + count(4, uint32_t LE)
                 # Wire frame: '>'(1) + payload_len_LE(2) + payload(5) = 8 bytes
                 contacts_start = bytes([ord(">"), 5, 0, 0x02]) + struct.pack("<I", n)
                 await self._send_bytes_to_client(state, contacts_start)
-                for frame in frames:
+                most_recent = 0
+                for frame in snapshot:
                     await self._send_bytes_to_client(state, frame)
                     total += 1
-                end_of_contacts = build_backend_frame(0x04)
+                    if len(frame) >= CONTACT_LASTMOD_OFFSET + 4:
+                        lm = struct.unpack_from("<I", frame, CONTACT_LASTMOD_OFFSET)[0]
+                        if lm > most_recent:
+                            most_recent = lm
+                # END_OF_CONTACTS payload: code(1) + most_recent_lastmod(4, uint32_t LE)
+                end_of_contacts = bytes([ord(">"), 5, 0, 0x04]) + struct.pack("<I", most_recent)
                 await self._send_bytes_to_client(state, end_of_contacts)
                 continue
-            for frame in frames:
+            for frame in list(frames):  # snapshot: list may mutate at await
                 await self._send_bytes_to_client(state, frame)
                 total += 1
 
@@ -1025,6 +1038,13 @@ class BroadcastProxy:
         # NO_MORE from the backend is handled by the poll loop; clients receive a
         # locally-generated NO_MORE when they SYNC and nothing is pending.
         if packet_type == RESP_CODE_NO_MORE_MESSAGES:
+            return
+
+        # PUSH_MSG_WAITING from the backend arrives before the poll loop has
+        # retrieved the message.  The proxy generates its own 0x83 after
+        # queueing, so suppress the backend's to avoid a spurious SYNC/NO_MORE
+        # cycle on the client.
+        if packet_type == 0x83:
             return
 
         # Message frames go into the client's pending queue and are served on the
