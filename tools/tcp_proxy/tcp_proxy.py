@@ -275,6 +275,7 @@ class BroadcastProxy:
         # are still cached but forwarding to all clients is suppressed — they
         # have already received the full contact list via cache replay.
         self._in_contact_dump: bool = False
+        self._suppressed_dump_count: int = 0  # contacts suppressed in current dump
 
         self._server: Optional[asyncio.base_events.Server] = None
         self._stop = asyncio.Event()
@@ -884,8 +885,17 @@ class BroadcastProxy:
         # _send_frame_to_client can suppress forwarding to all clients.
         if packet_type == 0x02:  # CONTACTS_START
             self._in_contact_dump = True
+            self._suppressed_dump_count = 0
+            if self._state_cache.get(0x03):
+                self._d("[cache] backend contact dump started — will be suppressed (cache warm)")
         elif packet_type == 0x04:  # END_OF_CONTACTS
             self._in_contact_dump = False
+            if self._suppressed_dump_count:
+                self._d(
+                    f"[cache] backend contact dump suppressed: "
+                    f"{self._suppressed_dump_count} contact(s) discarded (cache is authoritative)"
+                )
+                self._suppressed_dump_count = 0
 
         # Signal the poll loop: got a message (poll again immediately) or
         # queue empty (sleep before next poll).
@@ -1006,20 +1016,16 @@ class BroadcastProxy:
         # replay.  We still cache the frames in _handle_backend_frame so the
         # cache stays fresh — we just don't forward the dump to any client.
         if self._in_contact_dump and self._state_cache.get(0x03):
-            self._d(
-                f"[bkd→{state.client_id}] SUPPRESS type={fmt_ptype(packet_type)} "
-                f"(contacts in cache, dump suppressed for all clients)"
-            )
-            return
+            # Count suppressed contacts once (using the first connected client
+            # as a proxy to avoid multiplying by the number of clients).
+            if packet_type == 0x03 and state is next(iter(self.client_states.values()), None):
+                self._suppressed_dump_count += 1
+            return  # silent: summary logged at END_OF_CONTACTS in _handle_backend_frame
         # Also suppress the END_OF_CONTACTS delimiter when the dump is
         # suppressed (packet_type==0x04 clears _in_contact_dump before we
         # reach here, so check via packet_type directly).
         if packet_type == 0x04 and self._state_cache.get(0x03):
-            self._d(
-                f"[bkd→{state.client_id}] SUPPRESS END_OF_CONTACTS "
-                f"(contacts in cache, dump suppressed)"
-            )
-            return
+            return  # silent: already handled above
 
         # Suppress CHANNEL_INFO if this client got channels via cache replay AND
         # the frame is identical to what was replayed (no actual change).
