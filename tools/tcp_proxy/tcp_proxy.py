@@ -17,9 +17,16 @@ from typing import Deque, Dict, List, Optional
 
 
 CMD_APP_START = 0x01
+CMD_GET_CONTACTS = 0x04
 CMD_SYNC_NEXT_MESSAGE = 0x0A
 RESP_CODE_SELF_INFO = 0x05
 RESP_CODE_NO_MORE_MESSAGES = 0x0A
+
+# Offset of the 4-byte uint32_t LE lastmod field inside a CONTACT wire frame.
+# Wire frame: '>'(1) + len_LE(2) + code(1) + pubkey(32) + type(1) + flags(1)
+#             + out_path_len(1) + out_path(64) + name(32) + last_advert(4)
+#             + lat(4) + lon(4) + lastmod(4) = total 151 bytes
+CONTACT_LASTMOD_OFFSET = 147
 
 # Packet types that are singleton in the cache: the latest frame replaces the
 # previous one (e.g. SELF_INFO / DEVICE_INFO which describe fixed node state).
@@ -656,6 +663,46 @@ class BroadcastProxy:
                             )
                             state.awaiting_replay_after_self_info = True
                             forward_frames.append(frame)
+                    elif command == CMD_GET_CONTACTS:
+                        # Serve the contact list from the proxy cache.  The
+                        # cache is kept fresh by APP_START (cold) and
+                        # PUSH_NEW_ADVERT events, so no backend round-trip is
+                        # needed.  Supports the optional 'since' uint32 LE
+                        # filter (frame[4:8]) so incremental syncs work.
+                        cached_contacts = self._state_cache.get(0x03, [])
+                        if cached_contacts:
+                            since: int = 0
+                            if len(frame) >= 8:
+                                since = struct.unpack_from("<I", frame, 4)[0]
+                            filtered = [
+                                f for f in cached_contacts
+                                if len(f) >= CONTACT_LASTMOD_OFFSET + 4
+                                and struct.unpack_from("<I", f, CONTACT_LASTMOD_OFFSET)[0] > since
+                            ]
+                            most_recent = max(
+                                (struct.unpack_from("<I", f, CONTACT_LASTMOD_OFFSET)[0]
+                                 for f in filtered),
+                                default=since,
+                            )
+                            n = len(filtered)
+                            contacts_start = bytes([ord(">"), 5, 0, 0x02]) + struct.pack("<I", n)
+                            await self._send_bytes_to_client(state, contacts_start)
+                            for cf in filtered:
+                                await self._send_bytes_to_client(state, cf)
+                            # END_OF_CONTACTS includes most_recent_lastmod so the
+                            # app can use it as 'since' on the next call.
+                            eoc = bytes([ord(">"), 5, 0, 0x04]) + struct.pack("<I", most_recent)
+                            await self._send_bytes_to_client(state, eoc)
+                            self._d(
+                                f"[cli→{state.client_id}] GET_CONTACTS since={since} "
+                                f"→ {n}/{len(cached_contacts)} contact(s) from cache"
+                            )
+                        else:
+                            # Cache cold: forward to backend so cache is populated.
+                            self._d(
+                                f"[cli→{state.client_id}] GET_CONTACTS — cache cold, forwarding"
+                            )
+                            forward_frames.append(frame)
                     elif command == CMD_SYNC_NEXT_MESSAGE:
                         # Always served locally from the proxy cache.
                         # The poll loop keeps the cache fresh; client SYNCs are
@@ -886,14 +933,13 @@ class BroadcastProxy:
         if packet_type == 0x02:  # CONTACTS_START
             self._in_contact_dump = True
             self._suppressed_dump_count = 0
-            if self._state_cache.get(0x03):
-                self._d("[cache] backend contact dump started — will be suppressed (cache warm)")
+            self._d("[cache] backend contact dump started")
         elif packet_type == 0x04:  # END_OF_CONTACTS
             self._in_contact_dump = False
             if self._suppressed_dump_count:
                 self._d(
-                    f"[cache] backend contact dump suppressed: "
-                    f"{self._suppressed_dump_count} contact(s) discarded (cache is authoritative)"
+                    f"[cache] backend contact dump done: "
+                    f"{self._suppressed_dump_count} contact(s) received and cached"
                 )
                 self._suppressed_dump_count = 0
 
@@ -1010,22 +1056,14 @@ class BroadcastProxy:
                 )
             return
 
-        # Suppress the backend's contact dump for ALL clients when the cache
-        # already holds contacts.  Every backend APP_START triggers a full
-        # dump, but all clients already received their contacts via cache
-        # replay.  We still cache the frames in _handle_backend_frame so the
-        # cache stays fresh — we just don't forward the dump to any client.
-        if self._in_contact_dump and self._state_cache.get(0x03):
-            # Count suppressed contacts once (using the first connected client
-            # as a proxy to avoid multiplying by the number of clients).
-            if packet_type == 0x03 and state is next(iter(self.client_states.values()), None):
+        # CMD_GET_CONTACTS is now intercepted per-client and served from the
+        # proxy cache, so the backend should no longer receive contact dump
+        # requests.  If a dump arrives anyway (e.g. cold-cache forwarding),
+        # count it for diagnostic purposes but still forward it so the
+        # requesting client gets its response.
+        if self._in_contact_dump and packet_type == 0x03:
+            if state is next(iter(self.client_states.values()), None):
                 self._suppressed_dump_count += 1
-            return  # silent: summary logged at END_OF_CONTACTS in _handle_backend_frame
-        # Also suppress the END_OF_CONTACTS delimiter when the dump is
-        # suppressed (packet_type==0x04 clears _in_contact_dump before we
-        # reach here, so check via packet_type directly).
-        if packet_type == 0x04 and self._state_cache.get(0x03):
-            return  # silent: already handled above
 
         # Suppress CHANNEL_INFO if this client got channels via cache replay AND
         # the frame is identical to what was replayed (no actual change).
