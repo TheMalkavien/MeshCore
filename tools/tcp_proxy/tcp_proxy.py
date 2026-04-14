@@ -49,6 +49,8 @@ CACHE_BLACKLIST_TYPES = {
     0x0C,  # BATT_AND_STORAGE — changes constantly, stale data not useful
     0x0E,  # PRIVATE_KEY     — security-sensitive, must not be replayed
     0x0F,  # DISABLED        — transient feature-flag response
+    0x02,  # CONTACTS_START  — delimiter, rebuilt from CONTACT cache on replay
+    0x04,  # END_OF_CONTACTS — delimiter, rebuilt from CONTACT cache on replay
     0x13,  # SIGN_START      — transient signing session
     0x14,  # SIGNATURE       — transient signing result
     # Unsolicited push events (0x80–0x90): all transient except PUSH_NEW_ADVERT
@@ -885,16 +887,30 @@ class BroadcastProxy:
         total = 0
         # Replay singleton types first (SELF_INFO already sent — skip it),
         # then collections, preserving insertion order within each bucket.
+        contact_frames = self._state_cache.get(0x03, [])
         for packet_type, frames in self._state_cache.items():
             if packet_type == RESP_CODE_SELF_INFO:
                 continue  # already sent by the caller
+            if packet_type == 0x03:
+                # Wrap CONTACT frames with synthetic delimiters so the client
+                # receives a well-formed contact dump.
+                n = len(contact_frames)
+                # CONTACTS_START: '>' + LSB(n) + MSB(n) + 0x02  (count field)
+                contacts_start = bytes([ord(">"), n & 0xFF, (n >> 8) & 0xFF, 0x02])
+                await self._send_bytes_to_client(state, contacts_start)
+                for frame in frames:
+                    await self._send_bytes_to_client(state, frame)
+                    total += 1
+                end_of_contacts = build_backend_frame(0x04)
+                await self._send_bytes_to_client(state, end_of_contacts)
+                continue
             for frame in frames:
                 await self._send_bytes_to_client(state, frame)
                 total += 1
 
         # If contacts were in the cache replay, suppress the backend's upcoming
         # contact dump for this client (cache will still be updated).
-        if self._state_cache.get(0x03):
+        if contact_frames:
             state.suppress_contact_dump = True
 
         n_types = sum(
