@@ -144,7 +144,7 @@ def parse_grp_txt_packet(
     raw_hex: str,
     secret_32: bytes,
     expected_hash_byte: int,
-) -> Optional[Tuple[str, str]]:
+) -> Optional[Tuple[str, str, str]]:
     """
     Parse and decrypt a raw GRP_TXT LoRa packet from its hex representation.
 
@@ -159,9 +159,17 @@ def parse_grp_txt_packet(
                   [3:]   AES-128-ECB ciphertext
                 Decrypted (BaseChatMesh::sendGroupMessage):
                   [0:4]  timestamp (uint32 LE, not forwarded)
-                  [4:]   "sender_name: message_text"  (null-padded)
+                  [4]    txt_type  (0 = PLAIN, skip)
+                  [5:]   "sender_name: message_text"  (null-padded)
 
-    Returns (sender, message) or None.
+    Returns (sender, message, stable_id) or None.
+
+    stable_id is a SHA-256 fingerprint of the MAC+ciphertext.  Unlike the
+    'hash' field in the MQTT JSON (which uses Packet::calculatePacketHash and
+    includes path_len — a value that changes at every relay hop and may also
+    reflect a recycled packet-pool pointer in the MQTT bridge), this fingerprint
+    is identical for the same logical message regardless of which relay heard it
+    or at which hop count.
     """
     try:
         raw = bytes.fromhex(raw_hex)
@@ -204,9 +212,15 @@ def parse_grp_txt_packet(
     if payload[0] != expected_hash_byte:
         return None  # different channel
 
-    plaintext = mac_then_decrypt(secret_32, payload[PATH_HASH_SIZE:])
+    mac_and_cipher = payload[PATH_HASH_SIZE:]
+    plaintext = mac_then_decrypt(secret_32, mac_and_cipher)
     if plaintext is None:
         return None  # wrong PSK or hash collision
+
+    # Stable cross-hop dedup ID: SHA-256 of MAC+ciphertext (hop-invariant).
+    # The JSON 'hash' field is NOT used because Packet::calculatePacketHash()
+    # mixes in path_len which increments at every relay hop.
+    stable_id = hashlib.sha256(mac_and_cipher).hexdigest()[:16].upper()
 
     # Plaintext layout: [0:4] timestamp (LE uint32) | [4] txt_type (0=PLAIN) | [5:] "sender: msg"
     # onChannelMessageRecv receives &data[5], so we must skip 5 bytes, not 4.
@@ -216,8 +230,8 @@ def parse_grp_txt_packet(
     text = plaintext[5:].rstrip(b"\x00").decode("utf-8", errors="replace")
     sep  = text.find(": ")
     if sep >= 0:
-        return text[:sep], text[sep + 2:]
-    return "?", text
+        return text[:sep], text[sep + 2:], stable_id
+    return "?", text, stable_id
 
 
 # ─── Dedup cache ───────────────────────────────────────────────────────────────
@@ -592,18 +606,22 @@ class MeshCoreMQTTBot:
         result = parse_grp_txt_packet(raw_hex, self._secret_32, self._ch_hash)
         if result is None:
             # Either different channel, wrong PSK, or malformed — all silent at DEBUG
-            log.debug(f"[mqtt] packet {pkt_hash}: not our channel or decrypt failed")
+            log.debug(f"[mqtt] packet mqtt_hash={pkt_hash}: not our channel or decrypt failed")
             return
 
-        sender, message = result
+        sender, message, stable_id = result
         self._stats.inc("packets_received")
 
         # ── Deduplication ─────────────────────────────────────────────────────
-        if pkt_hash and self._dedup.is_duplicate(pkt_hash):
+        # Use stable_id (SHA-256 of MAC+ciphertext) instead of the MQTT 'hash'
+        # field.  The MQTT hash includes path_len which changes at every relay
+        # hop, so the same logical message arrives with different hash values
+        # from different nodes.  stable_id is hop-invariant.
+        if self._dedup.is_duplicate(stable_id):
             self._stats.inc("deduplicated")
             log.info(
-                f"[dedup] SKIP {pkt_hash} from {sender!r} "
-                f"(already seen, heard again by {origin!r})"
+                f"[dedup] SKIP id={stable_id} from {sender!r} "
+                f"(already seen, heard again by node {origin!r})"
             )
             return
 
@@ -618,7 +636,7 @@ class MeshCoreMQTTBot:
         tg_text = f"[{sender}] : {message}"
         log.info(
             f"[forward] [{sender}] : {message!r} "
-            f"(hash={pkt_hash}, SNR={snr}, RSSI={rssi})"
+            f"(id={stable_id}, SNR={snr}, RSSI={rssi})"
         )
 
         if self._tg.send(tg_text):
