@@ -498,11 +498,13 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
     } else if (sender_timestamp == 0 && memcmp(command, "log", 3) == 0) {
       _callbacks->dumpLogFile();
       strcpy(reply, "   EOF");
-    } else if (sender_timestamp == 0 && memcmp(command, "stats-packets", 13) == 0 && (command[13] == 0 || command[13] == ' ')) {
+    } else if (memcmp(command, "stats-packets", 13) == 0 && (command[13] == 0 || command[13] == ' ')) {
       _callbacks->formatPacketStatsReply(reply);
-    } else if (sender_timestamp == 0 && memcmp(command, "stats-radio", 11) == 0 && (command[11] == 0 || command[11] == ' ')) {
+    } else if (memcmp(command, "stats-flood", 11) == 0 && (command[11] == 0 || command[11] == ' ')) {
+      _callbacks->formatFloodStatsReply(reply);
+    } else if (memcmp(command, "stats-radio", 11) == 0 && (command[11] == 0 || command[11] == ' ')) {
       _callbacks->formatRadioStatsReply(reply);
-    } else if (sender_timestamp == 0 && memcmp(command, "stats-core", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
+    } else if (memcmp(command, "stats-core", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
       _callbacks->formatStatsReply(reply);
     } else {
       strcpy(reply, "Unknown command");
@@ -1061,42 +1063,4 @@ void CommonCLI::handleRegionCmd(char* command, char* reply) {
   } else {
     strcpy(reply, "Err - ??");
   }
-#endif
-    } else if (memcmp(command, "powersaving on", 14) == 0) {
-      _prefs->powersaving_enabled = 1;
-      savePrefs();
-      strcpy(reply, "ok"); // TODO: to return Not supported if required
-    } else if (memcmp(command, "powersaving off", 15) == 0) {
-      _prefs->powersaving_enabled = 0;
-      savePrefs();
-      strcpy(reply, "ok");
-    } else if (memcmp(command, "powersaving", 11) == 0) {
-      if (_prefs->powersaving_enabled) {
-        strcpy(reply, "on");
-      } else {
-        strcpy(reply, "off");
-      }
-    } else if (memcmp(command, "log start", 9) == 0) {
-      _callbacks->setLoggingOn(true);
-      strcpy(reply, "   logging on");
-    } else if (memcmp(command, "log stop", 8) == 0) {
-      _callbacks->setLoggingOn(false);
-      strcpy(reply, "   logging off");
-    } else if (memcmp(command, "log erase", 9) == 0) {
-      _callbacks->eraseLogFile();
-      strcpy(reply, "   log erased");
-    } else if (sender_timestamp == 0 && memcmp(command, "log", 3) == 0) {
-      _callbacks->dumpLogFile();
-      strcpy(reply, "   EOF");
-    } else if (memcmp(command, "stats-packets", 13) == 0 && (command[13] == 0 || command[13] == ' ')) {
-      _callbacks->formatPacketStatsReply(reply);
-    } else if (memcmp(command, "stats-flood", 11) == 0 && (command[11] == 0 || command[11] == ' ')) {
-      _callbacks->formatFloodStatsReply(reply);
-    } else if (memcmp(command, "stats-radio", 11) == 0 && (command[11] == 0 || command[11] == ' ')) {
-      _callbacks->formatRadioStatsReply(reply);
-    } else if (memcmp(command, "stats-core", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
-      _callbacks->formatStatsReply(reply);
-    } else {
-      strcpy(reply, "Unknown command");
-    }
 }
