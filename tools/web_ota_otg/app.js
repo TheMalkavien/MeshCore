@@ -1436,9 +1436,17 @@ class MeshCoreSerialClient {
   }
 
   async requestContacts(timeoutMs = 10000) {
-    const endPromise = this.waitForEvent(["contacts_end", "error"], null, timeoutMs);
+    const startPromise = this.waitForEvent(["contacts_start", "error"], null, timeoutMs);
     await this.sendFrame(Uint8Array.of(0x04));
-    const evt = await endPromise;
+    const startEvt = await startPromise;
+    if (!startEvt || startEvt.type === "error") {
+      const code = startEvt?.payload?.error_code;
+      throw new Error(`get contacts error${code !== undefined ? ` (code=${code})` : ""}`);
+    }
+    // Scale timeout by contact count: 200ms/contact minimum for BLE, with 3s buffer
+    const count = startEvt.payload.count || 0;
+    const endTimeoutMs = Math.max(timeoutMs, count * 200 + 3000);
+    const evt = await this.waitForEvent(["contacts_end", "error"], null, endTimeoutMs);
     if (!evt || evt.type === "error") {
       const code = evt?.payload?.error_code;
       throw new Error(`get contacts error${code !== undefined ? ` (code=${code})` : ""}`);
