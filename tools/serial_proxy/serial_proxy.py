@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover - depends on local environment
 
 
 CMD_APP_START = 0x01
+CMD_SEND_CHAN_MSG = 0x03
 CMD_GET_CONTACTS = 0x04
 CMD_SYNC_NEXT_MESSAGE = 0x0A
 RESP_CODE_SELF_INFO = 0x05
@@ -742,6 +743,15 @@ class SerialBroadcastProxy:
                                 f"[cli→{state.client_id}] GET_CHANNEL idx={channel_idx} → cache miss, forwarding"
                             )
                             forward_frames.append(frame)
+                    elif command == CMD_SEND_CHAN_MSG and len(frame) >= 11:
+                        # frame[3]=0x03, frame[4]=0x00, frame[5]=chan_idx,
+                        # frame[6:10]=timestamp, frame[10:]=text
+                        chan_idx  = frame[5]
+                        text_data = frame[10:]
+                        forward_frames.append(frame)
+                        asyncio.ensure_future(
+                            self._inject_sent_echo(chan_idx, text_data, state.client_id)
+                        )
                     else:
                         forward_frames.append(frame)
 
@@ -860,6 +870,48 @@ class SerialBroadcastProxy:
                 await asyncio.to_thread(conn.flush)
             except Exception:
                 self.backend_connected.clear()
+
+    async def _inject_sent_echo(self, channel_idx: int, text_data: bytes, exclude_client_id: str) -> None:
+        """Inject a synthetic CHANNEL_MSG_RECV_V3 for a message sent by a client.
+
+        All connected clients except the sender receive the message via the
+        normal PUSH_MSG_WAITING + SYNC mechanism, so both apps see sent messages.
+
+        Companion apps expect the text field as "<sender name>: <message body>".
+        The caller is responsible for formatting text_data that way; this method
+        passes it through unchanged so the sender name is configured upstream
+        (e.g. in Node-RED) rather than here.
+        """
+        import time as _time
+        timestamp = int(_time.time())
+
+        # text_data is expected to already be "SenderName: message body"
+        echo_text = text_data
+
+        payload = bytes([
+            0x11,           # CHANNEL_MSG_RECV_V3
+            0,              # SNR = 0 (synthetic, no RF)
+            0, 0,           # reserved
+            channel_idx,    # canal cible
+            0xFF,           # plen = 255 (flood path)
+            0,              # txt_type = plain text
+        ]) + timestamp.to_bytes(4, "little") + echo_text
+
+        frame = bytes([ord(">"), len(payload) & 0xFF, (len(payload) >> 8) & 0xFF]) + payload
+        self._p(
+            f"[echo] injecting sent msg ch={channel_idx} "
+            f"text={echo_text.decode('utf-8', 'ignore')!r} "
+            f"excluding={exclude_client_id}"
+        )
+
+        # Temporarily remove the sender from the broadcast so they don't
+        # receive their own echo (they already have local display).
+        excluded_state = self.client_states.pop(exclude_client_id, None)
+        try:
+            await self._handle_backend_frame(frame)
+        finally:
+            if excluded_state is not None:
+                self.client_states[exclude_client_id] = excluded_state
 
     def _append_history(self, frame: bytes) -> int:
         seq = self.next_history_seq
