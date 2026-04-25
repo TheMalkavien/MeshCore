@@ -61,24 +61,9 @@ void HeltecV4Board::begin() {
   pinMode(PIN_ADC_CTRL, OUTPUT);
   digitalWrite(PIN_ADC_CTRL, LOW); // Initially inactive
 
-  // Set up digital GPIO registers before releasing RTC hold. The hold latches
-  // the pad state including function select, so register writes accumulate
-  // without affecting the pad. On hold release, all changes apply atomically.
-  pinMode(P_LORA_PA_POWER, OUTPUT);
-  digitalWrite(P_LORA_PA_POWER, HIGH);
-  rtc_gpio_hold_dis((gpio_num_t)P_LORA_PA_POWER);
-
-  pinMode(P_LORA_PA_EN, OUTPUT);
-  digitalWrite(P_LORA_PA_EN, HIGH);
-  rtc_gpio_hold_dis((gpio_num_t)P_LORA_PA_EN);
-
-  pinMode(P_LORA_PA_TX_EN, OUTPUT);
-  digitalWrite(P_LORA_PA_TX_EN, LOW);
+  fem_control.init();
 
   esp_reset_reason_t reason = esp_reset_reason();
-  if (reason != ESP_RST_DEEPSLEEP) {
-    delay(1);  // GC1109 startup time after cold power-on
-  }
 
   periph_power.begin();
   configureLowPowerPins();
@@ -95,13 +80,13 @@ void HeltecV4Board::begin() {
 }
 
 void HeltecV4Board::onBeforeTransmit(void) {
-  digitalWrite(P_LORA_TX_LED, HIGH);   // turn TX LED on
-  digitalWrite(P_LORA_PA_TX_EN, HIGH);
+  digitalWrite(P_LORA_TX_LED, HIGH);
+  fem_control.setTxModeEnable();
 }
 
 void HeltecV4Board::onAfterTransmit(void) {
-  digitalWrite(P_LORA_TX_LED, LOW);   // turn TX LED off
-  digitalWrite(P_LORA_PA_TX_EN, LOW);
+  digitalWrite(P_LORA_TX_LED, LOW);
+  fem_control.setRxModeEnable();
 }
 
 void HeltecV4Board::enterDeepSleep(uint32_t secs, int pin_wake_btn) {
@@ -112,9 +97,7 @@ void HeltecV4Board::enterDeepSleep(uint32_t secs, int pin_wake_btn) {
   rtc_gpio_pulldown_en((gpio_num_t)P_LORA_DIO_1);
   rtc_gpio_hold_en((gpio_num_t)P_LORA_NSS);
 
-  // Hold GC1109 FEM pins during sleep to keep the RX path stable for wakeups.
-  rtc_gpio_hold_en((gpio_num_t)P_LORA_PA_POWER);
-  rtc_gpio_hold_en((gpio_num_t)P_LORA_PA_EN);
+  fem_control.setRxModeEnableWhenMCUSleep();
 
   if (pin_wake_btn < 0) {
     esp_sleep_enable_ext1_wakeup((1L << P_LORA_DIO_1), ESP_EXT1_WAKEUP_ANY_HIGH);

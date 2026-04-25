@@ -4,12 +4,14 @@
 #include <helpers/RefCountedDigitalPin.h>
 #include <helpers/ESP32Board.h>
 #include <driver/rtc_io.h>
+#include "LoRaFEMControl.h"
 
 class HeltecV4Board : public ESP32Board {
   void configureLowPowerPins();
 
 public:
   RefCountedDigitalPin periph_power;
+  LoRaFEMControl fem_control;
   HeltecV4Board() : periph_power(PIN_VEXT_EN, PIN_VEXT_EN_ACTIVE) { }
 
   void begin();
