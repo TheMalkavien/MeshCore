@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import signal
 import struct
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional
@@ -203,6 +204,7 @@ class CompanionStreamParser:
 class BufferedFrame:
     seq: int
     data: bytes
+    timestamp: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -247,6 +249,7 @@ class BroadcastProxy:
         backend_reconnect_delay: float = 1.0,
         history_bytes: int = DEFAULT_HISTORY_BYTES,
         history_frames: int = DEFAULT_HISTORY_FRAMES,
+        history_max_age: int = 86400,
         client_write_timeout: float = DEFAULT_CLIENT_WRITE_TIMEOUT,
         client_queue_frames: int = DEFAULT_CLIENT_QUEUE_FRAMES,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
@@ -260,6 +263,7 @@ class BroadcastProxy:
         self.backend_reconnect_delay = backend_reconnect_delay
         self.history_bytes = max(history_bytes, 0)
         self.history_frames = max(history_frames, 0)
+        self.history_max_age = max(history_max_age, 0)
         self.client_write_timeout = max(client_write_timeout, 0.1)
         self.client_queue_frames = max(client_queue_frames, 1)
         self.poll_interval = max(poll_interval, 0.1)
@@ -454,15 +458,25 @@ class BroadcastProxy:
             self._p(f"[client] {state.client_id} has no app_name, keeping fresh replay state")
             return
 
+        # Inherit cursor from ANY existing session with the same identity, active or
+        # not. This prevents full replay when the old TCP connection hasn't been
+        # detected as dead yet (writer still set) at reconnect time.
+        for other in self.client_states.values():
+            if other is state or other.peer_group != state.peer_group or other.app_name != state.app_name:
+                continue
+            if other.replay_capture_seq > state.replay_capture_seq:
+                state.replay_capture_seq = other.replay_capture_seq
+                self._d(
+                    f"[client] {state.client_id} inherited cursor seq={state.replay_capture_seq} "
+                    f"from {'active' if other.writer is not None else 'inactive'} {other.client_id}"
+                )
+
         previous = self._find_matching_inactive_state(state)
         if previous is None:
             self._p(
                 f"[client] {state.client_id} identified as {state.peer_group} / {state.app_name}, no prior state"
             )
             return
-
-        if previous.replay_capture_seq > state.replay_capture_seq:
-            state.replay_capture_seq = previous.replay_capture_seq
 
         if previous.pending_message_frames:
             state.pending_message_frames = previous.pending_message_frames
@@ -532,23 +546,36 @@ class BroadcastProxy:
 
     def _capture_pending_history(self, state: ClientState) -> None:
         captured_messages = 0
+        skipped_old = 0
+        cutoff = (time.time() - self.history_max_age) if self.history_max_age > 0 else 0.0
+
         for buffered in self.history:
             if buffered.seq <= state.replay_capture_seq:
                 continue
 
-            if get_packet_type(buffered.data) in MESSAGE_PACKET_TYPES:
-                state.pending_message_frames.append(buffered)
-                captured_messages += 1
-
             state.replay_capture_seq = buffered.seq
+
+            if get_packet_type(buffered.data) not in MESSAGE_PACKET_TYPES:
+                continue
+
+            if cutoff and buffered.timestamp < cutoff:
+                skipped_old += 1
+                continue
+
+            state.pending_message_frames.append(buffered)
+            captured_messages += 1
 
         if captured_messages > 0:
             self._p(
                 f"[client] captured {captured_messages} buffered messages for {state.client_id} "
                 f"(up to seq={state.replay_capture_seq})"
+                + (f", skipped {skipped_old} older than {self.history_max_age}s" if skipped_old else "")
             )
         else:
-            self._p(f"[client] no buffered messages to capture for {state.client_id}")
+            self._p(
+                f"[client] no buffered messages to capture for {state.client_id}"
+                + (f" ({skipped_old} too old)" if skipped_old else "")
+            )
 
     async def _send_bytes_to_client(self, state: ClientState, payload: bytes) -> bool:
         async with state.send_lock:
@@ -1163,6 +1190,12 @@ def parse_args():
     ap.add_argument("--reconnect-delay", type=float, default=1.0)
     ap.add_argument("--history-bytes", type=int, default=DEFAULT_HISTORY_BYTES)
     ap.add_argument("--history-frames", type=int, default=DEFAULT_HISTORY_FRAMES)
+    ap.add_argument(
+        "--history-max-age",
+        type=int,
+        default=86400,
+        help="Max age in seconds for replayed messages (0 = no limit, default: 86400 = 24h)",
+    )
     ap.add_argument("--client-write-timeout", type=float, default=DEFAULT_CLIENT_WRITE_TIMEOUT)
     ap.add_argument("--client-queue-frames", type=int, default=DEFAULT_CLIENT_QUEUE_FRAMES)
     ap.add_argument(
@@ -1186,6 +1219,7 @@ async def main_async():
         backend_reconnect_delay=args.reconnect_delay,
         history_bytes=args.history_bytes,
         history_frames=args.history_frames,
+        history_max_age=args.history_max_age,
         client_write_timeout=args.client_write_timeout,
         client_queue_frames=args.client_queue_frames,
         poll_interval=args.poll_interval,
