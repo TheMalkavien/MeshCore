@@ -2192,6 +2192,20 @@ async function sendRemoteReboot(targetHex) {
   }
 
   try {
+    const password = String(ui.targetPassword?.value || "").trim();
+    if (password.length > 0) {
+      appendLog("Tentative de login...");
+      const fullKey = await client.resolveTargetFullKeyForBinary(targetHex);
+      if (!fullKey) {
+        throw new Error("Impossible de résoudre la clé complète de la cible. Renseigne la clé 64 hex.");
+      }
+      const loginRes = await client.sendLogin(fullKey, password);
+      if (!loginRes.ok) {
+        throw new Error(`Authentification échouée: ${loginRes.error}`);
+      }
+      appendLog(`Login OK${loginRes.is_admin ? " (admin)" : ""}`);
+    }
+
     appendLog(`Envoi de la commande reboot à ${targetHex}...`);
     await client.sendRepeaterCmdNoReply(targetHex, "reboot");
     appendLog(`Reboot envoyé avec succès à ${targetHex}`);
