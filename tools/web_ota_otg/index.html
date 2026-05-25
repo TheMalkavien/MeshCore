@@ -640,17 +640,17 @@
 
     // ── Remote reboot button ──
     document.getElementById('rebootBtn').addEventListener('click', async function() {
-      const pills = document.getElementById('nodePills');
-      const selected = pills.querySelector('.pill.selected');
-      
-      if (!selected) {
+      const targetHex = getSelectedTargetHex();
+
+      if (!targetHex || targetHex.length < 12) {
         alert('Sélectionnez un appareil d\'abord');
         return;
       }
-      
-      const targetHex = selected.dataset.hex;
-      
-      if (!confirm(`Êtes-vous sûr de vouloir redémarrer ${selected.textContent}?`)) {
+
+      const targetSelect = document.getElementById('targetSelect');
+      const label = targetSelect?.options[targetSelect.selectedIndex]?.textContent || targetHex;
+
+      if (!confirm(`Êtes-vous sûr de vouloir redémarrer ${label}?`)) {
         return;
       }
       
