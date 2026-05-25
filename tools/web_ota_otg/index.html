@@ -550,6 +550,9 @@
               <input id="tempRadioMins" type="number" min="1" max="240" step="1" value="20">
             </div>
           </div>
+
+          <div class="section-label">Actions</div>
+          <button type="button" id="rebootBtn" class="btn btn-secondary">Reboot à distance</button>
         </div><!-- /advanced-body -->
       </div>
     </div>
@@ -634,6 +637,30 @@
         document.getElementById('step1badge').classList.remove('done');
       }
     };
+
+    // ── Remote reboot button ──
+    document.getElementById('rebootBtn').addEventListener('click', async function() {
+      const pills = document.getElementById('nodePills');
+      const selected = pills.querySelector('.pill.selected');
+      
+      if (!selected) {
+        alert('Sélectionnez un appareil d\'abord');
+        return;
+      }
+      
+      const targetHex = selected.dataset.hex;
+      
+      if (!confirm(`Êtes-vous sûr de vouloir redémarrer ${selected.textContent}?`)) {
+        return;
+      }
+      
+      this.disabled = true;
+      try {
+        await sendRemoteReboot(targetHex);
+      } finally {
+        this.disabled = false;
+      }
+    });
   </script>
 
   <script defer src="./app.js?v=20260307-ble1"></script>
