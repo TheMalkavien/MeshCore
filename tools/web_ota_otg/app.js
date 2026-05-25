@@ -2185,6 +2185,29 @@ async function abortTargetOtaSession(targetHex, targetFullKeyHex = "", reason = 
   return false;
 }
 
+async function sendRemoteReboot(targetHex) {
+  if (!targetHex) {
+    setStatus("Erreur: Pas de cible sélectionnée");
+    return { error: true, message: "No target selected" };
+  }
+
+  try {
+    appendLog(`Envoi de la commande reboot à ${targetHex}...`);
+    setStatus("Envoi du reboot...");
+    
+    await client.sendRepeaterCmdNoReply(targetHex, "reboot");
+    
+    appendLog(`Reboot envoyé avec succès à ${targetHex}`);
+    setStatus("Reboot envoyé");
+    return { error: false };
+  } catch (e) {
+    const msg = e.message || String(e);
+    appendLog(`Erreur lors du reboot: ${msg}`);
+    setStatus(`Erreur: ${msg}`);
+    return { error: true, message: msg };
+  }
+}
+
 async function runBinaryOta(params) {
   const {
     targetHex,
@@ -2492,6 +2515,7 @@ async function runBinaryOta(params) {
     }
     shouldCleanupTargetOta = false;
 
+    await sleep(1000);
     await client.sendRepeaterCmdNoReply(targetHex, "reboot");
 
     const durationSec = (performance.now() - tStart) / 1000.0;
@@ -2839,6 +2863,7 @@ async function runTextOta(params) {
     }
     shouldCleanupTargetOta = false;
 
+    await sleep(1000);
     await client.sendRepeaterCmdNoReply(targetHex, "reboot");
 
     const durationSec = (performance.now() - tStart) / 1000.0;
