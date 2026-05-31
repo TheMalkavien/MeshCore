@@ -12,6 +12,7 @@ import asyncio
 import itertools
 import logging
 import signal
+import socket
 import struct
 import time
 from collections import deque
@@ -704,6 +705,22 @@ class BroadcastProxy:
             except Exception:
                 pass
             return
+
+        # Enable TCP keepalive so the OS detects half-open (zombie) connections.
+        # Without this, a client that disappears without a TCP FIN/RST can leave
+        # a phantom active connection for hours if no data is written to it.
+        _sock = writer.transport.get_extra_info("socket")
+        if _sock is not None:
+            try:
+                _sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                if hasattr(socket, "TCP_KEEPIDLE"):   # Linux
+                    _sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                if hasattr(socket, "TCP_KEEPINTVL"):
+                    _sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                if hasattr(socket, "TCP_KEEPCNT"):
+                    _sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            except Exception as exc:
+                self._logger.debug("[client] could not set keepalive on %s: %s", peer, exc)
 
         state = await self._register_client(peer_group, writer)
         self._logger.info(
