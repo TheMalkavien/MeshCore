@@ -109,7 +109,9 @@ DEFAULT_CLIENT_WRITE_TIMEOUT = 2.0
 DEFAULT_CLIENT_QUEUE_FRAMES = 512
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_MAX_CLIENTS = 32
-DEFAULT_INACTIVE_STATE_MAX_AGE = 3600
+# Keep inactive client cursors for as long as the message history (86400 = 24h).
+# Pruning cursors earlier than the history window causes full replays on reconnect.
+DEFAULT_INACTIVE_STATE_MAX_AGE = 86400
 DEFAULT_CACHE_BUCKET_MAX = 256
 DEFAULT_RECONNECT_BACKOFF_MAX = 60.0
 
@@ -1296,7 +1298,8 @@ def parse_args():
         "--inactive-state-max-age",
         type=float,
         default=DEFAULT_INACTIVE_STATE_MAX_AGE,
-        help="Seconds before an inactive client state is pruned (0 = never, default: %(default)s)",
+        help="Seconds before an inactive client state is pruned (0 = never, default: %(default)s). "
+             "Should be >= --history-max-age to avoid full replays on reconnect.",
     )
     ap.add_argument(
         "--cache-bucket-max",
