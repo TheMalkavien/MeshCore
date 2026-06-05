@@ -37,6 +37,7 @@ static bool isUsbOffCommand(const char *cmd) {
 // For power saving
 unsigned long lastActive = 0; // mark last active time
 unsigned long nextSleepinSecs = 60; // next sleep in seconds. The first sleep (if enabled) is after 1 minutes from boot
+unsigned long POWERSAVING_FIRSTSLEEP_SECS = 120; // The first sleep (if enabled) from boot
 
 #if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_)
 static unsigned long userBtnDownAt = 0;
@@ -58,9 +59,6 @@ void setup() {
   // boot debug messages can be seen on terminal
   delay(5000);
 #endif
-
-  // For power saving
-  lastActive = millis(); // mark last active time since boot
 
 #ifdef DISPLAY_CLASS
   if (display.begin()) {
