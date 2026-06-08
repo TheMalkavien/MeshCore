@@ -38,5 +38,34 @@ void PicoWBoard::begin() {
 }
 
 bool PicoWBoard::startOTAUpdate(const char* id, char reply[]) {
+#if defined(ARDUINO_ARCH_RP2040)
+  rp2040_enter_ota_profile();
+#endif
   return ota.startSession(id, reply);
+}
+
+bool PicoWBoard::handleOTACommand(const char *command, char reply[]) {
+#if defined(ARDUINO_ARCH_RP2040)
+  rp2040_enter_ota_profile();
+#endif
+  bool ok = ota.handleCommand(command, reply);
+#if defined(ARDUINO_ARCH_RP2040)
+  if (!ota.isSleepInhibited()) {
+    rp2040_restore_active_profile();
+  }
+#endif
+  return ok;
+}
+
+bool PicoWBoard::handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) {
+#if defined(ARDUINO_ARCH_RP2040)
+  rp2040_enter_ota_profile();
+#endif
+  bool ok = ota.handleBinaryCommand(opcode, payload, payload_len, reply);
+#if defined(ARDUINO_ARCH_RP2040)
+  if (!ota.isSleepInhibited()) {
+    rp2040_restore_active_profile();
+  }
+#endif
+  return ok;
 }
