@@ -29,7 +29,9 @@
  *              |    100k
  *    BAT- -----+
  */
-#define PIN_VBAT_READ            26
+#ifndef PIN_VBAT_READ
+  #define PIN_VBAT_READ          26
+#endif
 #define BATTERY_SAMPLES          8
 #define ADC_MULTIPLIER           (3.0f * 3.3f * 1000)
 
