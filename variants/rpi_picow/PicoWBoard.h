@@ -4,6 +4,10 @@
 #include <Arduino.h>
 #include <helpers/RP2040OTA.h>
 
+#if defined(ARDUINO_ARCH_RP2040)
+  #include <hardware/clocks.h>
+#endif
+
 // built-ins
 #define  PIN_VBAT_READ    26
 #define  ADC_MULTIPLIER   (3.1 * 3.3 * 1000) // MT Uses 3.1
@@ -50,8 +54,41 @@ public:
   }
 
   bool startOTAUpdate(const char* id, char reply[]) override;
-  bool handleOTACommand(const char *command, char reply[]) override { return ota.handleCommand(command, reply); }
-  bool handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) override {
-    return ota.handleBinaryCommand(opcode, payload, payload_len, reply);
-  }
+  bool handleOTACommand(const char *command, char reply[]) override;
+  bool handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) override;
 };
+
+#if defined(ARDUINO_ARCH_RP2040)
+#ifndef RP2040_ACTIVE_CLOCK_MHZ
+  #ifdef RP2040_CPU_FREQ_MHZ
+    #define RP2040_ACTIVE_CLOCK_MHZ RP2040_CPU_FREQ_MHZ
+  #else
+    #define RP2040_ACTIVE_CLOCK_MHZ 125
+  #endif
+#endif
+
+#ifndef RP2040_OTA_CLOCK_MHZ
+  #define RP2040_OTA_CLOCK_MHZ 125
+#endif
+
+inline void rp2040_apply_clock_profile(uint32_t clock_mhz) {
+  set_sys_clock_khz(clock_mhz * KHZ, false);
+  clock_configure(clk_peri,
+                  0,
+                  CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+                  clock_mhz * MHZ,
+                  clock_mhz * MHZ);
+  clock_configure(clk_adc, 0,
+                  CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                  clock_mhz * MHZ, clock_mhz * MHZ);
+  clock_configure(clk_rtc, 0, CLOCKS_CLK_RTC_CTRL_AUXSRC_VALUE_XOSC_CLKSRC, 12 * MHZ, 46875);
+}
+
+inline void rp2040_restore_active_profile() {
+  rp2040_apply_clock_profile(RP2040_ACTIVE_CLOCK_MHZ);
+}
+
+inline void rp2040_enter_ota_profile() {
+  rp2040_apply_clock_profile(RP2040_OTA_CLOCK_MHZ);
+}
+#endif

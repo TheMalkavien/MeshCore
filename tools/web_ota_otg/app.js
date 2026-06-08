@@ -3106,10 +3106,13 @@ async function applyTempRadioPresetForOta(targetHex, preset) {
   appendLog("Target tempradio: commande envoyee (pas d'ACK attendu).");
 
   const suggested = Number(sentEvt.payload?.suggested_timeout || 0);
+  // The firmware delays the actual radio switch by 2000ms (futureMillis(2000) in MyMesh.cpp)
+  // to let the CLI reply be sent back on the old frequency first.
+  // Guard must exceed: airTime(tempradio_packet) + 2000ms firmware delay + margin.
   const computedGuard = Number.isFinite(suggested) && suggested > 0
-    ? Math.round((suggested / 800.0) * 1000.0 * 0.6)
+    ? Math.round(suggested + 2200)
     : 0;
-  const dispatchGuardMs = clamp(computedGuard || 1200, 800, 2500);
+  const dispatchGuardMs = clamp(computedGuard || 2400, 2200, 4000);
   appendLog(`Attente ${dispatchGuardMs}ms pour laisser partir la commande tempradio...`);
   await sleep(dispatchGuardMs);
 

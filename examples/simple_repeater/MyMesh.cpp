@@ -364,6 +364,7 @@ void MyMesh::processFloodRetries() {
   }
 #endif
 }
+
 void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
 #if MAX_NEIGHBOURS // check if neighbours enabled
   // find existing neighbour, else use least recently updated
