@@ -9,6 +9,7 @@
 #endif
 #ifdef MLK_RP2040_LOWPOWER
   #include <hardware/vreg.h>
+  #include <hardware/timer.h>
 #endif
 
 // LoRa radio module pins for Waveshare RP2040-LoRa-HF/LF
@@ -137,6 +138,7 @@ inline void rp2040_enter_sleep_profile() {
 inline void rp2040_restore_active_profile() {
 #ifdef MLK_RP2040_LOWPOWER
   vreg_set_voltage(VREG_VOLTAGE_DEFAULT);
+  busy_wait_us(200);
 #endif
   rp2040_apply_clock_profile(RP2040_ACTIVE_CLOCK_MHZ);
 }
@@ -144,6 +146,7 @@ inline void rp2040_restore_active_profile() {
 inline void rp2040_enter_ota_profile() {
 #ifdef MLK_RP2040_LOWPOWER
   vreg_set_voltage(VREG_VOLTAGE_DEFAULT);
+  busy_wait_us(200);
 #endif
   rp2040_apply_clock_profile(RP2040_OTA_CLOCK_MHZ);
 }
