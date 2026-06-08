@@ -25,7 +25,9 @@
  *              |    100k
  *    BAT- -----+
  */
-#define PIN_VBAT_READ            28
+#ifndef PIN_VBAT_READ
+  #define PIN_VBAT_READ          28
+#endif
 #define BATTERY_SAMPLES          8
 #define ADC_MULTIPLIER           (3.0f * 3.3f * 1000)
 
@@ -82,7 +84,16 @@ public:
 #endif
 
 inline void rp2040_apply_clock_profile(uint32_t clock_mhz) {
-  set_sys_clock_khz(clock_mhz * 1000, true);
+  set_sys_clock_khz(clock_mhz * KHZ, false);
+  clock_configure(clk_peri,
+                  0,
+                  CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+                  clock_mhz * MHZ,
+                  clock_mhz * MHZ);
+  clock_configure(clk_adc, 0,
+                  CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                  clock_mhz * MHZ, clock_mhz * MHZ);
+  clock_configure(clk_rtc, 0, CLOCKS_CLK_RTC_CTRL_AUXSRC_VALUE_XOSC_CLKSRC, 12 * MHZ, 46875);
 }
 
 inline void rp2040_restore_active_profile() {
