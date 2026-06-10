@@ -491,12 +491,14 @@ bool RP2040OTAController::handleBinaryCommand(uint8_t opcode, const uint8_t *pay
       char hex_buf[(OTA_CMD_MAX_CHUNK_BYTES * 2) + 1];
       bytesToHex(chunk, chunk_len, hex_buf);
 
-      char cmd[16 + sizeof(hex_buf)];
+      // 24 covers "write " + up to 10 digits of offset + space + NUL, so a
+      // max-size chunk at a 32-bit offset still fits without snprintf truncation.
+      char cmd[24 + sizeof(hex_buf)];
       snprintf(cmd, sizeof(cmd), "write %lu %s", (unsigned long) offset, hex_buf);
       bool ok = handleCommand(cmd, reply);
       // Suppress write ACK in binary transport: the ACK TX collides with the
       // BIN_OP_STATUS immediately following. Progress is verified via BIN_OP_STATUS.
-      if (reply[0] == 'O') reply[0] = 0;
+      if (reply[0] == 'O' && reply[1] == 'K') reply[0] = 0;
       return ok;
     }
 

@@ -38,7 +38,13 @@ bool WaveshareBoard::startOTAUpdate(const char *id, char reply[]) {
 
 bool WaveshareBoard::handleOTACommand(const char *command, char reply[]) {
 #if defined(ARDUINO_ARCH_RP2040)
-  rp2040_enter_ota_profile();
+  // Only switch to the OTA clock/voltage profile when not already in it. During
+  // an active session isSleepInhibited() stays true, so the profile persists and
+  // we avoid re-running set_sys_clock_khz/vreg (and the 200us settle on lowpower)
+  // on every command.
+  if (!ota.isSleepInhibited()) {
+    rp2040_enter_ota_profile();
+  }
 #endif
   bool ok = ota.handleCommand(command, reply);
 #if defined(ARDUINO_ARCH_RP2040)
@@ -51,7 +57,11 @@ bool WaveshareBoard::handleOTACommand(const char *command, char reply[]) {
 
 bool WaveshareBoard::handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) {
 #if defined(ARDUINO_ARCH_RP2040)
-  rp2040_enter_ota_profile();
+  // See handleOTACommand: skip the profile switch while a session is already
+  // active so per-chunk writes don't thrash the system PLL feeding the radio SPI.
+  if (!ota.isSleepInhibited()) {
+    rp2040_enter_ota_profile();
+  }
 #endif
   bool ok = ota.handleBinaryCommand(opcode, payload, payload_len, reply);
 #if defined(ARDUINO_ARCH_RP2040)
