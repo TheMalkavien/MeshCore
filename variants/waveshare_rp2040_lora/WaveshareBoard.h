@@ -61,7 +61,9 @@ public:
     }
     raw = raw / BATTERY_SAMPLES;
 
-    return (adc_mult * raw * 1000) / 4096;
+    // adc_mult is already a full-scale millivolt multiplier (ADC_MULTIPLIER ~= 9900),
+    // matching the convention used by every other board: (mult * raw) / 4096 -> mV.
+    return (adc_mult * raw) / 4096;
 #else
     return 0;
 #endif
@@ -116,7 +118,11 @@ public:
 #endif
 
 inline void rp2040_apply_clock_profile(uint32_t clock_mhz) {
-  set_sys_clock_khz(clock_mhz * KHZ, false);
+  if (!set_sys_clock_khz(clock_mhz * KHZ, false)) {
+    // Requested frequency not achievable: clk_sys is unchanged, so leave the
+    // derived clocks alone rather than re-deriving them from a wrong base.
+    return;
+  }
 
   // Keep SPI, ADC and RTC on coherent clock sources after changing clk_sys.
   clock_configure(clk_peri,

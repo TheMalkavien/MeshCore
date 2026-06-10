@@ -72,7 +72,11 @@ public:
 #endif
 
 inline void rp2040_apply_clock_profile(uint32_t clock_mhz) {
-  set_sys_clock_khz(clock_mhz * KHZ, false);
+  if (!set_sys_clock_khz(clock_mhz * KHZ, false)) {
+    // Requested frequency not achievable: clk_sys is unchanged, so leave the
+    // derived clocks alone rather than re-deriving them from a wrong base.
+    return;
+  }
   clock_configure(clk_peri,
                   0,
                   CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
