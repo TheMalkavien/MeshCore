@@ -625,13 +625,17 @@ function estimateOtaRadioProfile(radioBwKhz, radioSf, radioCr) {
   else if (airFactor <= 5.0) chunkText = 64;
   else if (airFactor <= 10.0) chunkText = 56;
 
-  let ackEvery = 2;
+  // The firmware suppresses every per-write ACK in binary transport (no more
+  // ACK/STATUS collision), so larger batches between STATUS checkpoints are safe.
+  // On very slow links (high airFactor) the STATUS round-trip dominates wall-clock,
+  // so batching aggressively is the main lever for OTA duration.
+  let ackEvery = 6;
   if (airFactor <= 0.25) ackEvery = 12;
   else if (airFactor <= 0.6) ackEvery = 10;
   else if (airFactor <= 1.2) ackEvery = 8;
   else if (airFactor <= 2.5) ackEvery = 6;
-  else if (airFactor <= 5.0) ackEvery = 4;
-  else if (airFactor <= 10.0) ackEvery = 3;
+  else if (airFactor <= 5.0) ackEvery = 5;
+  else if (airFactor <= 10.0) ackEvery = 4;
 
   const noAckGapSec = clamp(0.015 + (0.025 * airFactor), 0.015, 0.45);
   const checkpointTimeoutSec = clamp(0.9 + (0.9 * airFactor), 1.5, 12.0);
