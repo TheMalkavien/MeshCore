@@ -146,7 +146,11 @@ void Dispatcher::loop() {
 
 #if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
   // Idle the core until next interrupt (SysTick or radio IRQ) to trim idle current.
-  __asm volatile("wfi");
+  // Skip while a packet is in flight or queued for TX, so outbound work isn't
+  // delayed by up to one SysTick (~1ms) per loop.
+  if (outbound == NULL && _mgr->getOutboundTotal() == 0) {
+    __asm volatile("wfi");
+  }
 #endif
 }
 

@@ -176,7 +176,9 @@ void loop() {
 
   if (the_mesh.getNodePrefs()->powersaving_enabled) {
     #if defined(NRF52_PLATFORM)
-    board.sleep(1800); // nrf ignores seconds param, sleeps whenever possible
+    if (!the_mesh.hasPendingWork()) {
+      board.sleep(1800); // nrf ignores seconds param, sleeps whenever possible
+    }
     #else
     if (the_mesh.hasPendingWork()) {
       // Keep postponing sleep while work is pending.
