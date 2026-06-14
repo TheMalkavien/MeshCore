@@ -23,7 +23,10 @@ from typing import Optional
 CMD_APP_START = 0x01
 CMD_SEND_CHAN_MSG = 0x03
 CMD_GET_CONTACTS = 0x04
+CMD_ADD_UPDATE_CONTACT = 0x09
 CMD_SYNC_NEXT_MESSAGE = 0x0A
+CMD_RESET_PATH = 0x0D
+CMD_REMOVE_CONTACT = 0x0F
 RESP_CODE_SELF_INFO = 0x05
 RESP_CODE_NO_MORE_MESSAGES = 0x0A
 
@@ -105,6 +108,7 @@ DEFAULT_MAX_CLIENTS = 32
 DEFAULT_INACTIVE_STATE_MAX_AGE = 86400
 DEFAULT_CACHE_BUCKET_MAX = 256
 DEFAULT_RECONNECT_BACKOFF_MAX = 60.0
+DEFAULT_BACKEND_WRITE_TIMEOUT = 10.0
 
 # RESP_CODE_CONTACT_MSG_RECV / CHANNEL_MSG_RECV  (v<3 : 0x07, 0x08)
 # RESP_CODE_CONTACT_MSG_RECV_V3 / CHANNEL_MSG_RECV_V3  (v≥3 : 0x10, 0x11)
@@ -313,6 +317,12 @@ class BroadcastProxy:
         # (between CONTACTS_START and END_OF_CONTACTS).
         self._in_contact_dump: bool = False
         self._suppressed_dump_count: int = 0
+        # Set when a client mutates contacts (add/update/reset-path): the next
+        # GET_CONTACTS forces a full backend refresh to rebuild the stale cache.
+        self._contacts_dirty: bool = False
+        # True while an authoritative full (since=0) contact dump is rebuilding
+        # the cache, so the stale 0x03 bucket is cleared on CONTACTS_START.
+        self._contacts_rebuild_pending: bool = False
 
         self._server: Optional[asyncio.base_events.Server] = None
         self._stop = asyncio.Event()
@@ -542,6 +552,49 @@ class BroadcastProxy:
     def _reset_client_runtime_state(self, state: ClientState) -> None:
         state.awaiting_replay_after_self_info = False
 
+    def _on_background_task_done(self, task: asyncio.Task) -> None:
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._logger.warning("[task] background %s failed: %s", task.get_name(), exc)
+
+    def _close_writer_background(self, writer: asyncio.StreamWriter) -> None:
+        """Close a client writer without blocking the caller.
+
+        Used from the backend broadcast path: awaiting wait_closed() on a
+        half-open client there would stall delivery to every other client.
+        """
+        async def _closer() -> None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+        task = asyncio.create_task(_closer(), name="close-writer")
+        self._background_tasks.add(task)
+        task.add_done_callback(self._on_background_task_done)
+
+    def _evict_contact_from_cache(self, pubkey: bytes) -> None:
+        """Remove a contact (and any cached advert) from the state cache by pubkey."""
+        end = PUBKEY_OFFSET + PUBKEY_SIZE
+        for pt in (0x03, 0x8A):
+            bucket = self._state_cache.get(pt)
+            if not bucket:
+                continue
+            kept = [
+                f for f in bucket
+                if not (len(f) >= end and f[PUBKEY_OFFSET:end] == pubkey)
+            ]
+            if len(kept) != len(bucket):
+                self._state_cache[pt] = kept
+                self._logger.info(
+                    "[cache] evicted contact pubkey=%s… from %s (now %d)",
+                    pubkey[:4].hex(), fmt_ptype(pt), len(kept),
+                )
+
     async def _client_sender(
         self, state: ClientState, writer: asyncio.StreamWriter
     ) -> None:
@@ -654,11 +707,10 @@ class BroadcastProxy:
                     writer_to_close = writer
                 self._cancel_sender_task(state)
         if writer_to_close is not None:
-            try:
-                writer_to_close.close()
-                await writer_to_close.wait_closed()
-            except Exception:
-                pass
+            # Close in the background: this can run inside the backend broadcast
+            # loop, where awaiting wait_closed() on a half-open client would stall
+            # delivery to every other client until the OS TCP timeout fires.
+            self._close_writer_background(writer_to_close)
         return False
 
     async def _serve_pending_message(self, state: ClientState) -> bool:
@@ -779,7 +831,7 @@ class BroadcastProxy:
                             forward_frames.append(frame)
                     elif command == CMD_GET_CONTACTS:
                         cached_contacts = self._state_cache.get(0x03, [])
-                        if cached_contacts:
+                        if cached_contacts and not self._contacts_dirty:
                             since: int = 0
                             if len(frame) >= 8:
                                 since = struct.unpack_from("<I", frame, 4)[0]
@@ -804,11 +856,41 @@ class BroadcastProxy:
                                 "[cli→%s] GET_CONTACTS since=%d → %d/%d contact(s) from cache",
                                 state.client_id, since, n, len(cached_contacts),
                             )
+                        elif self._contacts_dirty:
+                            # A contact was mutated: rebuild the cache from an
+                            # authoritative full (since=0) backend dump instead of
+                            # serving stale data.
+                            self._contacts_dirty = False
+                            self._contacts_rebuild_pending = True
+                            forward_frames.append(bytes((ord("<"), 1, 0, CMD_GET_CONTACTS)))
+                            self._logger.debug(
+                                "[cli→%s] GET_CONTACTS — cache dirty, forcing full refresh",
+                                state.client_id,
+                            )
                         else:
                             self._logger.debug(
                                 "[cli→%s] GET_CONTACTS — cache cold, forwarding", state.client_id
                             )
                             forward_frames.append(frame)
+                    elif command == CMD_REMOVE_CONTACT and len(frame) >= PUBKEY_OFFSET + PUBKEY_SIZE:
+                        # Forward the delete AND evict the contact from the cache
+                        # immediately, so reconnecting clients are not re-served a
+                        # ghost contact (which would reappear in the app and then
+                        # fail on a second delete with ERR_NOT_FOUND).
+                        pubkey = frame[PUBKEY_OFFSET:PUBKEY_OFFSET + PUBKEY_SIZE]
+                        forward_frames.append(frame)
+                        self._evict_contact_from_cache(pubkey)
+                    elif command in (CMD_ADD_UPDATE_CONTACT, CMD_RESET_PATH):
+                        # The backend mutates the contact (rename / path / flags) but
+                        # does not echo a fresh CONTACT frame, so the cached copy goes
+                        # stale. Mark the cache dirty to force a refresh on the next
+                        # GET_CONTACTS.
+                        forward_frames.append(frame)
+                        self._contacts_dirty = True
+                        self._logger.debug(
+                            "[cli→%s] contact mutation cmd=0x%02X → cache marked dirty",
+                            state.client_id, command,
+                        )
                     elif command == CMD_SYNC_NEXT_MESSAGE:
                         # Always served locally from the proxy cache.
                         self._logger.debug("[cli→%s] SYNC → serving locally", state.client_id)
@@ -843,7 +925,7 @@ class BroadcastProxy:
                             name=f"echo-ch{chan_idx}-{state.client_id}",
                         )
                         self._background_tasks.add(task)
-                        task.add_done_callback(self._background_tasks.discard)
+                        task.add_done_callback(self._on_background_task_done)
                     else:
                         forward_frames.append(frame)
 
@@ -872,6 +954,11 @@ class BroadcastProxy:
                 await writer.wait_closed()
             except Exception:
                 pass
+            # Drop never-identified phantom connections immediately instead of
+            # keeping them until the 24h prune: they can never be re-adopted and
+            # would be scanned on every backend frame.
+            if not state.app_name:
+                self.client_states.pop(state.client_id, None)
             self._logger.info(
                 "[client] disconnected %s as %s (clients=%d)",
                 peer, state.client_id, self._connected_client_count(),
@@ -896,8 +983,11 @@ class BroadcastProxy:
 
             self._reconnect_attempt = 0
             try:
-                while not self._stop.is_set():
-                    data = await self.backend_reader.read(65536)
+                while not self._stop.is_set() and self.backend_connected.is_set():
+                    reader = self.backend_reader
+                    if reader is None:
+                        break
+                    data = await reader.read(65536)
                     if not data:
                         raise ConnectionError("backend closed")
 
@@ -933,6 +1023,10 @@ class BroadcastProxy:
     async def _close_backend(self) -> None:
         self.backend_connected.clear()
         self.backend_parser.reset()
+        # Reset contact-dump tracking so stale state cannot leak across reconnects.
+        self._in_contact_dump = False
+        self._suppressed_dump_count = 0
+        self._contacts_rebuild_pending = False
         # Unblock the poll loop if it is waiting for a backend response.
         self._poll_event.set()
         writer = self.backend_writer
@@ -966,14 +1060,26 @@ class BroadcastProxy:
 
     async def _send_to_backend(self, data: bytes) -> None:
         async with self.backend_lock:
-            if not self.backend_writer or self._stop.is_set():
+            writer = self.backend_writer
+            if not writer or self._stop.is_set():
                 return
             try:
-                self.backend_writer.write(data)
-                await self.backend_writer.drain()
+                writer.write(data)
+                # Bound the drain: holding backend_lock across an unbounded drain()
+                # would freeze the poll loop and all client forwarding if the backend
+                # peer stops reading (its TCP receive window closes).
+                await asyncio.wait_for(writer.drain(), timeout=DEFAULT_BACKEND_WRITE_TIMEOUT)
             except Exception as exc:
                 self._logger.info("[backend] write error: %s", exc)
+                # Drop the wedged connection so the read loop sees EOF and reconnects.
                 self.backend_connected.clear()
+                self._poll_event.set()
+                self.backend_reader = None
+                self.backend_writer = None
+                try:
+                    writer.close()
+                except Exception:
+                    pass
 
     async def _inject_sent_echo(self, channel_idx: int, text_data: bytes, exclude_client_id: str) -> None:
         """Inject a synthetic CHANNEL_MSG_RECV_V3 for a message sent by a client.
@@ -1106,15 +1212,24 @@ class BroadcastProxy:
         if packet_type == 0x02:  # CONTACTS_START
             self._in_contact_dump = True
             self._suppressed_dump_count = 0
+            if self._contacts_rebuild_pending:
+                # Authoritative full refresh: drop the stale contact cache so
+                # backend-side deletions and renames are reflected after rebuild.
+                self._state_cache[0x03] = []
+                self._logger.debug("[cache] contact cache cleared for full rebuild")
             self._logger.debug("[cache] backend contact dump started")
         elif packet_type == 0x04:  # END_OF_CONTACTS
             self._in_contact_dump = False
+            self._contacts_rebuild_pending = False
             if self._suppressed_dump_count:
                 self._logger.debug(
                     "[cache] backend contact dump done: %d contact(s) received and cached",
                     self._suppressed_dump_count,
                 )
                 self._suppressed_dump_count = 0
+        elif packet_type == 0x8F:  # PUSH_CONTACT_DELETED — backend auto-evicted a contact
+            if len(frame) >= PUBKEY_OFFSET + PUBKEY_SIZE:
+                self._evict_contact_from_cache(frame[PUBKEY_OFFSET:PUBKEY_OFFSET + PUBKEY_SIZE])
 
         # Signal the poll loop only for real backend frames, not synthetic echoes.
         if not synthetic:
