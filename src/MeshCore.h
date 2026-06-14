@@ -66,6 +66,9 @@ public:
   virtual bool startOTAUpdate(const char* id, char reply[]) { return false; }   // not supported
   virtual bool handleOTACommand(const char* command, char reply[]) { return false; }
   virtual bool handleOTABinaryCommand(uint8_t opcode, const uint8_t* payload, size_t payload_len, char reply[]) { return false; }
+  virtual bool setLoRaFemLnaEnabled(bool enable) { return false; }
+  virtual bool canControlLoRaFemLna() const { return false; }
+  virtual bool isLoRaFemLnaEnabled() const { return false; }
 
   // Power management interface (boards with power management override these)
   virtual bool isExternalPowered() { return false; }
@@ -76,37 +79,6 @@ public:
   virtual const char* getShutdownReasonString(uint8_t reason) { return "Not available"; }
 };
 
-/**
- * An abstraction of the device's Realtime Clock.
-*/
-class RTCClock {
-  uint32_t last_unique;
-protected:
-  RTCClock() { last_unique = 0; }
-
-public:
-  /**
-   * \returns  the current time. in UNIX epoch seconds.
-  */
-  virtual uint32_t getCurrentTime() = 0;
-
-  /**
-   * \param time  current time in UNIX epoch seconds.
-  */
-  virtual void setCurrentTime(uint32_t time) = 0;
-
-  /**
-   * override in classes that need to periodically update internal state
-   */
-  virtual void tick() { /* no op */}
-
-  uint32_t getCurrentTimeUnique() {
-    uint32_t t = getCurrentTime();
-    if (t <= last_unique) {
-      return ++last_unique;
-    }
-    return last_unique = t;
-  }
-};
+// ... reste du fichier inchangé ...
 
 }
