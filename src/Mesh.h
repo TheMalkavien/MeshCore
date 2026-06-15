@@ -1,5 +1,7 @@
 #pragma once
 
+#include <MeshCore.h>
+
 #include <Dispatcher.h>
 
 namespace mesh {

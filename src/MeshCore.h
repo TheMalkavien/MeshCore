@@ -79,6 +79,37 @@ public:
   virtual const char* getShutdownReasonString(uint8_t reason) { return "Not available"; }
 };
 
-// ... reste du fichier inchangé ...
+/**
+ * An abstraction of the device's Realtime Clock.
+*/
+class RTCClock {
+  uint32_t last_unique;
+protected:
+  RTCClock() { last_unique = 0; }
+
+public:
+  /**
+   * \returns  the current time. in UNIX epoch seconds.
+  */
+  virtual uint32_t getCurrentTime() = 0;
+
+  /**
+   * \param time  current time in UNIX epoch seconds.
+  */
+  virtual void setCurrentTime(uint32_t time) = 0;
+
+  /**
+   * override in classes that need to periodically update internal state
+   */
+  virtual void tick() { /* no op */}
+
+  uint32_t getCurrentTimeUnique() {
+    uint32_t t = getCurrentTime();
+    if (t <= last_unique) {
+      return ++last_unique;
+    }
+    return last_unique = t;
+  }
+};
 
 }
