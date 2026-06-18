@@ -1443,6 +1443,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.flood_max_advert = 8;
   _prefs.interference_threshold = 0; // disabled
   _prefs.multi_acks = 1;             // default: send one extra ACK per hop for better ACK delivery
+  _prefs.cad_enabled = 0;            // hardware CAD before TX (off by default; 'set cad on')
 
   // bridge defaults
   _prefs.bridge_enabled = 1;    // enabled
