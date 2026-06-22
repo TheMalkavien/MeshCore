@@ -358,20 +358,6 @@ class BroadcastProxy:
         self._next_client_slot += 1
         return client_id
 
-    def _find_matching_inactive_state(self, current: ClientState) -> Optional[ClientState]:
-        reusable: list[ClientState] = [
-            state
-            for state in self.client_states.values()
-            if state is not current
-            and state.peer_group == current.peer_group
-            and state.writer is None
-            and state.app_name == current.app_name
-        ]
-        if not reusable:
-            return None
-        reusable.sort(key=lambda state: state.last_disconnect_at, reverse=True)
-        return reusable[0]
-
     def _prune_stale_client_states(self) -> None:
         if self.inactive_state_max_age <= 0:
             return
@@ -500,48 +486,66 @@ class BroadcastProxy:
         return state
 
     def _adopt_prior_state(self, state: ClientState) -> None:
+        """Supersede every prior session sharing this client's app_name.
+
+        A client is identified solely by its app_name (IP-independent), so a
+        fresh APP_START is treated as the same logical client reconnecting:
+        migrate the furthest cursor and all unserved pending messages from every
+        other session with the same app_name, then close those sessions. This
+        guarantees a single live session per app_name, which prevents a message
+        from being duplicated onto a half-open (zombie) connection and then
+        re-delivered as a flood of already-seen messages on the next reconnect.
+        """
         if not state.app_name:
             self._logger.info(
                 "[client] %s has no app_name, keeping fresh replay state", state.client_id
             )
             return
 
-        # Inherit cursor from ANY existing session with the same identity, active or
-        # not. This prevents full replay when the old TCP connection hasn't been
-        # detected as dead yet (writer still set) at reconnect time.
-        for other in self.client_states.values():
-            if other is state or other.peer_group != state.peer_group or other.app_name != state.app_name:
-                continue
-            if other.replay_capture_seq > state.replay_capture_seq:
-                state.replay_capture_seq = other.replay_capture_seq
-                self._logger.debug(
-                    "[client] %s inherited cursor seq=%d from %s %s",
-                    state.client_id, state.replay_capture_seq,
-                    "active" if other.writer is not None else "inactive", other.client_id,
-                )
-
-        previous = self._find_matching_inactive_state(state)
-        if previous is None:
+        priors = [
+            other for other in self.client_states.values()
+            if other is not state and other.app_name == state.app_name
+        ]
+        if not priors:
             self._logger.info(
-                "[client] %s identified as %s / %s, no prior state",
-                state.client_id, state.peer_group, state.app_name,
+                "[client] %s identified as %s, no prior session",
+                state.client_id, state.app_name,
             )
             return
 
-        if previous.pending_message_frames:
-            state.pending_message_frames = previous.pending_message_frames
-            previous.pending_message_frames = deque()
-            self._logger.info(
-                "[client] %s transferred %d unserved messages from %s",
-                state.client_id, len(state.pending_message_frames), previous.client_id,
-            )
+        # Merge cursors (furthest wins) and pending messages (union by seq, so a
+        # message already queued on the old session is never delivered twice).
+        merged: dict[int, BufferedFrame] = {
+            bf.seq: bf for bf in state.pending_message_frames
+        }
+        writers_to_close: list[asyncio.StreamWriter] = []
+        live = 0
+        for other in priors:
+            if other.replay_capture_seq > state.replay_capture_seq:
+                state.replay_capture_seq = other.replay_capture_seq
+            for bf in other.pending_message_frames:
+                merged.setdefault(bf.seq, bf)
+            if other.writer is not None:
+                live += 1
+                writers_to_close.append(other.writer)
+            other.writer = None
+            self._reset_client_runtime_state(other)
+            self._cancel_sender_task(other)
+            other.outbound_queue = None
+            self.client_states.pop(other.client_id, None)
+
+        state.pending_message_frames = deque(bf for _, bf in sorted(merged.items()))
 
         self._logger.info(
-            "[client] %s identified as %s / %s, adopting prior state from %s at seq=%d",
-            state.client_id, state.peer_group, state.app_name,
-            previous.client_id, previous.replay_capture_seq,
+            "[client] %s identified as %s — superseded %d prior session(s)%s "
+            "(cursor=%d, pending=%d)",
+            state.client_id, state.app_name, len(priors),
+            f" ({live} still live)" if live else "",
+            state.replay_capture_seq, len(state.pending_message_frames),
         )
-        del self.client_states[previous.client_id]
+
+        for writer in writers_to_close:
+            self._close_writer_background(writer)
 
     def _cancel_sender_task(self, state: ClientState) -> None:
         task = state.sender_task
