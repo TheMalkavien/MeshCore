@@ -69,18 +69,32 @@ struct NeighbourInfo {
 };
 
 struct PendingPing {
-  bool active;
-  bool success;
-  bool reply_remote;
+  // --- multi-ping session state (a run of 1..count pings) ---
+  bool session_active;       // a ping session is in progress
+  bool reply_remote;         // results go to a remote admin client (async) vs local serial (blocking)
   mesh::Identity target;
   mesh::Identity requester;
+  uint8_t requester_path_hash_size;
+  char cli_prefix[10];
+  uint16_t count;            // total pings requested
+  uint16_t seq;              // current ping number (1-based) = pings sent so far
+  uint16_t recv;             // successful responses so far
+  unsigned long next_at;     // remote pacing: when to fire the next ping (0 = none scheduled)
+
+  // --- aggregate stats over the session ---
+  unsigned long rtt_sum, rtt_min, rtt_max;   // ms
+  int32_t lsnr_sum;  int8_t lsnr_min, lsnr_max;  // local SNR (snr_rx), multiplied by 4
+  int32_t rsnr_sum;  int8_t rsnr_min, rsnr_max;  // remote SNR (snr_tx), multiplied by 4
+
+  // --- current in-flight ping ---
+  bool active;               // a single ping is awaiting its trace response
+  bool success;              // last in-flight ping succeeded
   uint32_t tag;
   unsigned long started_at;
   unsigned long expiry_at;
-  int8_t remote_snr;
-  int8_t local_snr;
-  uint8_t requester_path_hash_size;
-  char cli_prefix[10];
+  unsigned long last_rtt;    // rtt (ms) of the last successful ping
+  int8_t remote_snr;         // multiplied by 4
+  int8_t local_snr;          // multiplied by 4
 };
 
 #ifndef FIRMWARE_BUILD_DATE
@@ -171,10 +185,15 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void saveOtherPrefs();
   void onFloodQueued(const mesh::Packet* packet, uint8_t priority, uint32_t delay_ms) override;
   bool resolvePingTarget(const char* destination, mesh::Identity& target, char* error_reply);
-  bool sendTracePing(const mesh::Identity& target, bool reply_remote, const char* cli_prefix, char* error_reply);
-  void formatPendingPingReply(char* reply, bool timeout) const;
-  void sendPendingPingReply(bool timeout);
-  bool waitForPingResult(char* reply);
+  bool startPingSession(const mesh::Identity& target, uint16_t count, bool reply_remote, const char* cli_prefix, char* error_reply);
+  bool firePing(char* error_reply);
+  void accumulatePingStats();
+  void completePingAndAdvance();
+  void sendRemotePingLine(bool summary);
+  void endPingSession();
+  void runLocalPingSession(char* reply);
+  void formatPingLine(char* out) const;
+  void formatPingSummary(char* out) const;
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);

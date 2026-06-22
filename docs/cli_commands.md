@@ -115,18 +115,21 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 
 ### Ping a zero-hop neighbor
 **Usage:**
-- `ping <pubkey_prefix_or_pubkey>`
+- `ping <pubkey_prefix_or_pubkey> [count]`
 
 **Parameters:**
 - `pubkey_prefix_or_pubkey`: Full public key, or a unique neighbor prefix from `neighbors`
+- `count` (optional): number of pings to send (default `1`, max `100`). Pings are paced ~0.7s apart.
 
-**Note:** Returns either `timeout` or link data as `rtt=<ms> snr_rx=<dB> snr_tx=<dB>`.
+**Note:** For a single ping, returns either `timeout` or link data as `rtt=<ms> snr_rx=<dB> snr_tx=<dB>`.
+
+**Note:** When `count > 1`, each ping is reported independently as `seq=<n>/<count> ...` (one line per ping), followed by a global summary line: `--- stats: sent=<n> recv=<n> loss=<pct>% rtt=<min>/<avg>/<max> ms snr_rx=<min>/<avg>/<max> snr_tx=<min>/<avg>/<max>`.
 
 **Note:** `snr_rx` is the SNR measured locally on the response; `snr_tx` is the SNR measured by the remote node on the ping request.
 
 **Note:** Uses the same direct `TRACE` mechanism as companion clients for zero-hop link probing.
 
-**Note:** Can be used from the local serial CLI or from a remote admin CLI session. Remote replies are sent asynchronously.
+**Note:** Can be used from the local serial CLI or from a remote admin CLI session. Remote replies (each per-ping line and the summary) are sent asynchronously.
 
 ---
 

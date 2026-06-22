@@ -110,6 +110,8 @@ static bool readPacketWireExact(mesh::Packet* dst, const uint8_t raw[], uint8_t 
 
 #define LAZY_CONTACTS_WRITE_DELAY    5000
 #define PING_TIMEOUT_MILLIS          8000
+#define PING_MAX_COUNT               100   // max pings accepted by a single 'ping' command
+#define PING_INTERVAL_MILLIS         700   // pacing gap between consecutive pings (>= CLI_REPLY_DELAY_MILLIS so remote replies keep their order)
 
 static const char* skipCommandSpaces(const char* p) {
   while (*p == ' ') {
@@ -454,14 +456,39 @@ bool MyMesh::resolvePingTarget(const char* destination, mesh::Identity& target, 
   return true;
 }
 
-bool MyMesh::sendTracePing(const mesh::Identity& target, bool reply_remote, const char* cli_prefix, char* error_reply) {
-  if (pending_ping.active) {
+bool MyMesh::startPingSession(const mesh::Identity& target, uint16_t count, bool reply_remote,
+                              const char* cli_prefix, char* error_reply) {
+  if (pending_ping.session_active) {
     strcpy(error_reply, "Err - ping busy");
     return false;
   }
 
+  pending_ping.session_active = true;
+  pending_ping.reply_remote = reply_remote;
+  pending_ping.target = target;
+  pending_ping.requester = active_cli_client ? active_cli_client->id : self_id;
+  pending_ping.requester_path_hash_size = active_cli_path_hash_size > 0 ? active_cli_path_hash_size : PATH_HASH_SIZE;
+  StrHelper::strncpy(pending_ping.cli_prefix, cli_prefix ? cli_prefix : "", sizeof(pending_ping.cli_prefix));
+  pending_ping.count = count;
+  pending_ping.seq = 0;
+  pending_ping.recv = 0;
+  pending_ping.next_at = 0;
+  pending_ping.rtt_sum = pending_ping.rtt_min = pending_ping.rtt_max = 0;
+  pending_ping.lsnr_sum = 0; pending_ping.lsnr_min = pending_ping.lsnr_max = 0;
+  pending_ping.rsnr_sum = 0; pending_ping.rsnr_min = pending_ping.rsnr_max = 0;
+  pending_ping.active = false;
+
+  if (!firePing(error_reply)) {
+    pending_ping.session_active = false;
+    return false;
+  }
+  return true;
+}
+
+// Sends one TRACE for the next sequence number and arms the in-flight state.
+bool MyMesh::firePing(char* error_reply) {
   uint8_t path[4];
-  memcpy(path, target.pub_key, sizeof(path));
+  memcpy(path, pending_ping.target.pub_key, sizeof(path));
   uint8_t flags = 0x02; // 4-byte trace path hashes, same encoding as companion TRACE
   uint32_t auth_code;
   getRNG()->random((uint8_t*)&pending_ping.tag, 4);
@@ -469,63 +496,104 @@ bool MyMesh::sendTracePing(const mesh::Identity& target, bool reply_remote, cons
 
   mesh::Packet* pkt = createTrace(pending_ping.tag, auth_code, flags);
   if (pkt == NULL) {
-    strcpy(error_reply, "Err - packet pool empty");
+    if (error_reply) strcpy(error_reply, "Err - packet pool empty");
     return false;
   }
 
+  pending_ping.seq++;
   pending_ping.active = true;
   pending_ping.success = false;
-  pending_ping.reply_remote = reply_remote;
-  pending_ping.target = target;
-  pending_ping.requester = active_cli_client ? active_cli_client->id : self_id;
   pending_ping.started_at = millis();
   pending_ping.expiry_at = futureMillis(PING_TIMEOUT_MILLIS);
+  pending_ping.next_at = 0;
   pending_ping.remote_snr = 0;
   pending_ping.local_snr = 0;
-  pending_ping.requester_path_hash_size = active_cli_path_hash_size > 0 ? active_cli_path_hash_size : PATH_HASH_SIZE;
-  StrHelper::strncpy(pending_ping.cli_prefix, cli_prefix ? cli_prefix : "", sizeof(pending_ping.cli_prefix));
 
   sendDirect(pkt, path, sizeof(path));
   return true;
 }
 
-void MyMesh::formatPendingPingReply(char* reply, bool timeout) const {
-  if (timeout || !pending_ping.success) {
-    strcpy(reply, "timeout");
+// Folds the just-completed in-flight ping into the session aggregates.
+void MyMesh::accumulatePingStats() {
+  if (!pending_ping.success) return;  // misses don't contribute to rtt/snr stats
+
+  unsigned long rtt = pending_ping.last_rtt;
+  if (pending_ping.recv == 0) {  // first sample seeds the min/max trackers
+    pending_ping.rtt_min = pending_ping.rtt_max = rtt;
+    pending_ping.lsnr_min = pending_ping.lsnr_max = pending_ping.local_snr;
+    pending_ping.rsnr_min = pending_ping.rsnr_max = pending_ping.remote_snr;
+  } else {
+    if (rtt < pending_ping.rtt_min) pending_ping.rtt_min = rtt;
+    if (rtt > pending_ping.rtt_max) pending_ping.rtt_max = rtt;
+    if (pending_ping.local_snr < pending_ping.lsnr_min) pending_ping.lsnr_min = pending_ping.local_snr;
+    if (pending_ping.local_snr > pending_ping.lsnr_max) pending_ping.lsnr_max = pending_ping.local_snr;
+    if (pending_ping.remote_snr < pending_ping.rsnr_min) pending_ping.rsnr_min = pending_ping.remote_snr;
+    if (pending_ping.remote_snr > pending_ping.rsnr_max) pending_ping.rsnr_max = pending_ping.remote_snr;
+  }
+  pending_ping.recv++;
+  pending_ping.rtt_sum += rtt;
+  pending_ping.lsnr_sum += pending_ping.local_snr;
+  pending_ping.rsnr_sum += pending_ping.remote_snr;
+}
+
+// One per-ping result line. For a single ping (count==1) the legacy format is preserved.
+void MyMesh::formatPingLine(char* out) const {
+  char* p = out;
+  if (pending_ping.count > 1) {
+    p += sprintf(p, "seq=%u/%u ", (unsigned)pending_ping.seq, (unsigned)pending_ping.count);
+  }
+  if (!pending_ping.success) {
+    strcpy(p, "timeout");
     return;
   }
-
-  unsigned long rtt = millis() - pending_ping.started_at;
-  sprintf(reply,
+  sprintf(p,
           "rtt=%lums snr_rx=%.2f snr_tx=%.2f",
-          rtt,
+          pending_ping.last_rtt,
           pending_ping.local_snr / 4.0f,
           pending_ping.remote_snr / 4.0f);
 }
 
-void MyMesh::sendPendingPingReply(bool timeout) {
-  if (!pending_ping.reply_remote) {
-    if (timeout) {
-      pending_ping.success = false;
-    }
-    pending_ping.active = false;
-    return;
-  }
+// Global summary over the whole session.
+void MyMesh::formatPingSummary(char* out) const {
+  uint16_t sent = pending_ping.seq;   // pings actually transmitted
+  uint16_t recv = pending_ping.recv;
+  uint16_t lost = sent - recv;
+  uint32_t loss_permille = (sent == 0) ? 0 : ((uint32_t)lost * 1000UL) / sent;
 
+  char* p = out;
+  p += sprintf(p, "--- stats: sent=%u recv=%u loss=%lu.%lu%%",
+               (unsigned)sent, (unsigned)recv,
+               (unsigned long)(loss_permille / 10), (unsigned long)(loss_permille % 10));
+  if (recv > 0) {
+    p += sprintf(p, " rtt=%lu/%lu/%lu ms",
+                 pending_ping.rtt_min, pending_ping.rtt_sum / recv, pending_ping.rtt_max);
+    p += sprintf(p, " snr_rx=%.2f/%.2f/%.2f",
+                 pending_ping.lsnr_min / 4.0f, (pending_ping.lsnr_sum / (float)recv) / 4.0f, pending_ping.lsnr_max / 4.0f);
+    sprintf(p, " snr_tx=%.2f/%.2f/%.2f",
+            pending_ping.rsnr_min / 4.0f, (pending_ping.rsnr_sum / (float)recv) / 4.0f, pending_ping.rsnr_max / 4.0f);
+  }
+}
+
+// Sends one CLI-data datagram to the remote requester (a per-ping line or the summary).
+void MyMesh::sendRemotePingLine(bool summary) {
   auto client = acl.getClient(pending_ping.requester.pub_key, PUB_KEY_SIZE);
   if (client == NULL) {
-    pending_ping.active = false;
-    pending_ping.success = false;
+    endPingSession();
     return;
   }
 
   uint8_t temp[166];
   char* reply = (char*)&temp[5];
+  reply[0] = 0;
   if (pending_ping.cli_prefix[0]) {
     strcpy(reply, pending_ping.cli_prefix);
     reply += strlen(reply);
   }
-  formatPendingPingReply(reply, timeout);
+  if (summary) {
+    formatPingSummary(reply);
+  } else {
+    formatPingLine(reply);
+  }
 
   int text_len = strlen((char*)&temp[5]);
   uint32_t timestamp = getRTCClock()->getCurrentTimeUnique();
@@ -540,32 +608,71 @@ void MyMesh::sendPendingPingReply(bool timeout) {
       sendDirect(pkt, client->out_path, client->out_path_len, CLI_REPLY_DELAY_MILLIS);
     }
   }
+}
 
+// Drives a remote (async) session forward after one ping completes (success or timeout).
+void MyMesh::completePingAndAdvance() {
+  accumulatePingStats();
+  sendRemotePingLine(false);   // independent per-ping result
+
+  if (pending_ping.seq < pending_ping.count) {
+    pending_ping.next_at = futureMillis(PING_INTERVAL_MILLIS);  // pace the next ping
+  } else {
+    sendRemotePingLine(true);  // global summary
+    endPingSession();
+  }
+}
+
+void MyMesh::endPingSession() {
+  pending_ping.session_active = false;
   pending_ping.active = false;
-  pending_ping.success = false;
   pending_ping.reply_remote = false;
+  pending_ping.next_at = 0;
   pending_ping.cli_prefix[0] = 0;
 }
 
-bool MyMesh::waitForPingResult(char* reply) {
-  while (pending_ping.active && !millisHasNowPassed(pending_ping.expiry_at)) {
-    loop();
-    delay(1);
+// Local serial driver: blocks, printing each ping as it completes, and returns the summary in `reply`.
+void MyMesh::runLocalPingSession(char* reply) {
+  char line[120];
+  for (;;) {
+    // wait for the current in-flight ping to resolve or time out
+    while (pending_ping.active && !millisHasNowPassed(pending_ping.expiry_at)) {
+      loop();
+      delay(1);
+    }
+    if (pending_ping.active) {  // timed out (no trace response arrived)
+      pending_ping.success = false;
+      pending_ping.active = false;
+    }
+    accumulatePingStats();
+
+    if (pending_ping.count > 1) {  // print each ping independently; single ping keeps legacy single-line reply
+      formatPingLine(line);
+      Serial.print("  -> "); Serial.println(line);
+    }
+
+    if (pending_ping.seq >= pending_ping.count) break;
+
+    // pace the next ping (keep servicing the mesh while we wait)
+    unsigned long fire_at = futureMillis(PING_INTERVAL_MILLIS);
+    while (!millisHasNowPassed(fire_at)) {
+      loop();
+      delay(1);
+    }
+
+    char err[40];
+    if (!firePing(err)) {  // packet pool momentarily empty: stop and summarise what we have
+      Serial.print("  -> "); Serial.println(err);
+      break;
+    }
   }
 
-  if (pending_ping.active) {
-    pending_ping.active = false;
-    formatPendingPingReply(reply, true);
-    return false;
+  if (pending_ping.count > 1) {
+    formatPingSummary(reply);
+  } else {
+    formatPingLine(reply);  // legacy single-ping reply
   }
-
-  if (!pending_ping.success) {
-    formatPendingPingReply(reply, true);
-    return false;
-  }
-
-  formatPendingPingReply(reply, false);
-  return true;
+  endPingSession();
 }
 
 uint8_t MyMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood) {
@@ -1160,12 +1267,13 @@ void MyMesh::onTraceRecv(mesh::Packet* packet, uint32_t tag, uint32_t auth_code,
   pending_ping.success = true;
   pending_ping.remote_snr = (int8_t)path_snrs[0];
   pending_ping.local_snr = (int8_t)(packet->getSNR() * 4.0f);
+  pending_ping.last_rtt = millis() - pending_ping.started_at;
+  pending_ping.active = false;  // this in-flight ping is resolved
 
   if (pending_ping.reply_remote) {
-    sendPendingPingReply(false);
-  } else {
-    pending_ping.active = false;
+    completePingAndAdvance();   // remote: accumulate, reply, fire next or summarise
   }
+  // local: runLocalPingSession() drives the session forward
 }
 
 static bool isShare(const mesh::Packet *packet) {
@@ -1851,14 +1959,28 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       strcpy(reply, "OK - Discover sent");
     }
   } else if (memcmp(command, "ping ", 5) == 0) {
+    char* arg = command + 5;
+    while (*arg == ' ') arg++;
+    // optional 2nd argument: number of pings to send
+    int count = 1;
+    char* sp = strchr(arg, ' ');
+    if (sp != NULL) {
+      *sp = 0;  // terminate the pubkey token
+      const char* cp = sp + 1;
+      while (*cp == ' ') cp++;
+      if (*cp) count = atoi(cp);
+    }
+    if (count < 1) count = 1;
+    if (count > PING_MAX_COUNT) count = PING_MAX_COUNT;
+
     mesh::Identity target;
     bool reply_remote = sender_timestamp != 0 && active_cli_client != NULL;
-    if (resolvePingTarget(command + 5, target, reply) &&
-        sendTracePing(target, reply_remote, cli_prefix, reply)) {
+    if (resolvePingTarget(arg, target, reply) &&
+        startPingSession(target, (uint16_t)count, reply_remote, cli_prefix, reply)) {
       if (reply_remote) {
-        reply_start[0] = 0;
+        reply_start[0] = 0;          // results are sent asynchronously (per-ping lines + summary)
       } else {
-        waitForPingResult(reply);
+        runLocalPingSession(reply);  // blocks, prints each ping, returns the summary
       }
     }
   } else if (memcmp(command, "set flood.maxretry ", 19) == 0) {
@@ -1896,8 +2018,20 @@ void MyMesh::loop() {
   mesh::Mesh::loop();
   processFloodRetries();
 
-  if (pending_ping.active && pending_ping.reply_remote && millisHasNowPassed(pending_ping.expiry_at)) {
-    sendPendingPingReply(true);
+  // drive an in-progress remote (async) ping session
+  if (pending_ping.session_active && pending_ping.reply_remote) {
+    if (pending_ping.active) {
+      if (millisHasNowPassed(pending_ping.expiry_at)) {  // current ping timed out
+        pending_ping.success = false;
+        pending_ping.active = false;
+        completePingAndAdvance();
+      }
+    } else if (pending_ping.next_at && millisHasNowPassed(pending_ping.next_at)) {  // time to fire the next ping
+      pending_ping.next_at = 0;
+      if (!firePing(NULL)) {  // packet pool momentarily empty: retry after the pacing gap
+        pending_ping.next_at = futureMillis(PING_INTERVAL_MILLIS);
+      }
+    }
   }
 
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
