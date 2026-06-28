@@ -45,64 +45,42 @@ RESP_CODE_NO_MORE_MESSAGES = 0x0A
 #             + lat(4) + lon(4) + lastmod(4) = total 151 bytes
 CONTACT_LASTMOD_OFFSET = 147
 
-# Packet types that are singleton in the cache: the latest frame replaces the
-# previous one (e.g. SELF_INFO / DEVICE_INFO which describe fixed node state).
-CACHE_SINGLETON_TYPES = {
-    0x05,  # RESP_CODE_SELF_INFO
-    0x0D,  # RESP_CODE_DEVICE_INFO
-    0x15,  # RESP_CODE_CUSTOM_VARS    — node config, one per device
-    0x17,  # RESP_CODE_TUNING_PARAMS  — radio config, one per device
-    0x19,  # RESP_CODE_AUTOADD_CONFIG — one per device
-    0x1A,  # RESP_ALLOWED_REPEAT_FREQ — one per device
-}
-
-# Packet types deduplicated by pubkey (frame[4:36], 32 bytes).
-# The latest frame for a given pubkey replaces the previous one.
-# 0x03 = RESP_CODE_CONTACT, 0x8A = PUSH_CODE_NEW_ADVERT
-CACHE_DEDUP_BY_PUBKEY_TYPES = {0x03, 0x8A}
-PUBKEY_OFFSET = 4   # bytes: '>' + LSB + MSB + type
+PUBKEY_OFFSET = 4   # CONTACT/advert pubkey starts here: '>' + len_LE(2) + code
 PUBKEY_SIZE   = 32
+IDX_OFFSET = 4      # CHANNEL_INFO channel-index byte
 
-# Packet types deduplicated by a single key byte at frame[4].
-# 0x12 = RESP_CODE_CHANNEL_INFO  (key = channel_idx)
-CACHE_DEDUP_BY_IDX_TYPES = {0x12}
-IDX_OFFSET = 4
+# --- State cache (mechanism 2): the latest snapshot of heavy / slow-changing
+# backend state, so a (re)connecting client can be served without hitting the
+# backend. This is an ALLOWLIST: only the types below are cached; everything
+# else is forwarded live and never cached (the safe default). Messages are NOT
+# here — they go through the per-client message queue (mechanism 1).
+#
+# Each type maps to a key function (frame -> key bytes) identifying the entity
+# (a contact's pubkey, a channel index…), or None for a singleton (one per
+# device, latest wins). The cache stores one latest frame per (type, key).
+CONTACT_TYPE = 0x03         # RESP_CODE_CONTACT
+CHANNEL_INFO_TYPE = 0x12    # RESP_CODE_CHANNEL_INFO
+NEW_ADVERT_TYPE = 0x8A      # PUSH_CODE_NEW_ADVERT (same wire layout as CONTACT)
 
-# Packet types that must NOT be cached at all.
-CACHE_BLACKLIST_TYPES = {
-    0x00,  # OK              — transient command acknowledgment
-    0x01,  # ERR             — transient error
-    0x06,  # SENT            — transient send acknowledgment
-    0x09,  # CURR_TIME       — time value, always stale when replayed
-    0x0A,  # NO_MORE_MESSAGES — internal poll protocol, never forwarded
-    0x0C,  # BATT_AND_STORAGE — changes constantly, stale data not useful
-    0x0E,  # PRIVATE_KEY     — security-sensitive, must not be replayed
-    0x02,  # CONTACTS_START  — delimiter, rebuilt from CONTACT cache on replay
-    0x04,  # END_OF_CONTACTS — delimiter, rebuilt from CONTACT cache on replay
-    0x0F,  # DISABLED        — transient feature-flag response
-    0x0B,  # EXPORT_CONTACT  — transient response to a specific command
-    0x13,  # SIGN_START      — transient signing session
-    0x14,  # SIGNATURE       — transient signing result
-    0x16,  # ADVERT_PATH     — per-contact routing info, stale on replay
-    0x18,  # STATS           — varies by stats_type, stale on replay
-    # Unsolicited push events (0x80–0x90): all transient except PUSH_NEW_ADVERT
-    # (0x8A) which carries a full contact structure and is worth caching.
-    0x80,  # PUSH_ADVERT                  — radio event, not persistent state
-    0x81,  # PUSH_PATH_UPDATED            — routing event
-    0x82,  # PUSH_SEND_CONFIRMED          — ACK event
-    0x83,  # PUSH_MSG_WAITING             — tickle, proxy handles polling
-    0x84,  # PUSH_RAW_DATA                — transient datagram
-    0x85,  # PUSH_LOGIN_SUCCESS           — transient auth event
-    0x86,  # PUSH_LOGIN_FAIL              — transient auth event
-    0x87,  # PUSH_STATUS_RESPONSE         — transient status reply
-    0x88,  # PUSH_LOG_RX_DATA             — debug radio log, very frequent
-    0x89,  # PUSH_TRACE_DATA              — transient trace result
-    0x8B,  # PUSH_TELEMETRY_RESPONSE      — transient sensor data
-    0x8C,  # PUSH_BINARY_RESPONSE         — transient binary reply
-    0x8D,  # PUSH_PATH_DISCOVERY_RESPONSE — transient
-    0x8E,  # PUSH_CONTROL_DATA            — transient
-    0x8F,  # PUSH_CONTACT_DELETED         — event (deletion handled by app state)
-    0x90,  # PUSH_CONTACTS_FULL           — transient overflow notification
+
+def _contact_pubkey_key(frame: bytes) -> Optional[bytes]:
+    end = PUBKEY_OFFSET + PUBKEY_SIZE
+    return frame[PUBKEY_OFFSET:end] if len(frame) >= end else None
+
+
+def _channel_idx_key(frame: bytes) -> Optional[bytes]:
+    return frame[IDX_OFFSET:IDX_OFFSET + 1] if len(frame) > IDX_OFFSET else None
+
+
+CACHE_TYPES = {
+    0x05: None,                           # SELF_INFO            (singleton)
+    0x0D: None,                           # DEVICE_INFO          (singleton)
+    0x15: None,                           # CUSTOM_VARS          (singleton)
+    0x17: None,                           # TUNING_PARAMS        (singleton)
+    0x19: None,                           # AUTOADD_CONFIG       (singleton)
+    0x1A: None,                           # ALLOWED_REPEAT_FREQ  (singleton)
+    CONTACT_TYPE: _contact_pubkey_key,    # keyed by pubkey
+    CHANNEL_INFO_TYPE: _channel_idx_key,  # keyed by channel index
 }
 
 MAX_COMPANION_FRAME_SIZE = 2048
@@ -115,12 +93,14 @@ DEFAULT_MAX_CLIENTS = 32
 # Keep inactive client cursors for as long as the message history (86400 = 24h).
 # Pruning cursors earlier than the history window causes full replays on reconnect.
 DEFAULT_INACTIVE_STATE_MAX_AGE = 86400
-DEFAULT_CACHE_BUCKET_MAX = 256
 DEFAULT_RECONNECT_BACKOFF_MAX = 60.0
 
-# RESP_CODE_CONTACT_MSG_RECV / CHANNEL_MSG_RECV  (v<3 : 0x07, 0x08)
-# RESP_CODE_CONTACT_MSG_RECV_V3 / CHANNEL_MSG_RECV_V3  (v≥3 : 0x10, 0x11)
-MESSAGE_PACKET_TYPES = {0x07, 0x08, 0x10, 0x11}
+# Per-client message stream, queued on the node and retrieved one-at-a-time via
+# CMD_SYNC_NEXT_MESSAGE (history + per-client cursor; missed ones replayed):
+#   RESP_CODE_CONTACT_MSG_RECV / CHANNEL_MSG_RECV       (v<3 : 0x07, 0x08)
+#   RESP_CODE_CONTACT_MSG_RECV_V3 / CHANNEL_MSG_RECV_V3 (v≥3 : 0x10, 0x11)
+#   RESP_CODE_CHANNEL_DATA_RECV (0x1B) — binary channel data, also SYNC-queued.
+MESSAGE_PACKET_TYPES = {0x07, 0x08, 0x10, 0x11, 0x1B}
 
 PACKET_TYPE_NAMES: dict[int, str] = {
     # Responses to client commands
@@ -283,7 +263,6 @@ class SerialBroadcastProxy:
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         max_clients: int = DEFAULT_MAX_CLIENTS,
         inactive_state_max_age: float = DEFAULT_INACTIVE_STATE_MAX_AGE,
-        cache_bucket_max: int = DEFAULT_CACHE_BUCKET_MAX,
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
@@ -300,7 +279,6 @@ class SerialBroadcastProxy:
         self.poll_interval = max(poll_interval, 0.1)
         self.max_clients = max(max_clients, 1)
         self.inactive_state_max_age = max(inactive_state_max_age, 0.0)
-        self._cache_bucket_max = max(cache_bucket_max, 1)
 
         self._logger = logging.getLogger(__name__)
 
@@ -316,24 +294,13 @@ class SerialBroadcastProxy:
         self.history_size_bytes = 0
         self.next_history_seq = 1
 
-        # Generic state cache: packet_type → list of distinct frames.
-        # Singleton types (CACHE_SINGLETON_TYPES) keep only the latest frame.
-        # All other non-blacklisted types accumulate one entry per distinct frame.
-        # Replayed to every client immediately after SELF_INFO.
-        self._state_cache: dict[int, list[bytes]] = {}
-        # Parallel hash sets for O(1) exact-frame dedup in the catch-all bucket.
-        self._state_cache_sets: dict[int, set[bytes]] = {}
-
-        # Set to True while the backend is streaming a contact dump
-        # (between CONTACTS_START and END_OF_CONTACTS).
-        self._in_contact_dump: bool = False
-        self._suppressed_dump_count: int = 0
-        # Set when a client mutates contacts (add/update/reset-path): the next
-        # GET_CONTACTS forces a full backend refresh to rebuild the stale cache.
+        # State cache (mechanism 2): packet_type -> {entity_key -> latest frame}.
+        # Singletons use the key None. Only CACHE_TYPES are cached (allowlist).
+        self._state_cache: dict[int, dict] = {}
+        # Set when a client renames / reset-paths a contact and the backend won't
+        # echo a fresh CONTACT: the next GET_CONTACTS is forwarded so the backend
+        # response refreshes the cache (the cache is never cleared).
         self._contacts_dirty: bool = False
-        # True while an authoritative full (since=0) contact dump is rebuilding
-        # the cache, so the stale 0x03 bucket is cleared on CONTACTS_START.
-        self._contacts_rebuild_pending: bool = False
 
         self._server: Optional[asyncio.base_events.Server] = None
         self._stop = asyncio.Event()
@@ -461,7 +428,6 @@ class SerialBroadcastProxy:
             self._poll_event.clear()
             self._poll_got_message = False
             await self._send_to_backend(SYNC_FRAME)
-            self._logger.debug("[poll] SYNC sent → backend")
 
             try:
                 await asyncio.wait_for(self._poll_event.wait(), timeout=5.0)
@@ -473,10 +439,7 @@ class SerialBroadcastProxy:
             if not self.backend_connected.is_set():
                 continue
 
-            if self._poll_got_message:
-                self._logger.debug("[poll] message received, polling again immediately")
-            else:
-                self._logger.debug("[poll] NO_MORE, sleeping %.1fs", self.poll_interval)
+            if not self._poll_got_message:
                 await asyncio.sleep(self.poll_interval)
 
     async def _register_client(self, peer_group: str, writer: asyncio.StreamWriter) -> ClientState:
@@ -594,23 +557,37 @@ class SerialBroadcastProxy:
         self._background_tasks.add(task)
         task.add_done_callback(self._on_background_task_done)
 
+    def _cache_backend_frame(self, frame: bytes, packet_type: Optional[int]) -> None:
+        """Upsert an allowlisted backend frame into the state cache (latest wins).
+
+        NEW_ADVERT (0x8A) carries a full contact with the same wire layout as a
+        CONTACT, so it is stored as a CONTACT (only the code byte differs). Types
+        not in CACHE_TYPES are ignored here (they are still forwarded live by the
+        caller). Messages never reach here — they go to the message queue.
+        """
+        if packet_type is None:
+            return
+        cache_type = packet_type
+        if packet_type == NEW_ADVERT_TYPE:
+            cache_type = CONTACT_TYPE
+            frame = bytes((frame[0], frame[1], frame[2], CONTACT_TYPE)) + frame[4:]
+        if cache_type not in CACHE_TYPES:
+            return
+        key_fn = CACHE_TYPES[cache_type]
+        key = None if key_fn is None else key_fn(frame)
+        if key_fn is not None and key is None:
+            return  # frame too short to extract its key — skip
+        bucket = self._state_cache.setdefault(cache_type, {})
+        bucket[key] = frame
+
     def _evict_contact_from_cache(self, pubkey: bytes) -> None:
-        """Remove a contact (and any cached advert) from the state cache by pubkey."""
-        end = PUBKEY_OFFSET + PUBKEY_SIZE
-        for pt in (0x03, 0x8A):
-            bucket = self._state_cache.get(pt)
-            if not bucket:
-                continue
-            kept = [
-                f for f in bucket
-                if not (len(f) >= end and f[PUBKEY_OFFSET:end] == pubkey)
-            ]
-            if len(kept) != len(bucket):
-                self._state_cache[pt] = kept
-                self._logger.info(
-                    "[cache] evicted contact pubkey=%s… from %s (now %d)",
-                    pubkey[:4].hex(), fmt_ptype(pt), len(kept),
-                )
+        """Remove a contact from the state cache by pubkey (delete / auto-evict)."""
+        bucket = self._state_cache.get(CONTACT_TYPE)
+        if bucket and pubkey in bucket:
+            del bucket[pubkey]
+            self._logger.info(
+                "[cache] evicted contact pubkey=%s… (now %d)", pubkey[:4].hex(), len(bucket)
+            )
 
     async def _client_sender(
         self, state: ClientState, writer: asyncio.StreamWriter
@@ -696,19 +673,10 @@ class SerialBroadcastProxy:
             writer = state.writer
             queue = state.outbound_queue
             if writer is None or queue is None or self._stop.is_set():
-                self._logger.debug(
-                    "[send_bytes→%s] SKIP — writer=%s queue=%s stop=%s",
-                    state.client_id,
-                    writer is not None, queue is not None, self._stop.is_set(),
-                )
                 return False
 
             try:
                 queue.put_nowait(payload)
-                self._logger.debug(
-                    "[send_bytes→%s] enqueued %dB — q=%d/%d",
-                    state.client_id, len(payload), queue.qsize(), self.client_queue_frames,
-                )
                 return True
             except asyncio.QueueFull:
                 self._logger.info(
@@ -738,24 +706,15 @@ class SerialBroadcastProxy:
         """
         if state.pending_message_frames:
             buffered = state.pending_message_frames.popleft()
-            self._logger.debug(
-                "[serve/%s] seq=%d size=%dB remaining=%d",
-                state.client_id, buffered.seq, len(buffered.data),
-                len(state.pending_message_frames),
-            )
             if await self._send_bytes_to_client(state, buffered.data):
                 self._logger.info(
                     "[client] served message seq=%d to %s (remaining=%d)",
                     buffered.seq, state.client_id, len(state.pending_message_frames),
                 )
                 return True
-            self._logger.debug(
-                "[serve/%s] send failed — re-queuing seq=%d", state.client_id, buffered.seq
-            )
             state.pending_message_frames.appendleft(buffered)
             return False
         else:
-            self._logger.debug("[serve/%s] nothing pending → local NO_MORE", state.client_id)
             return await self._send_bytes_to_client(
                 state, build_backend_frame(RESP_CODE_NO_MORE_MESSAGES)
             )
@@ -825,7 +784,7 @@ class SerialBroadcastProxy:
                         self._adopt_prior_state(state)
                         self._capture_pending_history(state)
 
-                        cached_self_info = (self._state_cache.get(RESP_CODE_SELF_INFO) or [None])[0]
+                        cached_self_info = self._state_cache.get(RESP_CODE_SELF_INFO, {}).get(None)
                         if cached_self_info is not None:
                             # Cache is warm: serve the response locally without
                             # touching the backend.  Forwarding APP_START would
@@ -847,13 +806,13 @@ class SerialBroadcastProxy:
                             state.awaiting_replay_after_self_info = True
                             forward_frames.append(frame)
                     elif command == CMD_GET_CONTACTS:
-                        cached_contacts = self._state_cache.get(0x03, [])
+                        cached_contacts = self._state_cache.get(CONTACT_TYPE, {})
                         if cached_contacts and not self._contacts_dirty:
                             since: int = 0
                             if len(frame) >= 8:
                                 since = struct.unpack_from("<I", frame, 4)[0]
                             filtered = [
-                                f for f in cached_contacts
+                                f for f in cached_contacts.values()
                                 if len(f) >= CONTACT_LASTMOD_OFFSET + 4
                                 and struct.unpack_from("<I", f, CONTACT_LASTMOD_OFFSET)[0] > since
                             ]
@@ -874,14 +833,15 @@ class SerialBroadcastProxy:
                                 state.client_id, since, n, len(cached_contacts),
                             )
                         elif self._contacts_dirty:
-                            # A contact was mutated: rebuild the cache from an
-                            # authoritative full (since=0) backend dump instead of
-                            # serving stale data.
+                            # A contact was mutated (rename / path): forward this
+                            # GET_CONTACTS to the backend so its fresh CONTACT frames
+                            # update the cache in place (dedup-by-pubkey). The cache
+                            # is NOT cleared — deletions are handled by eviction — so
+                            # the contact list never transiently empties.
                             self._contacts_dirty = False
-                            self._contacts_rebuild_pending = True
-                            forward_frames.append(bytes((ord("<"), 1, 0, CMD_GET_CONTACTS)))
+                            forward_frames.append(frame)
                             self._logger.debug(
-                                "[cli→%s] GET_CONTACTS — cache dirty, forcing full refresh",
+                                "[cli→%s] GET_CONTACTS — cache dirty, forwarding to refresh",
                                 state.client_id,
                             )
                         else:
@@ -910,26 +870,15 @@ class SerialBroadcastProxy:
                         )
                     elif command == CMD_SYNC_NEXT_MESSAGE:
                         # Always served locally from the proxy cache.
-                        self._logger.debug("[cli→%s] SYNC → serving locally", state.client_id)
                         await self._serve_pending_message(state)
                     elif command == 0x1F and len(frame) >= 5:
                         # CMD_GET_CHANNEL: serve from cache if available.
                         channel_idx = frame[4]
-                        cached_channels = self._state_cache.get(0x12, [])
-                        cached = next(
-                            (f for f in cached_channels if len(f) > IDX_OFFSET and f[IDX_OFFSET] == channel_idx),
-                            None,
-                        )
+                        cached_channels = self._state_cache.get(CHANNEL_INFO_TYPE, {})
+                        cached = cached_channels.get(bytes([channel_idx]))
                         if cached is not None:
-                            self._logger.debug(
-                                "[cli→%s] GET_CHANNEL idx=%d → cache hit", state.client_id, channel_idx
-                            )
                             await self._send_bytes_to_client(state, cached)
                         else:
-                            self._logger.debug(
-                                "[cli→%s] GET_CHANNEL idx=%d → cache miss, forwarding",
-                                state.client_id, channel_idx,
-                            )
                             forward_frames.append(frame)
                     elif command == CMD_SEND_CHAN_MSG and len(frame) >= 11:
                         # frame[3]=0x03, frame[4]=0x00, frame[5]=chan_idx,
@@ -1044,10 +993,6 @@ class SerialBroadcastProxy:
     async def _close_backend(self) -> None:
         self.backend_connected.clear()
         self.backend_parser.reset()
-        # Reset contact-dump tracking so stale state cannot leak across reconnects.
-        self._in_contact_dump = False
-        self._suppressed_dump_count = 0
-        self._contacts_rebuild_pending = False
         # Unblock the poll loop if it is waiting for a backend response.
         self._poll_event.set()
         conn = self.serial_conn
@@ -1142,19 +1087,13 @@ class SerialBroadcastProxy:
         self.history.append(BufferedFrame(seq=seq, data=frame))
         self.history_size_bytes += len(frame)
 
-        evicted_count = 0
         while self.history and (
             (self.history_frames and len(self.history) > self.history_frames)
             or (self.history_bytes and self.history_size_bytes > self.history_bytes)
         ):
             evicted = self.history.popleft()
             self.history_size_bytes -= len(evicted.data)
-            evicted_count += 1
 
-        self._logger.debug(
-            "[history] appended seq=%d size=%dB total=%d frames / %dB evicted=%d",
-            seq, len(frame), len(self.history), self.history_size_bytes, evicted_count,
-        )
         return seq
 
     async def _handle_backend_frame(
@@ -1170,89 +1109,24 @@ class SerialBroadcastProxy:
         if is_msg:
             history_seq = self._append_history(frame)
 
-        connected_clients = [s for s in self.client_states.values() if s.writer is not None]
-        self._logger.debug(
-            "[bkd←frame] type=%s size=%dB is_msg=%s seq=%s connected_clients=%d/%d",
-            fmt_ptype(packet_type), len(frame), is_msg, history_seq,
-            len(connected_clients), len(self.client_states),
-        )
+        # Log every backend frame except the once-per-second NO_MORE poll keepalive.
+        if packet_type != RESP_CODE_NO_MORE_MESSAGES:
+            connected = sum(1 for s in self.client_states.values() if s.writer is not None)
+            self._logger.debug(
+                "[bkd←] %s size=%dB%s → %d client(s)",
+                fmt_ptype(packet_type), len(frame),
+                f" seq={history_seq}" if history_seq is not None else "",
+                connected,
+            )
 
-        # Update generic state cache so reconnecting clients get a full snapshot.
-        if packet_type is not None and packet_type not in CACHE_BLACKLIST_TYPES and not is_msg:
-            if packet_type in CACHE_SINGLETON_TYPES:
-                self._state_cache[packet_type] = [frame]
-                self._logger.debug("[cache] singleton updated type=%s", fmt_ptype(packet_type))
-            elif packet_type in CACHE_DEDUP_BY_PUBKEY_TYPES:
-                end = PUBKEY_OFFSET + PUBKEY_SIZE
-                if len(frame) >= end:
-                    pubkey = frame[PUBKEY_OFFSET:end]
-                    bucket = self._state_cache.setdefault(packet_type, [])
-                    for i, existing in enumerate(bucket):
-                        if existing[PUBKEY_OFFSET:end] == pubkey:
-                            if existing != frame:
-                                bucket[i] = frame
-                                self._logger.debug(
-                                    "[cache] updated type=%s pubkey=%s… total=%d",
-                                    fmt_ptype(packet_type), pubkey[:4].hex(), len(bucket),
-                                )
-                            break
-                    else:
-                        bucket.append(frame)
-                        self._logger.debug(
-                            "[cache] new type=%s pubkey=%s… total=%d",
-                            fmt_ptype(packet_type), pubkey[:4].hex(), len(bucket),
-                        )
-            elif packet_type in CACHE_DEDUP_BY_IDX_TYPES:
-                if len(frame) > IDX_OFFSET:
-                    idx = frame[IDX_OFFSET]
-                    bucket = self._state_cache.setdefault(packet_type, [])
-                    for i, existing in enumerate(bucket):
-                        if len(existing) > IDX_OFFSET and existing[IDX_OFFSET] == idx:
-                            if existing != frame:
-                                bucket[i] = frame
-                                self._logger.debug(
-                                    "[cache] updated type=%s idx=%d total=%d",
-                                    fmt_ptype(packet_type), idx, len(bucket),
-                                )
-                            break
-                    else:
-                        bucket.append(frame)
-                        self._logger.debug(
-                            "[cache] new type=%s idx=%d total=%d",
-                            fmt_ptype(packet_type), idx, len(bucket),
-                        )
-            else:
-                bucket = self._state_cache.setdefault(packet_type, [])
-                seen = self._state_cache_sets.setdefault(packet_type, set())
-                # O(1) hash lookup via parallel set; list preserves insertion order for replay.
-                if len(bucket) < self._cache_bucket_max and frame not in seen:
-                    bucket.append(frame)
-                    seen.add(frame)
-                    self._logger.debug(
-                        "[cache] collected type=%s total=%d", fmt_ptype(packet_type), len(bucket)
-                    )
-
-        # Track whether we are currently inside a backend contact dump.
-        if packet_type == 0x02:  # CONTACTS_START
-            self._in_contact_dump = True
-            self._suppressed_dump_count = 0
-            if self._contacts_rebuild_pending:
-                # Authoritative full refresh: drop the stale contact cache so
-                # backend-side deletions and renames are reflected after rebuild.
-                self._state_cache[0x03] = []
-                self._logger.debug("[cache] contact cache cleared for full rebuild")
-            self._logger.debug("[cache] backend contact dump started")
-        elif packet_type == 0x04:  # END_OF_CONTACTS
-            self._in_contact_dump = False
-            self._contacts_rebuild_pending = False
-            if self._suppressed_dump_count:
-                self._logger.debug(
-                    "[cache] backend contact dump done: %d contact(s) received and cached",
-                    self._suppressed_dump_count,
-                )
-                self._suppressed_dump_count = 0
-        elif packet_type == 0x8F:  # PUSH_CONTACT_DELETED — backend auto-evicted a contact
-            if len(frame) >= PUBKEY_OFFSET + PUBKEY_SIZE:
+        # State cache (mechanism 2): keep the latest snapshot of allowlisted types
+        # so (re)connecting clients can be served without hitting the backend.
+        # NEW_ADVERT (0x8A) is folded into the CONTACT cache by _cache_backend_frame;
+        # everything not in CACHE_TYPES is simply forwarded live below.
+        if not is_msg:
+            self._cache_backend_frame(frame, packet_type)
+            # Backend auto-evicted a contact (storage full) -> drop it from cache.
+            if packet_type == 0x8F and len(frame) >= PUBKEY_OFFSET + PUBKEY_SIZE:
                 self._evict_contact_from_cache(frame[PUBKEY_OFFSET:PUBKEY_OFFSET + PUBKEY_SIZE])
 
         # Signal the poll loop only for real backend frames, not synthetic echoes.
@@ -1272,7 +1146,6 @@ class SerialBroadcastProxy:
                     state.replay_capture_seq = history_seq
                 continue
             if state.writer is None:
-                self._logger.debug("[bkd→%s] SKIP — not connected", state.client_id)
                 continue
             await self._send_frame_to_client(state, frame, packet_type, history_seq)
 
@@ -1282,16 +1155,15 @@ class SerialBroadcastProxy:
         self._logger.info(
             "[cache] snapshot before replay to %s: %s",
             state.client_id,
-            ", ".join(f"{fmt_ptype(pt)}×{len(fs)}" for pt, fs in self._state_cache.items()),
+            ", ".join(f"{fmt_ptype(pt)}×{len(b)}" for pt, b in self._state_cache.items()),
         )
-        # Replay singleton types first (SELF_INFO already sent — skip it),
-        # then collections, preserving insertion order within each bucket.
-        for packet_type, frames in list(self._state_cache.items()):
+        # SELF_INFO was already sent; replay the rest. CONTACT frames are wrapped
+        # in synthetic CONTACTS_START / END_OF_CONTACTS delimiters.
+        for packet_type, bucket in list(self._state_cache.items()):
             if packet_type == RESP_CODE_SELF_INFO:
                 continue
-            if packet_type == 0x03:
-                # Wrap CONTACT frames with synthetic delimiters.
-                snapshot = list(frames)
+            if packet_type == CONTACT_TYPE:
+                snapshot = list(bucket.values())
                 n = len(snapshot)
                 contacts_start = bytes([ord(">"), 5, 0, 0x02]) + struct.pack("<I", n)
                 await self._send_bytes_to_client(state, contacts_start)
@@ -1306,7 +1178,7 @@ class SerialBroadcastProxy:
                 end_of_contacts = bytes([ord(">"), 5, 0, 0x04]) + struct.pack("<I", most_recent)
                 await self._send_bytes_to_client(state, end_of_contacts)
                 continue
-            for frame in list(frames):
+            for frame in list(bucket.values()):
                 await self._send_bytes_to_client(state, frame)
                 total += 1
 
@@ -1348,10 +1220,6 @@ class SerialBroadcastProxy:
             if history_seq > state.replay_capture_seq:
                 state.pending_message_frames.append(BufferedFrame(seq=history_seq, data=frame))
                 state.replay_capture_seq = history_seq
-                self._logger.debug(
-                    "[bkd→%s] QUEUED seq=%d pending=%d",
-                    state.client_id, history_seq, len(state.pending_message_frames),
-                )
                 self._logger.info(
                     "[client] queued message seq=%d for %s (pending=%d)",
                     history_seq, state.client_id, len(state.pending_message_frames),
@@ -1360,22 +1228,9 @@ class SerialBroadcastProxy:
                 # CMD_SYNC_NEXT_MESSAGE.  Done AFTER queueing to avoid a race
                 # where the client SYNCs before the frame is in pending queue.
                 await self._send_bytes_to_client(state, build_backend_frame(0x83))
-            else:
-                self._logger.debug(
-                    "[bkd→%s] SKIP msg seq=%d — already at cursor=%d",
-                    state.client_id, history_seq, state.replay_capture_seq,
-                )
             return
 
-        if self._in_contact_dump and packet_type == 0x03:
-            if state is next(iter(self.client_states.values()), None):
-                self._suppressed_dump_count += 1
-
-        self._logger.debug(
-            "[bkd→%s] PUSH type=%s size=%dB", state.client_id, fmt_ptype(packet_type), len(frame)
-        )
         if not await self._send_bytes_to_client(state, frame):
-            self._logger.debug("[bkd→%s] PUSH FAILED — client dropped", state.client_id)
             return
 
         if packet_type == RESP_CODE_SELF_INFO and state.awaiting_replay_after_self_info:
@@ -1425,12 +1280,6 @@ def parse_args():
         help="Seconds before an inactive client state is pruned (0 = never, default: %(default)s). "
              "Should be >= --history-max-age to avoid full replays on reconnect.",
     )
-    ap.add_argument(
-        "--cache-bucket-max",
-        type=int,
-        default=DEFAULT_CACHE_BUCKET_MAX,
-        help="Max frames per catch-all cache bucket (default: %(default)s)",
-    )
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
     return ap.parse_args()
@@ -1461,7 +1310,6 @@ async def main_async():
         poll_interval=args.poll_interval,
         max_clients=args.max_clients,
         inactive_state_max_age=args.inactive_state_max_age,
-        cache_bucket_max=args.cache_bucket_max,
     )
 
     loop = asyncio.get_running_loop()
