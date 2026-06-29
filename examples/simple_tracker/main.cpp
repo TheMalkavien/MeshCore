@@ -121,7 +121,7 @@ void setup() {
   }
   TRACKER_DBG("radio_init done");
 
-  fast_rng.begin(radio_get_rng_seed());
+  fast_rng.begin(radio_driver.getRngSeed());
   TRACKER_DBG("rng seeded");
 
   FILESYSTEM* fs = beginFilesystemAndIdentity();

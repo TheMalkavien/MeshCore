@@ -791,8 +791,16 @@ void TrackerMesh::startTrackingCycle() {
   _cycle_start_gps_ts = before_enable.timestamp;
   _cycle_start_raw_lat = before_enable.raw_lat;
   _cycle_start_raw_lon = before_enable.raw_lon;
-  sensors.setSettingValue("gps", "1");
-  TRACKER_DBG("gps enabled request sent");
+  // Warm start: ne ré-active le GPS que s'il est éteint. Évite de rejouer
+  // _location->reset() (qui relance une acquisition à froid) à chaque cycle
+  // quand le GPS tourne déjà en continu (cas sleep off).
+  const char* gps_state = sensors.getSettingByKey("gps");
+  if (!(gps_state != NULL && gps_state[0] == '1')) {
+    sensors.setSettingValue("gps", "1");
+    TRACKER_DBG("gps enabled request sent");
+  } else {
+    TRACKER_DBG("gps already on, warm start (no reset)");
+  }
 #endif
 }
 
