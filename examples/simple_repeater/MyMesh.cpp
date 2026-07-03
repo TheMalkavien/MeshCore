@@ -165,7 +165,18 @@ static bool isOtaCLICommand(const char* command) {
 #define CTL_TYPE_NODE_DISCOVER_RESP  0x90
 
 mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
-  mesh::DispatcherAction action = mesh::Mesh::onRecvPacket(pkt);
+  if (pkt->getRouteType() == ROUTE_TYPE_TRANSPORT_FLOOD) {
+    recv_pkt_region = region_map.findMatch(pkt, REGION_DENY_FLOOD);
+  } else if (pkt->getRouteType() == ROUTE_TYPE_FLOOD) {
+    if (region_map.getWildcard().flags & REGION_DENY_FLOOD) {
+      recv_pkt_region = NULL;
+    } else {
+      recv_pkt_region =  &region_map.getWildcard();
+    }
+  } else {
+    recv_pkt_region = NULL;
+  }
+  mesh::DispatcherAction action = Mesh::onRecvPacket(pkt);
 
 #if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
   if (pkt->isRouteFlood()) {
@@ -1168,22 +1179,7 @@ uint32_t MyMesh::getDirectRetransmitDelay(const mesh::Packet *packet) {
   return getRNG()->nextInt(0, 5*t + 1);
 }
 
-bool MyMesh::filterRecvFloodPacket(mesh::Packet* pkt) {
-  // just try to determine region for packet (apply later in allowPacketForward())
-  if (pkt->getRouteType() == ROUTE_TYPE_TRANSPORT_FLOOD) {
-    recv_pkt_region = region_map.findMatch(pkt, REGION_DENY_FLOOD);
-  } else if (pkt->getRouteType() == ROUTE_TYPE_FLOOD) {
-    if (region_map.getWildcard().flags & REGION_DENY_FLOOD) {
-      recv_pkt_region = NULL;
-    } else {
-      recv_pkt_region =  &region_map.getWildcard();
-    }
-  } else {
-    recv_pkt_region = NULL;
-  }
-  // do normal processing
-  return false;
-}
+
 
 void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const mesh::Identity &sender,
                             uint8_t *data, size_t len) {
@@ -1524,6 +1520,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   active_cli_path_hash_size = PATH_HASH_SIZE;
   clearFloodRetryState();
   memset(&pending_ping, 0, sizeof(pending_ping));
+  recv_pkt_region = NULL;
 
 #if MAX_NEIGHBOURS
   memset(neighbours, 0, sizeof(neighbours));
