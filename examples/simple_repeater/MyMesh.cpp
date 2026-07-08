@@ -189,6 +189,28 @@ mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
   return action;
 }
 
+// Nearest scheduled wake for the low-power idle: the earliest deadline among active
+// flood-retry slots and an in-progress ping session. Returns 0 when nothing is pending.
+uint32_t MyMesh::nextAppWake(uint32_t now) const {
+  uint32_t best = 0;
+  (void)now;
+
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  for (int i = 0; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
+    if (!_flood_retry[i].active) continue;
+    uint32_t t = _flood_retry[i].next_retry_at;
+    if (best == 0 || (int32_t)(t - best) < 0) best = t;
+  }
+#endif
+
+  if (pending_ping.session_active) {
+    uint32_t t = pending_ping.active ? pending_ping.expiry_at : pending_ping.next_at;
+    if (t != 0 && (best == 0 || (int32_t)(t - best) < 0)) best = t;
+  }
+
+  return best;
+}
+
 void MyMesh::loadOtherPrefs() {
   // Always start from compile-time defaults so missing fields fall back gracefully.
   _other_prefs.flood_max_retries = FLOOD_RETRY_MAX_RETRANSMITS;
