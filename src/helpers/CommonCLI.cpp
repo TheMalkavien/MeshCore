@@ -495,6 +495,10 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       strcpy(reply, "on - After 2 minutes");
 #elif defined(WITH_BRIDGE)
       strcpy(reply, "Bridge not supported");
+#elif defined(RP2040_PLATFORM)
+      _prefs->powersaving_enabled = 1;
+      savePrefs();
+      strcpy(reply, "on - USB off after idle");
 #else
       strcpy(reply, "Board not supported");
 #endif

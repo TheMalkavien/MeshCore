@@ -45,7 +45,6 @@ extern "C" bool meshcore_board_usb_is_connected(void) {
 #ifndef ADMIN_PASSWORD
   #define ADMIN_PASSWORD "password"
 #endif
-#define ADMIN_PASSWORD "123456" // For easy configuration
 
 #ifndef SERVER_RESPONSE_DELAY
   #define SERVER_RESPONSE_DELAY 300
@@ -739,6 +738,9 @@ uint8_t MyMesh::handleAnonRegionsReq(const mesh::Identity& sender, uint32_t send
     reply_path_hash_size = (*data >> 6) + 1;
     data++;
 
+    // Guard against a forged/oversized return path: reply_path is MAX_PATH_SIZE bytes,
+    // but len*hash_size can reach 63*4 = 252. Reject rather than overflow reply_path.
+    if ((int)reply_path_len * reply_path_hash_size > MAX_PATH_SIZE) return 0;
     memcpy(reply_path, data, ((uint8_t)reply_path_len) * reply_path_hash_size);
     // data += (uint8_t)reply_path_len * reply_path_hash_size;
 
@@ -758,6 +760,9 @@ uint8_t MyMesh::handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender
     reply_path_hash_size = (*data >> 6) + 1;
     data++;
 
+    // Guard against a forged/oversized return path: reply_path is MAX_PATH_SIZE bytes,
+    // but len*hash_size can reach 63*4 = 252. Reject rather than overflow reply_path.
+    if ((int)reply_path_len * reply_path_hash_size > MAX_PATH_SIZE) return 0;
     memcpy(reply_path, data, ((uint8_t)reply_path_len) * reply_path_hash_size);
     // data += (uint8_t)reply_path_len * reply_path_hash_size;
 
@@ -778,6 +783,9 @@ uint8_t MyMesh::handleAnonClockReq(const mesh::Identity& sender, uint32_t sender
     reply_path_hash_size = (*data >> 6) + 1;
     data++;
 
+    // Guard against a forged/oversized return path: reply_path is MAX_PATH_SIZE bytes,
+    // but len*hash_size can reach 63*4 = 252. Reject rather than overflow reply_path.
+    if ((int)reply_path_len * reply_path_hash_size > MAX_PATH_SIZE) return 0;
     memcpy(reply_path, data, ((uint8_t)reply_path_len) * reply_path_hash_size);
     // data += (uint8_t)reply_path_len * reply_path_hash_size;
 
