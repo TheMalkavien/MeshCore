@@ -6,6 +6,10 @@
 
 #include <math.h>
 
+#if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
+  #include <pico/time.h>   // best_effort_wfe_or_timeout(), make_timeout_time_ms()
+#endif
+
 namespace mesh {
 
 #define MAX_RX_DELAY_MILLIS        32000  // 32 seconds
@@ -146,13 +150,59 @@ void Dispatcher::loop() {
   checkSend();
 
 #if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
-  // Idle the core until next interrupt (SysTick or radio IRQ) to trim idle current.
-  // Skip while a packet is in flight or queued for TX, so outbound work isn't
-  // delayed by up to one SysTick (~1ms) per loop.
-  if (outbound == NULL && _mgr->getOutboundTotal() == 0) {
-    __asm volatile("wfi");
+  // Low-power idle: sleep the core until the nearest scheduled deadline (delayed inbound,
+  // scheduled TX, noise-floor calibration, and subclass work such as flood-retry / ping)
+  // or until the radio DIO1 IRQ fires. best_effort_wfe_or_timeout() arms a hardware timer
+  // alarm (the same mechanism the core's sleep_ms uses) and waits on WFE, so wake-up does
+  // NOT rely on SysTick surviving WFI on RP2040. Never idle while a TX is in flight.
+  if (outbound == NULL) {
+    uint32_t sleep_ms = idleSleepMillis(_ms->getMillis());
+    if (sleep_ms > 0) {
+      best_effort_wfe_or_timeout(make_timeout_time_ms(sleep_ms));
+    }
   }
 #endif
+}
+
+uint32_t Dispatcher::idleSleepMillis(uint32_t now) const {
+  uint32_t sleep_ms = 2000;   // cap = noise-floor calib interval; also a safety net
+  int32_t d;
+
+  // periodic noise-floor calibration (always scheduled)
+  d = (int32_t)(next_floor_calib_time - now);
+  if (d <= 0) return 0;
+  if ((uint32_t)d < sleep_ms) sleep_ms = (uint32_t)d;
+
+  // periodic AGC reset (only when enabled)
+  if (getAGCResetInterval() > 0) {
+    d = (int32_t)(next_agc_reset_time - now);
+    if (d <= 0) return 0;
+    if ((uint32_t)d < sleep_ms) sleep_ms = (uint32_t)d;
+  }
+
+  // scheduled outbound (delayed TX) and delayed inbound (score-delayed RX) queues
+  uint32_t sched = _mgr->getNextOutboundSchedule();
+  if (sched != 0xFFFFFFFF) {
+    d = (int32_t)(sched - now);
+    if (d <= 0) return 0;
+    if ((uint32_t)d < sleep_ms) sleep_ms = (uint32_t)d;
+  }
+  sched = _mgr->getNextInboundSchedule();
+  if (sched != 0xFFFFFFFF) {
+    d = (int32_t)(sched - now);
+    if (d <= 0) return 0;
+    if ((uint32_t)d < sleep_ms) sleep_ms = (uint32_t)d;
+  }
+
+  // subclass-specific timed work (flood-retry, ping, ...)
+  uint32_t app = nextAppWake(now);
+  if (app != 0) {
+    d = (int32_t)(app - now);
+    if (d <= 0) return 0;
+    if ((uint32_t)d < sleep_ms) sleep_ms = (uint32_t)d;
+  }
+
+  return sleep_ms;
 }
 
 bool Dispatcher::tryParsePacket(Packet* pkt, const uint8_t* raw, int len) {

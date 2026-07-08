@@ -98,6 +98,11 @@ public:
   virtual Packet* removeOutboundByIdx(int i) = 0;
   virtual void queueInbound(Packet* packet, uint32_t scheduled_for) = 0;
   virtual Packet* getNextInbound(uint32_t now) = 0;
+
+  // Earliest scheduled_for (absolute millis) among queued packets, or 0xFFFFFFFF if the
+  // queue is empty. Used by the low-power idle to know when the next packet becomes due.
+  virtual uint32_t getNextOutboundSchedule() const { return 0xFFFFFFFF; }
+  virtual uint32_t getNextInboundSchedule() const { return 0xFFFFFFFF; }
 };
 
 typedef uint32_t  DispatcherAction;
@@ -172,6 +177,11 @@ protected:
   virtual int getAGCResetInterval() const { return 0; }    // disabled by default
   virtual unsigned long getDutyCycleWindowMs() const { return 3600000; }
 
+  // Nearest scheduled wake time (absolute millis) from subclass-specific timed work
+  // (e.g. flood-retry, ping), or 0 if none. Consulted by the RP2040 low-power idle so it
+  // never sleeps past such a deadline. Base has no such work.
+  virtual uint32_t nextAppWake(uint32_t now) const { return 0; }
+
 public:
   void begin();
   void loop();
@@ -199,6 +209,8 @@ public:
   bool tryParsePacket(Packet* pkt, const uint8_t* raw, int len);
 
 private:
+  // Milliseconds until the nearest scheduled wake, capped; 0 = work already due (do not sleep).
+  uint32_t idleSleepMillis(uint32_t now) const;
   void checkRecv();
   void checkSend();
 };
