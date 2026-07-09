@@ -325,7 +325,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
         strcpy(reply, "ERR: bad pubkey");
       }
     } else if (memcmp(command, "tempradio ", 10) == 0) {
-      strcpy(tmp, &command[10]);
+      StrHelper::strncpy(tmp, &command[10], sizeof(tmp));
       const char *parts[5];
       int num = mesh::Utils::parseTextParts(tmp, parts, 5);
       float freq  = num > 0 ? strtof(parts[0], nullptr) : 0.0f;
@@ -368,7 +368,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
         strcpy(reply, "null");
       }
     } else if (memcmp(command, "sensor set ", 11) == 0) {
-      strcpy(tmp, &command[11]);
+      StrHelper::strncpy(tmp, &command[11], sizeof(tmp));
       const char *parts[2];
       int num = mesh::Utils::parseTextParts(tmp, parts, 2, ' ');
       const char *key = (num > 0) ? parts[0] : "";
@@ -577,8 +577,8 @@ void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* rep
     strcpy(reply, "OK");
   } else if (memcmp(config, "flood.advert.interval ", 22) == 0) {
     int hours = _atoi(&config[22]);
-    if ((hours > 0 && hours < 1) || (hours > 168)) {
-      strcpy(reply, "Error: interval range is 1-168 hours");
+    if (hours < 0 || hours > 168) {   // 0 = disabled; reject negatives (would wrap in uint8_t) and >168
+      strcpy(reply, "Error: interval range is 0-168 hours (0 = off)");
     } else {
       _prefs->flood_advert_interval = (uint8_t)(hours);
       _callbacks->updateFloodAdvertTimer();
@@ -656,7 +656,7 @@ void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* rep
       strcpy(reply, "Error: state must be on or off");
     }
   } else if (memcmp(config, "radio ", 6) == 0) {
-    strcpy(tmp, &config[6]);
+    StrHelper::strncpy(tmp, &config[6], sizeof(tmp));
     const char *parts[4];
     int num = mesh::Utils::parseTextParts(tmp, parts, 4);
     float freq  = num > 0 ? strtof(parts[0], nullptr) : 0.0f;
@@ -1016,7 +1016,7 @@ void CommonCLI::handleGetCmd(uint32_t sender_timestamp, char* command, char* rep
     strcpy(reply, "ERROR: Power management not supported");
 #endif
   } else {
-    sprintf(reply, "??: %s", config);
+    snprintf(reply, 160, "??: %s", config);
   }
 }
 

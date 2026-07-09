@@ -133,9 +133,11 @@ class Dispatcher {
   unsigned long tx_budget_ms;
   unsigned long last_budget_update;
   unsigned long duty_cycle_window_ms;
+  float _cached_airtime_factor, _cached_duty_cycle;   // memoised duty cycle (see currentDutyCycle)
 
   void processRecvPacket(Packet* pkt);
   void updateTxBudget();
+  float currentDutyCycle();
 
 protected:
   PacketManager* _mgr;
@@ -157,6 +159,8 @@ protected:
     tx_budget_ms = 0;
     last_budget_update = 0;
     duty_cycle_window_ms = 3600000;
+    _cached_airtime_factor = -1.0f;   // force currentDutyCycle() to compute on first use
+    _cached_duty_cycle = 0.5f;
   }
 
   virtual DispatcherAction onRecvPacket(Packet* pkt) = 0;
