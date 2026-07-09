@@ -39,6 +39,7 @@ import hashlib
 import hmac as _hmac
 import json
 import logging
+import queue
 import threading
 import time
 from collections import OrderedDict
@@ -83,7 +84,7 @@ def psk_to_bytes(psk_str: str) -> bytes:
     """Accept 16-byte PSK as base64 or hex, return raw 16 bytes."""
     s = psk_str.strip()
     for decoder in (
-        lambda v: base64.b64decode(v),
+        lambda v: base64.b64decode(v, validate=True),
         lambda v: bytes.fromhex(v),
     ):
         try:
@@ -225,6 +226,9 @@ def parse_grp_txt_packet(
     # Plaintext layout: [0:4] timestamp (LE uint32) | [4] txt_type (0=PLAIN) | [5:] "sender: msg"
     # onChannelMessageRecv receives &data[5], so we must skip 5 bytes, not 4.
     if len(plaintext) < 6:
+        return None
+
+    if plaintext[4] != 0:   # txt_type: only PLAIN (0) has the "sender: msg" layout we parse
         return None
 
     text = plaintext[5:].rstrip(b"\x00").decode("utf-8", errors="replace")
@@ -395,8 +399,10 @@ class TelegramSender:
                 )
             except requests.RequestException as exc:
                 delay = TG_RETRY_BASE_SECS ** attempt
+                # NB: log the exception *type* only — str(exc) embeds the request URL,
+                # which contains the bot token.
                 log.warning(
-                    f"[telegram] send attempt {attempt + 1}/{TG_MAX_RETRIES} failed: {exc}"
+                    f"[telegram] send attempt {attempt + 1}/{TG_MAX_RETRIES} failed: {type(exc).__name__}"
                     + (f", retrying in {delay:.0f}s" if attempt + 1 < TG_MAX_RETRIES else "")
                 )
                 if attempt + 1 < TG_MAX_RETRIES:
@@ -501,6 +507,11 @@ class MeshCoreMQTTBot:
         self._stats_interval = stats_interval
         self._stats_timer: Optional[threading.Timer] = None
 
+        # Telegram is delivered from a dedicated worker thread so its retry/rate-limit
+        # sleeps never block the MQTT network thread (which must keep servicing keepalive).
+        self._tg_queue: "queue.Queue" = queue.Queue(maxsize=1000)
+        self._tg_worker: Optional[threading.Thread] = None
+
         log.info(
             f"Config — channel hash: 0x{self._ch_hash:02X} | "
             f"dedup TTL: {dedup_ttl}s | "
@@ -526,7 +537,7 @@ class MeshCoreMQTTBot:
             f"throttled={s['throttled']} | "
             f"forwarded={s['forwarded']} | "
             f"tg_errors={s['telegram_errors']} | "
-            f"mqtt_reconnects={s['mqtt_disconnects']}"
+            f"mqtt_disconnects={s['mqtt_disconnects']}"
         )
         self._throttle.cleanup_stale_senders()
         self._schedule_stats()  # reschedule
@@ -567,7 +578,33 @@ class MeshCoreMQTTBot:
     def _on_subscribe(self, _client, _userdata, mid, granted_qos) -> None:
         log.debug(f"[mqtt] subscription confirmed mid={mid} qos={granted_qos}")
 
+    def _tg_worker_loop(self) -> None:
+        """Consume the Telegram send queue off the MQTT thread."""
+        while True:
+            item = self._tg_queue.get()
+            if item is None:      # shutdown sentinel
+                break
+            sender, message, tg_text = item
+            try:
+                ok = self._tg.send(tg_text)
+            except Exception:
+                log.exception("[telegram] unexpected error while sending")
+                ok = False
+            if ok:
+                self._stats.inc("forwarded")
+            else:
+                self._stats.inc("telegram_errors")
+                log.error(f"[telegram] failed to forward message from {sender!r}: {message!r}")
+
     def _on_message(self, client, userdata, msg) -> None:
+        # A malformed publish must never escape into paho's loop (which would kill
+        # the bot); swallow and log any unexpected error here.
+        try:
+            self._handle_message(msg)
+        except Exception:
+            log.exception("[mqtt] error handling message; ignoring")
+
+    def _handle_message(self, msg) -> None:
         # ── Parse JSON ────────────────────────────────────────────────────────
         try:
             data = json.loads(msg.payload)
@@ -632,27 +669,39 @@ class MeshCoreMQTTBot:
             log.info(f"[throttle] SKIP message from {sender!r}: {reason}")
             return
 
-        # ── Forward to Telegram ───────────────────────────────────────────────
+        # ── Forward to Telegram (async: hand off to the worker thread) ────────
         tg_text = f"[{sender}] : {message}"
         log.info(
             f"[forward] [{sender}] : {message!r} "
             f"(id={stable_id}, SNR={snr}, RSSI={rssi})"
         )
 
-        if self._tg.send(tg_text):
-            self._stats.inc("forwarded")
-        else:
+        try:
+            self._tg_queue.put_nowait((sender, message, tg_text))
+        except queue.Full:
             self._stats.inc("telegram_errors")
-            log.error(
-                f"[telegram] failed to forward message from {sender!r}: {message!r}"
-            )
+            log.warning("[telegram] send queue full — dropping message (Telegram backlog?)")
 
     # ── Main run loop ─────────────────────────────────────────────────────────
 
     def run(self) -> None:
         self._schedule_stats()
 
-        client = mqtt.Client(client_id="meshcore_tg_bot", clean_session=True)
+        self._tg_worker = threading.Thread(
+            target=self._tg_worker_loop, name="tg-sender", daemon=True
+        )
+        self._tg_worker.start()
+
+        # paho-mqtt 2.x requires an explicit callback API version; request VERSION1 so the
+        # v1 callback signatures used below keep working. paho 1.x lacks the enum → fall back.
+        try:
+            client = mqtt.Client(
+                mqtt.CallbackAPIVersion.VERSION1,
+                client_id="meshcore_tg_bot",
+                clean_session=True,
+            )
+        except (AttributeError, TypeError):
+            client = mqtt.Client(client_id="meshcore_tg_bot", clean_session=True)
         if self._user:
             client.username_pw_set(self._user, self._pass)
 
@@ -691,6 +740,9 @@ class MeshCoreMQTTBot:
             if self._stats_timer:
                 self._stats_timer.cancel()
             client.disconnect()
+            self._tg_queue.put(None)          # stop the Telegram worker
+            if self._tg_worker:
+                self._tg_worker.join(timeout=5)
             self._emit_stats()
             log.info("[mqtt] disconnected")
 
