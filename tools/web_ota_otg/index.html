@@ -623,20 +623,11 @@
       }
     });
 
-    // ── Connection status helper (call from app.js if needed) ──
-    window.setConnectionStatus = function(text, state) {
-      const el = document.getElementById('connectionStatus');
-      el.textContent = text;
-      el.className = state || '';
-      const pills = document.getElementById('nodePills');
-      if (state === 'ok') {
-        pills.style.display = 'flex';
-        document.getElementById('step1badge').classList.add('done');
-      } else {
-        pills.style.display = 'none';
-        document.getElementById('step1badge').classList.remove('done');
-      }
-    };
+    // ── Connection status helper ──
+    // The implementation lives in app.js (setConnectionStatus): it manages the
+    // status pill classes (.ok/.err), the #nodePills visibility and the
+    // #step1badge "done" state. It is intentionally not redefined here so the
+    // two scripts no longer fight over window.setConnectionStatus.
 
     // ── Remote reboot button ──
     document.getElementById('rebootBtn').addEventListener('click', async function() {

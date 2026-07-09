@@ -246,32 +246,6 @@ async function gzipBytes(bytes) {
   return out;
 }
 
-function isWebSerialPortLike(port) {
-  return Boolean(
-    port
-    && typeof port.open === "function"
-    && port.readable
-    && port.writable
-  );
-}
-
-function isWebUsbDeviceLike(device) {
-  return Boolean(
-    device
-    && typeof device.open === "function"
-    && typeof device.transferIn === "function"
-    && typeof device.transferOut === "function"
-  );
-}
-
-function isWebBleDeviceLike(device) {
-  return Boolean(
-    device
-    && device.gatt
-    && typeof device.gatt.connect === "function"
-  );
-}
-
 function getUsbBrowserPreference() {
   const ua = String(navigator.userAgent || "").toLowerCase();
   const platform = String(navigator.platform || "").toLowerCase();
@@ -711,7 +685,11 @@ class MeshCoreSerialClient {
     this.bleDisconnectHandler = null;
     this.transport = null;
     this.connected = false;
-    this.rxPending = [];
+    // RX accumulation buffer: a growable Uint8Array consumed via head/tail
+    // offsets (no per-byte push / indexOf / splice).
+    this.rxBuf = new Uint8Array(4096);
+    this.rxHead = 0;
+    this.rxTail = 0;
     this.waiters = [];
     this.seq = Date.now() & 0xffff;
     this.messageQueue = [];
@@ -722,22 +700,6 @@ class MeshCoreSerialClient {
     this.contactsScanTmp = {};
     this.onEvent = null;
     this.writeChain = Promise.resolve();
-  }
-
-  async connect(portOrDevice, baudrate) {
-    if (isWebSerialPortLike(portOrDevice)) {
-      await this.connectSerial(portOrDevice, baudrate);
-      return;
-    }
-    if (isWebUsbDeviceLike(portOrDevice)) {
-      await this.connectWebUsb(portOrDevice, baudrate);
-      return;
-    }
-    if (isWebBleDeviceLike(portOrDevice)) {
-      await this.connectBle(portOrDevice);
-      return;
-    }
-    throw new Error("transport non supporte");
   }
 
   async connectSerial(port, baudrate) {
@@ -754,7 +716,7 @@ class MeshCoreSerialClient {
     this.writer = this.port.writable.getWriter();
     this.transport = "web_serial";
     this.connected = true;
-    this.rxPending = [];
+    this.resetRxBuffer();
     this.readLoopSerial();
   }
 
@@ -888,7 +850,7 @@ class MeshCoreSerialClient {
 
     this.transport = "web_usb";
     this.connected = true;
-    this.rxPending = [];
+    this.resetRxBuffer();
     this.readLoopWebUsb();
   }
 
@@ -927,7 +889,7 @@ class MeshCoreSerialClient {
 
     this.transport = "web_ble";
     this.connected = true;
-    this.rxPending = [];
+    this.resetRxBuffer();
   }
 
   async disconnect() {
@@ -1048,28 +1010,61 @@ class MeshCoreSerialClient {
     }
   }
 
+  resetRxBuffer() {
+    this.rxHead = 0;
+    this.rxTail = 0;
+  }
+
   pushRxChunk(chunk) {
-    for (const b of chunk) this.rxPending.push(b);
+    if (!chunk || chunk.length === 0) return;
+    // Drop the fully-consumed prefix once the buffer has been drained.
+    if (this.rxHead === this.rxTail) {
+      this.rxHead = 0;
+      this.rxTail = 0;
+    }
+    // Compact live bytes to the front if that frees enough room for the chunk.
+    if (this.rxHead > 0 && this.rxTail + chunk.length > this.rxBuf.length) {
+      this.rxBuf.copyWithin(0, this.rxHead, this.rxTail);
+      this.rxTail -= this.rxHead;
+      this.rxHead = 0;
+    }
+    // Grow (doubling) if compaction was not enough.
+    if (this.rxTail + chunk.length > this.rxBuf.length) {
+      let newSize = this.rxBuf.length * 2;
+      while (newSize < this.rxTail + chunk.length) newSize *= 2;
+      const grown = new Uint8Array(newSize);
+      grown.set(this.rxBuf.subarray(0, this.rxTail), 0);
+      this.rxBuf = grown;
+    }
+    this.rxBuf.set(chunk, this.rxTail);
+    this.rxTail += chunk.length;
   }
 
   parseFrames() {
     while (true) {
-      const start = this.rxPending.indexOf(0x3e);
+      // Locate the next frame-start marker (0x3e) within the live window.
+      let start = -1;
+      for (let i = this.rxHead; i < this.rxTail; i += 1) {
+        if (this.rxBuf[i] === 0x3e) { start = i; break; }
+      }
       if (start < 0) {
-        if (this.rxPending.length > 2048) this.rxPending = [];
+        // No frame start pending: discard garbage that grew unbounded.
+        if (this.rxTail - this.rxHead > 2048) this.resetRxBuffer();
         return;
       }
-      if (start > 0) this.rxPending.splice(0, start);
-      if (this.rxPending.length < 3) return;
-      const frameSize = this.rxPending[1] | (this.rxPending[2] << 8);
+      this.rxHead = start;
+      const available = this.rxTail - this.rxHead;
+      if (available < 3) return;
+      const frameSize = this.rxBuf[this.rxHead + 1] | (this.rxBuf[this.rxHead + 2] << 8);
       if (frameSize <= 0 || frameSize > 300) {
-        this.rxPending.shift();
+        this.rxHead += 1;
         continue;
       }
-      if (this.rxPending.length < 3 + frameSize) return;
-      const frame = this.rxPending.slice(3, 3 + frameSize);
-      this.rxPending.splice(0, 3 + frameSize);
-      this.handleFrame(new Uint8Array(frame));
+      if (available < 3 + frameSize) return;
+      // slice() returns a fresh Uint8Array copy, so reusing rxBuf is safe.
+      const frame = this.rxBuf.slice(this.rxHead + 3, this.rxHead + 3 + frameSize);
+      this.rxHead += 3 + frameSize;
+      this.handleFrame(frame);
     }
   }
 
@@ -1299,7 +1294,8 @@ class MeshCoreSerialClient {
 
   waitForEvent(types, predicate = null, timeoutMs = 5000) {
     const typeSet = new Set(Array.isArray(types) ? types : [types]);
-    return new Promise((resolve, reject) => {
+    let waiterRef = null;
+    const promise = new Promise((resolve, reject) => {
       const waiter = {
         types: typeSet,
         predicate,
@@ -1310,8 +1306,22 @@ class MeshCoreSerialClient {
           reject(new Error(`timeout waiting events: ${Array.from(typeSet).join(",")}`));
         }, timeoutMs),
       };
+      waiterRef = waiter;
       this.waiters.push(waiter);
     });
+    // Let a caller tear the waiter down: clears its timer, removes it from the
+    // pending list and rejects the promise. Used when a send fails so an
+    // abandoned waiter does not keep a live timer that later fires into an
+    // unhandled promise rejection.
+    promise.cancel = (err) => {
+      if (!waiterRef) return;
+      const waiter = waiterRef;
+      waiterRef = null;
+      clearTimeout(waiter.timer);
+      this.waiters = this.waiters.filter((w) => w !== waiter);
+      waiter.reject(err instanceof Error ? err : new Error(err ? String(err) : "cancelled"));
+    };
+    return promise;
   }
 
   async sendFrame(payload) {
@@ -1382,7 +1392,18 @@ class MeshCoreSerialClient {
   async sendCommand(payload, expectedTypes = [], predicate = null, timeoutMs = 5000) {
     const wantsReply = Array.isArray(expectedTypes) ? expectedTypes.length > 0 : Boolean(expectedTypes);
     const waiter = wantsReply ? this.waitForEvent(expectedTypes, predicate, timeoutMs) : null;
-    await this.sendFrame(payload);
+    try {
+      await this.sendFrame(payload);
+    } catch (e) {
+      if (waiter && typeof waiter.cancel === "function") {
+        // Nobody awaits the waiter on this failure path: attach a no-op catch
+        // to absorb the rejection cancel() is about to trigger, then tear the
+        // waiter (and its timer) down before re-throwing the send error.
+        waiter.catch(() => {});
+        waiter.cancel(e);
+      }
+      throw e;
+    }
     if (!waiter) return null;
     return waiter;
   }
@@ -1752,6 +1773,7 @@ const ui = {
   disconnectBtn: document.querySelector("#disconnectBtn"),
   startOtaBtn: document.querySelector("#startOtaBtn"),
   cancelOtaBtn: document.querySelector("#cancelOtaBtn"),
+  rebootBtn: document.querySelector("#rebootBtn"),
   refreshTargetsBtn: document.querySelector("#refreshTargetsBtn"),
   connectionMode: document.querySelector("#connectionMode"),
   baudrate: document.querySelector("#baudrate"),
@@ -1787,13 +1809,41 @@ let otaCancelRequested = false;
 let lastSelfInfo = null;
 let lastPlanSummary = "";
 
+// Cap the journal so long OTA sessions do not grow the textarea (and the cost
+// of every append) without bound. The buffer is kept in JS; only the trimmed
+// text is written to the DOM.
+const MAX_LOG_CHARS = 100000;
+let logText = "";
+
 function appendLog(line) {
-  ui.log.value += `[${nowTime()}] ${line}\n`;
+  logText += `[${nowTime()}] ${line}\n`;
+  if (logText.length > MAX_LOG_CHARS) {
+    // Drop the oldest lines, trimming to a line boundary when possible.
+    const excess = logText.length - MAX_LOG_CHARS;
+    const nextBreak = logText.indexOf("\n", excess);
+    logText = nextBreak >= 0 ? logText.slice(nextBreak + 1) : logText.slice(excess);
+  }
+  ui.log.value = logText;
   ui.log.scrollTop = ui.log.scrollHeight;
 }
 
-function setConnectionStatus(text, ok = false) {
-  ui.connectionStatus.innerHTML = ok ? `<strong>${text}</strong>` : text;
+function setConnectionStatus(text, state = "") {
+  // Accept both the legacy boolean signature (true => connected/ok) and an
+  // explicit state string ("ok" | "err" | "").
+  const normalized = state === true ? "ok" : (state || "");
+  if (ui.connectionStatus) {
+    ui.connectionStatus.textContent = text;
+    ui.connectionStatus.className = normalized;
+  }
+  const pills = document.getElementById("nodePills");
+  const badge = document.getElementById("step1badge");
+  if (normalized === "ok") {
+    if (pills) pills.style.display = "flex";
+    if (badge) badge.classList.add("done");
+  } else {
+    if (pills) pills.style.display = "none";
+    if (badge) badge.classList.remove("done");
+  }
 }
 
 function setOtaStatus(text) {
@@ -1928,6 +1978,7 @@ function updateButtons() {
   ui.disconnectBtn.disabled = !connected || otaRunning;
   ui.startOtaBtn.disabled = !connected || otaRunning;
   ui.cancelOtaBtn.disabled = !otaRunning;
+  if (ui.rebootBtn) ui.rebootBtn.disabled = !connected || otaRunning;
   if (ui.refreshTargetsBtn) ui.refreshTargetsBtn.disabled = !connected || otaRunning;
   if (ui.targetSelect) ui.targetSelect.disabled = !connected || otaRunning;
   if (ui.targetKey) ui.targetKey.disabled = otaRunning;
@@ -3227,6 +3278,13 @@ async function connectClientWithBestUsbTransport(baudrate) {
       return;
     } catch (e) {
       serialErr = e;
+      // A cancelled chooser (user dismissed the Web Serial picker) is an abort,
+      // not a transport failure: stop here instead of opening a second WebUSB
+      // picker and treating the cancellation as a fallback trigger.
+      if (e && (e.name === "NotFoundError" || e.name === "AbortError")) {
+        appendLog("Selection Web Serial annulee par l'utilisateur.");
+        throw e;
+      }
       appendLog(`Web Serial indisponible: ${e.message}`);
     }
   } else {
@@ -3278,7 +3336,7 @@ ui.connectBtn.addEventListener("click", async () => {
     await initClientSession(baudrate);
   } catch (e) {
     appendLog(`Connexion impossible: ${e.message}`);
-    setConnectionStatus("Connexion echouee");
+    setConnectionStatus("Connexion echouee", "err");
     if (client) {
       await client.disconnect();
       client = null;
