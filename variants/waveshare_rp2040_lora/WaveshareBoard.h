@@ -117,11 +117,11 @@ public:
   #define RP2040_OTA_CLOCK_MHZ 125
 #endif
 
-inline void rp2040_apply_clock_profile(uint32_t clock_mhz) {
+inline bool rp2040_apply_clock_profile(uint32_t clock_mhz) {
   if (!set_sys_clock_khz(clock_mhz * KHZ, false)) {
     // Requested frequency not achievable: clk_sys is unchanged, so leave the
     // derived clocks alone rather than re-deriving them from a wrong base.
-    return;
+    return false;
   }
 
   // Keep SPI, ADC and RTC on coherent clock sources after changing clk_sys.
@@ -134,12 +134,16 @@ inline void rp2040_apply_clock_profile(uint32_t clock_mhz) {
                   CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
                   clock_mhz * MHZ, clock_mhz * MHZ);
   clock_configure(clk_rtc, 0, CLOCKS_CLK_RTC_CTRL_AUXSRC_VALUE_XOSC_CLKSRC, 12 * MHZ, 46875);
+  return true;
 }
 
 #ifdef MLK_RP2040_LOWPOWER
 inline void rp2040_enter_sleep_profile() {
-  rp2040_apply_clock_profile(RP2040_SLEEP_CLOCK_MHZ);
-  vreg_set_voltage(VREG_VOLTAGE_0_90);
+  // Only drop core voltage if the clock actually came down; otherwise we'd under-volt
+  // the core while it is still running at the higher active frequency.
+  if (rp2040_apply_clock_profile(RP2040_SLEEP_CLOCK_MHZ)) {
+    vreg_set_voltage(VREG_VOLTAGE_0_90);
+  }
 }
 #endif
 
