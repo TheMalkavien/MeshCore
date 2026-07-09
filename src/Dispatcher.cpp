@@ -27,7 +27,7 @@ void Dispatcher::begin() {
   radio_nonrx_start = _ms->getMillis();
 
   duty_cycle_window_ms = getDutyCycleWindowMs();
-  float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
+  float duty_cycle = currentDutyCycle();
   tx_budget_ms = (unsigned long)(duty_cycle_window_ms * duty_cycle);
   last_budget_update = _ms->getMillis();
 
@@ -43,7 +43,7 @@ void Dispatcher::updateTxBudget() {
   unsigned long now = _ms->getMillis();
   unsigned long elapsed = now - last_budget_update;
 
-  float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
+  float duty_cycle = currentDutyCycle();
   unsigned long max_budget = (unsigned long)(getDutyCycleWindowMs() * duty_cycle);
   unsigned long refill = (unsigned long)(elapsed * duty_cycle);
   
@@ -57,7 +57,18 @@ void Dispatcher::updateTxBudget() {
 }
 
 int Dispatcher::calcRxDelay(float score, uint32_t air_time) const {
-  return (int) ((pow(10, 0.85f - score) - 1.0) * air_time);
+  return (int) ((powf(10.0f, 0.85f - score) - 1.0f) * air_time);
+}
+
+float Dispatcher::currentDutyCycle() {
+  // Memoised: recompute only when the airtime budget factor actually changes,
+  // avoiding a soft-float division on every TX-budget update on the M0+.
+  float f = getAirtimeBudgetFactor();
+  if (f != _cached_airtime_factor) {
+    _cached_airtime_factor = f;
+    _cached_duty_cycle = 1.0f / (1.0f + f);
+  }
+  return _cached_duty_cycle;
 }
 
 uint32_t Dispatcher::getCADFailRetryDelay() const {
@@ -102,7 +113,7 @@ void Dispatcher::loop() {
       }
 
       if (tx_budget_ms < MIN_TX_BUDGET_RESERVE_MS) {
-        float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
+        float duty_cycle = currentDutyCycle();
         unsigned long needed = MIN_TX_BUDGET_RESERVE_MS - tx_budget_ms;
         next_tx_time = futureMillis((unsigned long)(needed / duty_cycle));
       } else {
@@ -338,7 +349,7 @@ void Dispatcher::checkSend() {
   
   uint32_t est_airtime = _radio->getEstAirtimeFor(MAX_TRANS_UNIT);
   if (tx_budget_ms < est_airtime / MIN_TX_BUDGET_AIRTIME_DIV) {
-    float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
+    float duty_cycle = currentDutyCycle();
     unsigned long needed = est_airtime / MIN_TX_BUDGET_AIRTIME_DIV - tx_budget_ms;
     next_tx_time = futureMillis((unsigned long)(needed / duty_cycle));
     return;
