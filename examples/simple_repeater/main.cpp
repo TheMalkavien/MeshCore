@@ -135,8 +135,8 @@ void loop() {
     }
     if (c == '\r') break;
   }
-  if (len == sizeof(command)-1) {  // command buffer full
-    command[sizeof(command)-1] = '\r';
+  if (len == sizeof(command)-1) {  // command buffer full: force end-of-line at the last
+    command[sizeof(command)-2] = '\r';  // data slot, keeping the '\0' at [size-1] intact
   }
 
   if (len > 0 && command[len - 1] == '\r') {  // received complete line
@@ -183,10 +183,11 @@ void loop() {
     if (the_mesh.hasPendingWork()) {
       // Keep postponing sleep while work is pending.
       lastActive = millis();
-    } else if (the_mesh.millisHasNowPassed(lastActive + nextSleepinSecs * 1000)) { // To check if it is time to sleep
-      board.sleep(1800);             // To sleep. Wake up after 30 minutes or when receiving a LoRa packet
+    } else if (the_mesh.millisHasNowPassed(lastActive + nextSleepinSecs * 1000)) { // time to enter low-power?
+      board.sleep(1800);   // 'secs' is ignored: on RP2040 this drops to the low clock/USB-off profile
+                           // continuously (no wake timer); the radio keeps receiving. See WaveshareBoard::sleep().
       lastActive = millis();
-      nextSleepinSecs = 5;  // Default: To work for 5s and sleep again
+      nextSleepinSecs = 5;  // re-evaluate again 5 s after each low-power entry
     }
     #endif
   }

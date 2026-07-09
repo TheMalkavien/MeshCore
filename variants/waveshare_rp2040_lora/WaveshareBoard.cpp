@@ -86,7 +86,11 @@ void WaveshareBoard::begin() {
 
 
 void WaveshareBoard::sleep(uint32_t secs) {
-  // if MLK_RP2040_LOWPOWER is defined, we will disable usb insted of sleeping, as RP2040 doesn't have a real sleep mode, and disabling USB can save power significantly.
+  // NOTE: 'secs' is ignored and there is NO real sleep / wake-timer here. The RP2040 has no
+  // usable deep-sleep in this design, so "sleeping" means: disable USB and drop to the low
+  // clock/voltage profile, staying there continuously until an incoming 'usb on' command.
+  // The radio keeps receiving; there is no timed wake-up.
+  (void)secs;
   #if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
     if (ota.isSleepInhibited()) {
       return;
