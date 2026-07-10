@@ -6,6 +6,10 @@
 
 #include <math.h>
 
+#if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
+  #include <pico/time.h>   // best_effort_wfe_or_timeout(), make_timeout_time_ms()
+#endif
+
 namespace mesh {
 
 #define MAX_RX_DELAY_MILLIS        32000  // 32 seconds
@@ -23,7 +27,7 @@ void Dispatcher::begin() {
   radio_nonrx_start = _ms->getMillis();
 
   duty_cycle_window_ms = getDutyCycleWindowMs();
-  float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
+  float duty_cycle = currentDutyCycle();
   tx_budget_ms = (unsigned long)(duty_cycle_window_ms * duty_cycle);
   last_budget_update = _ms->getMillis();
 
@@ -39,7 +43,7 @@ void Dispatcher::updateTxBudget() {
   unsigned long now = _ms->getMillis();
   unsigned long elapsed = now - last_budget_update;
 
-  float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
+  float duty_cycle = currentDutyCycle();
   unsigned long max_budget = (unsigned long)(getDutyCycleWindowMs() * duty_cycle);
   unsigned long refill = (unsigned long)(elapsed * duty_cycle);
   
@@ -53,7 +57,18 @@ void Dispatcher::updateTxBudget() {
 }
 
 int Dispatcher::calcRxDelay(float score, uint32_t air_time) const {
-  return (int) ((pow(10, 0.85f - score) - 1.0) * air_time);
+  return (int) ((powf(10.0f, 0.85f - score) - 1.0f) * air_time);
+}
+
+float Dispatcher::currentDutyCycle() {
+  // Memoised: recompute only when the airtime budget factor actually changes,
+  // avoiding a soft-float division on every TX-budget update on the M0+.
+  float f = getAirtimeBudgetFactor();
+  if (f != _cached_airtime_factor) {
+    _cached_airtime_factor = f;
+    _cached_duty_cycle = 1.0f / (1.0f + f);
+  }
+  return _cached_duty_cycle;
 }
 
 uint32_t Dispatcher::getCADFailRetryDelay() const {
@@ -66,6 +81,7 @@ uint32_t Dispatcher::getCADFailMaxDuration() const {
 void Dispatcher::loop() {
   if (millisHasNowPassed(next_floor_calib_time)) {
     _radio->triggerNoiseFloorCalibrate(getInterferenceThreshold());
+    _radio->setCADEnabled(getCADEnabled());
     next_floor_calib_time = futureMillis(NOISE_FLOOR_CALIB_INTERVAL);
   }
   _radio->loop();
@@ -97,7 +113,7 @@ void Dispatcher::loop() {
       }
 
       if (tx_budget_ms < MIN_TX_BUDGET_RESERVE_MS) {
-        float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
+        float duty_cycle = currentDutyCycle();
         unsigned long needed = MIN_TX_BUDGET_RESERVE_MS - tx_budget_ms;
         next_tx_time = futureMillis((unsigned long)(needed / duty_cycle));
       } else {
@@ -143,6 +159,61 @@ void Dispatcher::loop() {
   }
   checkRecv();
   checkSend();
+
+#if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
+  // Low-power idle: sleep the core until the nearest scheduled deadline (delayed inbound,
+  // scheduled TX, noise-floor calibration, and subclass work such as flood-retry / ping)
+  // or until the radio DIO1 IRQ fires. best_effort_wfe_or_timeout() arms a hardware timer
+  // alarm (the same mechanism the core's sleep_ms uses) and waits on WFE, so wake-up does
+  // NOT rely on SysTick surviving WFI on RP2040. Never idle while a TX is in flight.
+  if (outbound == NULL) {
+    uint32_t sleep_ms = idleSleepMillis(_ms->getMillis());
+    if (sleep_ms > 0) {
+      best_effort_wfe_or_timeout(make_timeout_time_ms(sleep_ms));
+    }
+  }
+#endif
+}
+
+uint32_t Dispatcher::idleSleepMillis(uint32_t now) const {
+  uint32_t sleep_ms = 2000;   // cap = noise-floor calib interval; also a safety net
+  int32_t d;
+
+  // periodic noise-floor calibration (always scheduled)
+  d = (int32_t)(next_floor_calib_time - now);
+  if (d <= 0) return 0;
+  if ((uint32_t)d < sleep_ms) sleep_ms = (uint32_t)d;
+
+  // periodic AGC reset (only when enabled)
+  if (getAGCResetInterval() > 0) {
+    d = (int32_t)(next_agc_reset_time - now);
+    if (d <= 0) return 0;
+    if ((uint32_t)d < sleep_ms) sleep_ms = (uint32_t)d;
+  }
+
+  // scheduled outbound (delayed TX) and delayed inbound (score-delayed RX) queues
+  uint32_t sched = _mgr->getNextOutboundSchedule();
+  if (sched != 0xFFFFFFFF) {
+    d = (int32_t)(sched - now);
+    if (d <= 0) return 0;
+    if ((uint32_t)d < sleep_ms) sleep_ms = (uint32_t)d;
+  }
+  sched = _mgr->getNextInboundSchedule();
+  if (sched != 0xFFFFFFFF) {
+    d = (int32_t)(sched - now);
+    if (d <= 0) return 0;
+    if ((uint32_t)d < sleep_ms) sleep_ms = (uint32_t)d;
+  }
+
+  // subclass-specific timed work (flood-retry, ping, ...)
+  uint32_t app = nextAppWake(now);
+  if (app != 0) {
+    d = (int32_t)(app - now);
+    if (d <= 0) return 0;
+    if ((uint32_t)d < sleep_ms) sleep_ms = (uint32_t)d;
+  }
+
+  return sleep_ms;
 }
 
 bool Dispatcher::tryParsePacket(Packet* pkt, const uint8_t* raw, int len) {
@@ -278,7 +349,7 @@ void Dispatcher::checkSend() {
   
   uint32_t est_airtime = _radio->getEstAirtimeFor(MAX_TRANS_UNIT);
   if (tx_budget_ms < est_airtime / MIN_TX_BUDGET_AIRTIME_DIV) {
-    float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
+    float duty_cycle = currentDutyCycle();
     unsigned long needed = est_airtime / MIN_TX_BUDGET_AIRTIME_DIV - tx_budget_ms;
     next_tx_time = futureMillis((unsigned long)(needed / duty_cycle));
     return;

@@ -1,6 +1,8 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
-
+#ifdef MLK_PIN_SERIAL_RX
+#define Serial Serial2
+#endif
 #include "MyMesh.h"
 
 #ifdef DISPLAY_CLASS
@@ -19,9 +21,23 @@ void halt() {
 
 static char command[160];
 
+static bool isUsbOffCommand(const char *cmd) {
+  while (*cmd == ' ') {
+    cmd++;
+  }
+  if (strlen(cmd) > 3 && cmd[2] == '|') {
+    cmd += 3;
+  }
+  while (*cmd == ' ') {
+    cmd++;
+  }
+  return strcmp(cmd, "usb off") == 0;
+}
+
 // For power saving
 unsigned long lastActive = 0; // mark last active time
-unsigned long nextSleepinSecs = 120; // next sleep in seconds. The first sleep (if enabled) is after 2 minutes from boot
+unsigned long nextSleepinSecs = 60; // next sleep in seconds. The first sleep (if enabled) is after 1 minutes from boot
+unsigned long POWERSAVING_FIRSTSLEEP_SECS = 120; // The first sleep (if enabled) from boot
 
 #if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_)
 static unsigned long userBtnDownAt = 0;
@@ -29,6 +45,10 @@ static unsigned long userBtnDownAt = 0;
 #endif
 
 void setup() {
+  #ifdef MLK_PIN_SERIAL_RX
+    Serial.setRX(MLK_PIN_SERIAL_RX);
+    Serial.setTX(MLK_PIN_SERIAL_TX);
+  #endif
   Serial.begin(115200);
   delay(1000);
 
@@ -39,9 +59,6 @@ void setup() {
   // boot debug messages can be seen on terminal
   delay(5000);
 #endif
-
-  // For power saving
-  lastActive = millis(); // mark last active time since boot
 
 #ifdef DISPLAY_CLASS
   if (display.begin()) {
@@ -57,7 +74,7 @@ void setup() {
     halt();
   }
 
-  fast_rng.begin(radio_get_rng_seed());
+  fast_rng.begin(radio_driver.getRngSeed());
 
   FILESYSTEM* fs;
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
@@ -103,6 +120,8 @@ void setup() {
 #if ENABLE_ADVERT_ON_BOOT == 1
   the_mesh.sendSelfAdvertisement(16000, false);
 #endif
+
+  board.onBootComplete();
 }
 
 void loop() {
@@ -116,16 +135,17 @@ void loop() {
     }
     if (c == '\r') break;
   }
-  if (len == sizeof(command)-1) {  // command buffer full
-    command[sizeof(command)-1] = '\r';
+  if (len == sizeof(command)-1) {  // command buffer full: force end-of-line at the last
+    command[sizeof(command)-2] = '\r';  // data slot, keeping the '\0' at [size-1] intact
   }
 
   if (len > 0 && command[len - 1] == '\r') {  // received complete line
     Serial.print('\n');
     command[len - 1] = 0;  // replace newline with C string null terminator
+    bool is_usb_off = isUsbOffCommand(command);
     char reply[160];
     the_mesh.handleCommand(0, command, reply);  // NOTE: there is no sender_timestamp via serial!
-    if (reply[0]) {
+    if (reply[0] && !is_usb_off) {
       Serial.print("  -> "); Serial.println(reply);
     }
 
@@ -154,16 +174,20 @@ void loop() {
 #endif
   rtc_clock.tick();
 
-  if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
+  if (the_mesh.getNodePrefs()->powersaving_enabled) {
     #if defined(NRF52_PLATFORM)
-    board.sleep(1800); // nrf ignores seconds param, sleeps whenever possible
+    if (!the_mesh.hasPendingWork()) {
+      board.sleep(1800); // nrf ignores seconds param, sleeps whenever possible
+    }
     #else
-    if (the_mesh.millisHasNowPassed(lastActive + nextSleepinSecs * 1000)) { // To check if it is time to sleep
-      board.sleep(1800);             // To sleep. Wake up after 30 minutes or when receiving a LoRa packet
+    if (the_mesh.hasPendingWork()) {
+      // Keep postponing sleep while work is pending.
       lastActive = millis();
-      nextSleepinSecs = 5;  // Default: To work for 5s and sleep again
-    } else {
-      nextSleepinSecs += 5; // When there is pending work, to work another 5s
+    } else if (the_mesh.millisHasNowPassed(lastActive + nextSleepinSecs * 1000)) { // time to enter low-power?
+      board.sleep(1800);   // 'secs' is ignored: on RP2040 this drops to the low clock/USB-off profile
+                           // continuously (no wake timer); the radio keeps receiving. See WaveshareBoard::sleep().
+      lastActive = millis();
+      nextSleepinSecs = 5;  // re-evaluate again 5 s after each low-power entry
     }
     #endif
   }

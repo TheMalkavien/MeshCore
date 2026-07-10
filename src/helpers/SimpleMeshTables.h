@@ -6,22 +6,19 @@
   #include <FS.h>
 #endif
 
-#define MAX_PACKET_HASHES  128
-#define MAX_PACKET_ACKS     64
+#define MAX_PACKET_HASHES  (128+32)
 
 class SimpleMeshTables : public mesh::MeshTables {
   uint8_t _hashes[MAX_PACKET_HASHES*MAX_HASH_SIZE];
+  uint8_t _hash0[MAX_PACKET_HASHES];   // first byte of each stored hash, for a cheap reject before memcmp
   int _next_idx;
-  uint32_t _acks[MAX_PACKET_ACKS];
-  int _next_ack_idx;
   uint32_t _direct_dups, _flood_dups;
 
 public:
-  SimpleMeshTables() { 
+  SimpleMeshTables() {
     memset(_hashes, 0, sizeof(_hashes));
+    memset(_hash0, 0, sizeof(_hash0));
     _next_idx = 0;
-    memset(_acks, 0, sizeof(_acks));
-    _next_ack_idx = 0;
     _direct_dups = _flood_dups = 0;
   }
 
@@ -29,77 +26,52 @@ public:
   void restoreFrom(File f) {
     f.read(_hashes, sizeof(_hashes));
     f.read((uint8_t *) &_next_idx, sizeof(_next_idx));
-    f.read((uint8_t *) &_acks[0], sizeof(_acks));
-    f.read((uint8_t *) &_next_ack_idx, sizeof(_next_ack_idx));
+    for (int i = 0; i < MAX_PACKET_HASHES; i++) _hash0[i] = _hashes[i * MAX_HASH_SIZE];  // rebuild reject cache
   }
   void saveTo(File f) {
     f.write(_hashes, sizeof(_hashes));
     f.write((const uint8_t *) &_next_idx, sizeof(_next_idx));
-    f.write((const uint8_t *) &_acks[0], sizeof(_acks));
-    f.write((const uint8_t *) &_next_ack_idx, sizeof(_next_ack_idx));
   }
 #endif
 
-  bool hasSeen(const mesh::Packet* packet) override {
-    if (packet->getPayloadType() == PAYLOAD_TYPE_ACK) {
-      uint32_t ack;
-      memcpy(&ack, packet->payload, 4);
-      for (int i = 0; i < MAX_PACKET_ACKS; i++) {
-        if (ack == _acks[i]) { 
-          if (packet->isRouteDirect()) {
-            _direct_dups++;   // keep some stats
-          } else {
-            _flood_dups++;
-          }
-          return true;
-        }
-      }
-  
-      _acks[_next_ack_idx] = ack;
-      _next_ack_idx = (_next_ack_idx + 1) % MAX_PACKET_ACKS;  // cyclic table  
-      return false;
-    }
-
+  bool wasSeen(const mesh::Packet* packet) override {
     uint8_t hash[MAX_HASH_SIZE];
     packet->calculatePacketHash(hash);
 
     const uint8_t* sp = _hashes;
     for (int i = 0; i < MAX_PACKET_HASHES; i++, sp += MAX_HASH_SIZE) {
-      if (memcmp(hash, sp, MAX_HASH_SIZE) == 0) { 
+      if (_hash0[i] != hash[0]) continue;   // quick reject (equivalent to memcmp failing on byte 0)
+      if (memcmp(hash, sp, MAX_HASH_SIZE) == 0) {
         if (packet->isRouteDirect()) {
-          _direct_dups++;   // keep some stats
+          _direct_dups++;
         } else {
           _flood_dups++;
         }
         return true;
       }
     }
-
-    memcpy(&_hashes[_next_idx*MAX_HASH_SIZE], hash, MAX_HASH_SIZE);
-    _next_idx = (_next_idx + 1) % MAX_PACKET_HASHES;  // cyclic table
     return false;
   }
 
-  void clear(const mesh::Packet* packet) override {
-    if (packet->getPayloadType() == PAYLOAD_TYPE_ACK) {
-      uint32_t ack;
-      memcpy(&ack, packet->payload, 4);
-      for (int i = 0; i < MAX_PACKET_ACKS; i++) {
-        if (ack == _acks[i]) { 
-          _acks[i] = 0;
-          break;
-        }
-      }
-    } else {
-      uint8_t hash[MAX_HASH_SIZE];
-      packet->calculatePacketHash(hash);
+  void markSeen(const mesh::Packet* packet) override {
+    uint8_t hash[MAX_HASH_SIZE];
+    packet->calculatePacketHash(hash);
+    memcpy(&_hashes[_next_idx * MAX_HASH_SIZE], hash, MAX_HASH_SIZE);
+    _hash0[_next_idx] = hash[0];
+    _next_idx = (_next_idx + 1) % MAX_PACKET_HASHES;
+  }
 
-      uint8_t* sp = _hashes;
-      for (int i = 0; i < MAX_PACKET_HASHES; i++, sp += MAX_HASH_SIZE) {
-        if (memcmp(hash, sp, MAX_HASH_SIZE) == 0) { 
-          memset(sp, 0, MAX_HASH_SIZE);
-          break;
-        }
+  void clear(const mesh::Packet* packet) override {
+    uint8_t hash[MAX_HASH_SIZE];
+    packet->calculatePacketHash(hash);
+
+    uint8_t* sp = _hashes;
+    for (int i = 0; i < MAX_PACKET_HASHES; i++, sp += MAX_HASH_SIZE) {
+      if (_hash0[i] != hash[0]) continue;   // quick reject (kept in sync with _hashes)
+      if (memcmp(hash, sp, MAX_HASH_SIZE) == 0) {
+        memset(sp, 0, MAX_HASH_SIZE);
+        _hash0[i] = 0;
+        break;
       }
     }
   }

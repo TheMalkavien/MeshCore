@@ -1,11 +1,65 @@
 #include "WaveshareBoard.h"
 
 #include <Arduino.h>
+#include <SPI.h>
 #include <Wire.h>
+
+#if defined(ARDUINO_ARCH_RP2040)
+  #include <hardware/clocks.h>
+  #include <hardware/sync.h>
+#if !defined(NO_USB) && !defined(USE_TINYUSB)
+  #include <USB.h>
+#endif
+#endif
+
+#if defined(ARDUINO_ARCH_RP2040)
+#if !defined(NO_USB) && !defined(USE_TINYUSB)
+static bool g_usb_connected = true;
+
+extern "C" bool meshcore_board_usb_on_demand(void) {
+#ifdef MLK_RP2040_LOWPOWER
+  // USB needs the active profile (clock + voltage) to enumerate reliably.
+  rp2040_restore_active_profile();
+#endif
+  if (!g_usb_connected) {
+    // Keep USB stack alive and only re-attach to host.
+    USB.connect();
+    delay(20);
+    g_usb_connected = true;
+  }
+  return true;
+}
+
+extern "C" bool meshcore_board_usb_off_demand(void) {
+  if (g_usb_connected) {
+    Serial.flush();
+    USB.disconnect();
+    g_usb_connected = false;
+  }
+#ifdef MLK_RP2040_LOWPOWER
+  // Once USB is down, keep runtime in lowest clock/voltage profile.
+  rp2040_enter_sleep_profile();
+#endif
+  return true;
+}
+
+extern "C" bool meshcore_board_usb_is_connected(void) {
+  return g_usb_connected;
+}
+#else
+extern "C" bool meshcore_board_usb_on_demand(void) { return false; }
+extern "C" bool meshcore_board_usb_off_demand(void) { return false; }
+extern "C" bool meshcore_board_usb_is_connected(void) { return false; }
+#endif
+#endif
 
 void WaveshareBoard::begin() {
   // for future use, sub-classes SHOULD call this from their begin()
   startup_reason = BD_STARTUP_NORMAL;
+
+#if defined(ARDUINO_ARCH_RP2040)
+  rp2040_restore_active_profile();
+#endif
 
 #ifdef P_LORA_TX_LED
   pinMode(P_LORA_TX_LED, OUTPUT);
@@ -23,8 +77,78 @@ void WaveshareBoard::begin() {
   Wire.begin();
 
   delay(10); // give sx1262 some time to power up
+
+  #ifdef MLK_ESP32_FLASHER_PIN
+    pinMode(MLK_ESP32_FLASHER_PIN, OUTPUT);
+    digitalWrite(MLK_ESP32_FLASHER_PIN, LOW); // ensure ESP32Flasher is not woken up by default
+  #endif
+}
+
+
+void WaveshareBoard::sleep(uint32_t secs) {
+  // NOTE: 'secs' is ignored and there is NO real sleep / wake-timer here. The RP2040 has no
+  // usable deep-sleep in this design, so "sleeping" means: disable USB and drop to the low
+  // clock/voltage profile, staying there continuously until an incoming 'usb on' command.
+  // The radio keeps receiving; there is no timed wake-up.
+  (void)secs;
+  #if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
+    if (ota.isSleepInhibited()) {
+      return;
+    }
+    Serial.println("Disabling USB for low power sleep. Use commd usb on to re-enable.");
+    meshcore_board_usb_off_demand();
+  #endif
+  return;
 }
 
 bool WaveshareBoard::startOTAUpdate(const char *id, char reply[]) {
-  return false;
+  #ifdef MLK_ESP32_FLASHER_PIN
+    pinMode(MLK_ESP32_FLASHER_PIN, OUTPUT);
+    digitalWrite(MLK_ESP32_FLASHER_PIN, HIGH); // wake up esp32flasher
+    delay(500);
+    digitalWrite(MLK_ESP32_FLASHER_PIN, LOW); // stay low to avoid another wake up
+    sprintf(reply, "Waking UP ESP32Flasher to flash the firmware.");
+    return true;
+  #else
+#if defined(ARDUINO_ARCH_RP2040)
+    rp2040_enter_ota_profile();
+#endif
+    return ota.startSession(id, reply);
+  #endif
+}
+
+bool WaveshareBoard::handleOTACommand(const char *command, char reply[]) {
+#if defined(ARDUINO_ARCH_RP2040)
+  // Only switch to the OTA clock/voltage profile when not already in it. During
+  // an active session isSleepInhibited() stays true, so the profile persists and
+  // we avoid re-running set_sys_clock_khz/vreg (and the 200us settle on lowpower)
+  // on every command.
+  if (!ota.isSleepInhibited()) {
+    rp2040_enter_ota_profile();
+  }
+#endif
+  bool ok = ota.handleCommand(command, reply);
+#if defined(ARDUINO_ARCH_RP2040)
+  if (!ota.isSleepInhibited()) {
+    rp2040_restore_active_profile();
+  }
+#endif
+  return ok;
+}
+
+bool WaveshareBoard::handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) {
+#if defined(ARDUINO_ARCH_RP2040)
+  // See handleOTACommand: skip the profile switch while a session is already
+  // active so per-chunk writes don't thrash the system PLL feeding the radio SPI.
+  if (!ota.isSleepInhibited()) {
+    rp2040_enter_ota_profile();
+  }
+#endif
+  bool ok = ota.handleBinaryCommand(opcode, payload, payload_len, reply);
+#if defined(ARDUINO_ARCH_RP2040)
+  if (!ota.isSleepInhibited()) {
+    rp2040_restore_active_profile();
+  }
+#endif
+  return ok;
 }

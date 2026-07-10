@@ -1,6 +1,19 @@
 #include "MyMesh.h"
 #include <algorithm>
 
+extern "C" bool meshcore_board_usb_on_demand(void) __attribute__((weak));
+extern "C" bool meshcore_board_usb_on_demand(void) {
+  return false;
+}
+extern "C" bool meshcore_board_usb_off_demand(void) __attribute__((weak));
+extern "C" bool meshcore_board_usb_off_demand(void) {
+  return false;
+}
+extern "C" bool meshcore_board_usb_is_connected(void) __attribute__((weak));
+extern "C" bool meshcore_board_usb_is_connected(void) {
+  return false;
+}
+
 /* ------------------------------ Config -------------------------------- */
 
 #ifndef LORA_FREQ
@@ -41,6 +54,34 @@
   #define TXT_ACK_DELAY 200
 #endif
 
+// Optional reliability helper: if no other repeater is heard forwarding the same
+// flood packet, re-send our already-forwarded packet up to N times.
+#ifndef ENABLE_FLOOD_CONDITIONAL_RETRY
+  #define ENABLE_FLOOD_CONDITIONAL_RETRY 1
+#endif
+#ifndef FLOOD_RETRY_MAX_RETRANSMITS
+  #define FLOOD_RETRY_MAX_RETRANSMITS 3
+#endif
+#ifndef FLOOD_RETRY_CONFIRM_WINDOW_MS
+  #define FLOOD_RETRY_CONFIRM_WINDOW_MS 2500
+#endif
+#ifndef FLOOD_RETRY_GAP_MIN_MS
+  #define FLOOD_RETRY_GAP_MIN_MS 350
+#endif
+#ifndef FLOOD_RETRY_GAP_MAX_MS
+  #define FLOOD_RETRY_GAP_MAX_MS 1200
+#endif
+#ifndef FLOOD_RETRY_AIRTIME_FACTOR
+  #define FLOOD_RETRY_AIRTIME_FACTOR 8
+#endif
+
+#define OTHER_PREFS_VERSION  1
+#define OTHER_PREFS_FILE     "/other_prefs"
+
+static bool readPacketWireExact(mesh::Packet* dst, const uint8_t raw[], uint8_t raw_len) {
+  return dst->readFrom(raw, raw_len);
+}
+
 #define FIRMWARE_VER_LEVEL       2
 
 #define REQ_TYPE_GET_STATUS         0x01 // same as _GET_STATS
@@ -49,6 +90,7 @@
 #define REQ_TYPE_GET_ACCESS_LIST    0x05
 #define REQ_TYPE_GET_NEIGHBOURS     0x06
 #define REQ_TYPE_GET_OWNER_INFO     0x07     // FIRMWARE_VER_LEVEL >= 2
+#define REQ_TYPE_OTA_BINARY         0x70
 
 #define RESP_SERVER_LOGIN_OK        0 // response to ANON_REQ
 
@@ -57,8 +99,343 @@
 #define ANON_REQ_TYPE_BASIC        0x03   // just remote clock
 
 #define CLI_REPLY_DELAY_MILLIS      600
+#ifndef OTA_CLI_REPLY_DELAY_MILLIS
+  #define OTA_CLI_REPLY_DELAY_MILLIS 40
+#endif
+
+#ifndef OTA_TXT_ACK_DELAY
+  #define OTA_TXT_ACK_DELAY 0
+#endif
+
+// The OTA binary STATUS checkpoints gate the whole transfer: the standard
+// 300ms SERVER_RESPONSE_DELAY would add ~15s to a typical firmware upload.
+// During OTA the preset is quiet and the client sits in RX waiting, so a
+// short turnaround is safe.
+#ifndef OTA_SERVER_RESPONSE_DELAY_MILLIS
+  #define OTA_SERVER_RESPONSE_DELAY_MILLIS 40
+#endif
 
 #define LAZY_CONTACTS_WRITE_DELAY    5000
+#define PING_TIMEOUT_MILLIS          8000
+#define PING_MAX_COUNT               100   // max pings accepted by a single 'ping' command
+#define PING_INTERVAL_MILLIS         700   // pacing gap between consecutive pings (>= CLI_REPLY_DELAY_MILLIS so remote replies keep their order)
+
+static const char* skipCommandSpaces(const char* p) {
+  while (*p == ' ') {
+    p++;
+  }
+  return p;
+}
+
+static bool isHexChar(char c) {
+  return (c >= '0' && c <= '9') ||
+         (c >= 'a' && c <= 'f') ||
+         (c >= 'A' && c <= 'F');
+}
+
+static size_t getCommandPrefixLen(const char* command) {
+  const char* p = skipCommandSpaces(command);
+  size_t n = 0;
+  while (isHexChar(p[n])) {
+    n++;
+    if (n >= 8) {
+      break;  // safety cap
+    }
+  }
+  if (n >= 2 && p[n] == '|') {
+    return n + 1;
+  }
+  return 0;
+}
+
+static bool isOtaCLICommand(const char* command) {
+  if (command == NULL) {
+    return false;
+  }
+  const char* p = skipCommandSpaces(command);
+  size_t prefix_len = getCommandPrefixLen(p);
+  if (prefix_len > 0) {  // optional "<token>|" prefix from mccli
+    p += prefix_len;
+  }
+  p = skipCommandSpaces(p);
+
+  if (memcmp(p, "start ota", 9) == 0 && (p[9] == 0 || p[9] == ' ')) {
+    return true;
+  }
+  if (memcmp(p, "ota", 3) == 0 && (p[3] == 0 || p[3] == ' ')) {
+    return true;
+  }
+  return false;
+}
+
+#define CTL_TYPE_NODE_DISCOVER_REQ   0x80
+#define CTL_TYPE_NODE_DISCOVER_RESP  0x90
+
+mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
+  if (pkt->getRouteType() == ROUTE_TYPE_TRANSPORT_FLOOD) {
+    recv_pkt_region = region_map.findMatch(pkt, REGION_DENY_FLOOD);
+  } else if (pkt->getRouteType() == ROUTE_TYPE_FLOOD) {
+    if (region_map.getWildcard().flags & REGION_DENY_FLOOD) {
+      recv_pkt_region = NULL;
+    } else {
+      recv_pkt_region =  &region_map.getWildcard();
+    }
+  } else {
+    recv_pkt_region = NULL;
+  }
+  mesh::DispatcherAction action = Mesh::onRecvPacket(pkt);
+
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  if (pkt->isRouteFlood()) {
+    if (action > ACTION_MANUAL_HOLD) {
+      trackFloodForward(pkt, action);
+    }
+    markFloodHeard(pkt);
+  }
+#endif
+
+  return action;
+}
+
+// Nearest scheduled wake for the low-power idle: the earliest deadline among active
+// flood-retry slots and an in-progress ping session. Returns 0 when nothing is pending.
+uint32_t MyMesh::nextAppWake(uint32_t now) const {
+  uint32_t best = 0;
+  (void)now;
+
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  for (int i = 0; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
+    if (!_flood_retry[i].active) continue;
+    uint32_t t = _flood_retry[i].next_retry_at;
+    if (best == 0 || (int32_t)(t - best) < 0) best = t;
+  }
+#endif
+
+  if (pending_ping.session_active) {
+    uint32_t t = pending_ping.active ? pending_ping.expiry_at : pending_ping.next_at;
+    if (t != 0 && (best == 0 || (int32_t)(t - best) < 0)) best = t;
+  }
+
+  return best;
+}
+
+void MyMesh::loadOtherPrefs() {
+  // Always start from compile-time defaults so missing fields fall back gracefully.
+  _other_prefs.flood_max_retries = FLOOD_RETRY_MAX_RETRANSMITS;
+  _other_prefs.flood_timeout_ms  = FLOOD_RETRY_CONFIRM_WINDOW_MS;
+
+  if (!_fs || !_fs->exists(OTHER_PREFS_FILE)) return;
+
+#if defined(RP2040_PLATFORM)
+  File f = _fs->open(OTHER_PREFS_FILE, "r");
+#else
+  File f = _fs->open(OTHER_PREFS_FILE);
+#endif
+  if (!f) return;
+
+  uint8_t ver = 0;
+  if (f.read(&ver, 1) != 1 || ver != OTHER_PREFS_VERSION) { f.close(); return; }
+
+  f.read(&_other_prefs.flood_max_retries, sizeof(_other_prefs.flood_max_retries));
+  f.read((uint8_t*)&_other_prefs.flood_timeout_ms, sizeof(_other_prefs.flood_timeout_ms));
+  f.close();
+
+  // Sanitize to prevent out-of-range values from a corrupted file.
+  _other_prefs.flood_max_retries = constrain((int)_other_prefs.flood_max_retries, 1, 10);
+  _other_prefs.flood_timeout_ms  = (uint16_t)constrain((int)_other_prefs.flood_timeout_ms, 500, 10000);
+}
+
+void MyMesh::saveOtherPrefs() {
+  if (!_fs) return;
+
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  _fs->remove(OTHER_PREFS_FILE);
+  File f = _fs->open(OTHER_PREFS_FILE, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  File f = _fs->open(OTHER_PREFS_FILE, "w");
+#else
+  File f = _fs->open(OTHER_PREFS_FILE, "w", true);
+#endif
+  if (!f) return;
+
+  uint8_t ver = OTHER_PREFS_VERSION;
+  f.write(&ver, 1);
+  f.write(&_other_prefs.flood_max_retries, sizeof(_other_prefs.flood_max_retries));
+  f.write((uint8_t*)&_other_prefs.flood_timeout_ms, sizeof(_other_prefs.flood_timeout_ms));
+  f.close();
+}
+
+void MyMesh::clearFloodRetryState() {
+  memset(_flood_retry, 0, sizeof(_flood_retry));
+  _flood_retry_tracked = 0;
+  _flood_retry_confirmed = 0;
+  _flood_retry_failed = 0;
+  _flood_retry_retransmits = 0;
+}
+
+void MyMesh::onFloodQueued(const mesh::Packet* packet, uint8_t priority, uint32_t delay_ms) {
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  // Track floods WE ORIGINATE (not just forwards) so that if no repeater is heard
+  // relaying them within the confirm window, we retransmit up to FLOOD_RETRY_MAX_RETRANSMITS times.
+  // Adverts and PATH packets are excluded: adverts are periodic, PATH packets are low-priority helpers.
+  uint8_t type = packet->getPayloadType();
+  if (type == PAYLOAD_TYPE_ADVERT || type == PAYLOAD_TYPE_PATH) {
+    return;
+  }
+  // Synthesise a DispatcherAction that trackFloodForward() expects:
+  //   bits[31:24] = priority + 1   (slot.priority = (action>>24)-1)
+  //   bits[23:0]  = initial delay  (base_delay for next_retry_at calculation)
+  mesh::DispatcherAction action = ACTION_RETRANSMIT_DELAYED(priority, delay_ms);
+  trackFloodForward(packet, action);
+#else
+  (void)packet; (void)priority; (void)delay_ms;
+#endif
+}
+
+void MyMesh::trackFloodForward(const mesh::Packet* pkt, mesh::DispatcherAction action) {
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  uint8_t hash[MAX_HASH_SIZE];
+  pkt->calculatePacketHash(hash);
+
+  int use_idx = -1;
+  for (int i = 0; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
+    if (_flood_retry[i].active && memcmp(_flood_retry[i].hash, hash, MAX_HASH_SIZE) == 0) {
+      use_idx = i;
+      break;
+    }
+    if (!_flood_retry[i].active && use_idx < 0) {
+      use_idx = i;
+    }
+  }
+  if (use_idx < 0) {
+    // No free slot; replace oldest.
+    use_idx = 0;
+    for (int i = 1; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
+      if (_flood_retry[i].created_at < _flood_retry[use_idx].created_at) {
+        use_idx = i;
+      }
+    }
+  }
+
+  auto& slot = _flood_retry[use_idx];
+  slot.raw_len = pkt->writeTo(slot.raw);
+  if (slot.raw_len == 0) {
+    slot.active = 0;
+    return;
+  }
+
+  memcpy(slot.hash, hash, MAX_HASH_SIZE);
+  slot.active = 1;
+  slot.retries_sent = 0;
+  slot.priority = (action >> 24) - 1;
+  slot.created_at = millis();
+
+  uint32_t base_delay = action & 0xFFFFFF;
+  uint32_t est_airtime = _radio->getEstAirtimeFor(pkt->getRawLength());
+  uint32_t wait_ms = est_airtime * (uint32_t)FLOOD_RETRY_AIRTIME_FACTOR;
+  if (wait_ms < (uint32_t)_other_prefs.flood_timeout_ms) {
+    wait_ms = (uint32_t)_other_prefs.flood_timeout_ms;
+  }
+  slot.wait_ms = wait_ms;
+  slot.next_retry_at = futureMillis(base_delay + wait_ms);
+
+  _flood_retry_tracked++;
+#else
+  (void)pkt;
+  (void)action;
+#endif
+}
+
+void MyMesh::markFloodHeard(const mesh::Packet* pkt) {
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  uint8_t hash[MAX_HASH_SIZE];
+  pkt->calculatePacketHash(hash);
+
+  for (int i = 0; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
+    auto& slot = _flood_retry[i];
+    if (!slot.active || memcmp(slot.hash, hash, MAX_HASH_SIZE) != 0) {
+      continue;
+    }
+
+    bool heard_other_repeater = false;
+    if (pkt->path_len >= PATH_HASH_SIZE) {
+      uint8_t self_hash[PATH_HASH_SIZE];
+      self_id.copyHashTo(self_hash);
+      heard_other_repeater = memcmp(&pkt->path[pkt->path_len - PATH_HASH_SIZE], self_hash, PATH_HASH_SIZE) != 0;
+    }
+
+    if (heard_other_repeater) {
+      slot.active = 0;
+      _flood_retry_confirmed++;
+    }
+    break;
+  }
+#else
+  (void)pkt;
+#endif
+}
+
+void MyMesh::processFloodRetries() {
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  for (int i = 0; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
+    auto& slot = _flood_retry[i];
+    if (!slot.active || !millisHasNowPassed(slot.next_retry_at)) {
+      continue;
+    }
+
+    if (slot.retries_sent >= _other_prefs.flood_max_retries) {
+      slot.active = 0;
+      _flood_retry_failed++;
+      continue;
+    }
+
+    mesh::Packet* retry = obtainNewPacket();
+    if (retry && readPacketWireExact(retry, slot.raw, slot.raw_len)) {
+      sendPacket(retry, slot.priority, 0);
+      slot.retries_sent++;
+      _flood_retry_retransmits++;
+    } else if (retry) {
+      releasePacket(retry);
+    }
+
+    uint32_t gap = FLOOD_RETRY_GAP_MIN_MS;
+    if (FLOOD_RETRY_GAP_MAX_MS > FLOOD_RETRY_GAP_MIN_MS) {
+      gap = getRNG()->nextInt(FLOOD_RETRY_GAP_MIN_MS, FLOOD_RETRY_GAP_MAX_MS + 1);
+    }
+    slot.next_retry_at = futureMillis(slot.wait_ms + gap);
+  }
+#endif
+}
+
+int MyMesh::getAGCResetInterval() const {
+  // The periodic AGC reset puts the radio into a brief warm sleep; during an
+  // OTA chunk stream that RX gap loses packets (seen as periodic resync
+  // bursts), so suspend it while a session is active.
+  if (board.isOTASessionActive()) {
+    return 0;
+  }
+  return ((int)_prefs.agc_reset_interval) * 4000;   // milliseconds
+}
+
+uint32_t MyMesh::getCADFailRetryDelay() const {
+  // At the fast OTA presets (low SF) the sticky PREAMBLE_DETECTED flag is
+  // frequently raised by noise; the default 120-360ms backoff quantizes every
+  // STATUS reply stall to multiples of that and dominates checkpoint latency.
+  // During an OTA session the channel is otherwise quiet, so re-check quickly.
+  if (board.isOTASessionActive()) {
+    return 20;
+  }
+  return mesh::Mesh::getCADFailRetryDelay();
+}
+
+uint32_t MyMesh::getCADFailMaxDuration() const {
+  // Bound how long a noise-stuck preamble flag can defer the STATUS reply;
+  // the OTA client is silent while waiting, so forcing TX after 400ms is safe.
+  if (board.isOTASessionActive()) {
+    return 400;
+  }
+  return mesh::Mesh::getCADFailMaxDuration();
+}
 
 void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
 #if MAX_NEIGHBOURS // check if neighbours enabled
@@ -85,6 +462,287 @@ void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float sn
   neighbour->heard_timestamp = getRTCClock()->getCurrentTime();
   neighbour->snr = (int8_t)(snr * 4);
 #endif
+}
+
+bool MyMesh::resolvePingTarget(const char* destination, mesh::Identity& target, char* error_reply) {
+  while (*destination == ' ') {
+    destination++;
+  }
+  if (*destination == 0) {
+    strcpy(error_reply, "Err - destination required");
+    return false;
+  }
+
+  int hex_len = strlen(destination);
+  if ((hex_len & 1) != 0) {
+    strcpy(error_reply, "Err - hex length must be even");
+    return false;
+  }
+
+  if (hex_len == PUB_KEY_SIZE * 2) {
+    if (!mesh::Utils::fromHex(target.pub_key, PUB_KEY_SIZE, destination)) {
+      strcpy(error_reply, "Err - bad pubkey");
+      return false;
+    }
+  } else {
+    int prefix_len = hex_len / 2;
+    if (prefix_len <= 0 || prefix_len > PUB_KEY_SIZE) {
+      strcpy(error_reply, "Err - bad pubkey prefix");
+      return false;
+    }
+
+    uint8_t prefix[PUB_KEY_SIZE];
+    if (!mesh::Utils::fromHex(prefix, prefix_len, destination)) {
+      strcpy(error_reply, "Err - bad pubkey prefix");
+      return false;
+    }
+
+    int matches = 0;
+#if MAX_NEIGHBOURS
+    for (int i = 0; i < MAX_NEIGHBOURS; i++) {
+      if (neighbours[i].heard_timestamp == 0) {
+        continue;
+      }
+      if (memcmp(neighbours[i].id.pub_key, prefix, prefix_len) == 0) {
+        target = neighbours[i].id;
+        matches++;
+      }
+    }
+#endif
+    if (matches == 0) {
+      strcpy(error_reply, "Err - neighbor not found");
+      return false;
+    }
+    if (matches > 1) {
+      strcpy(error_reply, "Err - ambiguous prefix");
+      return false;
+    }
+  }
+
+  if (target.matches(self_id)) {
+    strcpy(error_reply, "Err - cannot ping self");
+    return false;
+  }
+  return true;
+}
+
+bool MyMesh::startPingSession(const mesh::Identity& target, uint16_t count, bool reply_remote,
+                              const char* cli_prefix, char* error_reply) {
+  if (pending_ping.session_active) {
+    strcpy(error_reply, "Err - ping busy");
+    return false;
+  }
+
+  pending_ping.session_active = true;
+  pending_ping.reply_remote = reply_remote;
+  pending_ping.target = target;
+  pending_ping.requester = active_cli_client ? active_cli_client->id : self_id;
+  pending_ping.requester_path_hash_size = active_cli_path_hash_size > 0 ? active_cli_path_hash_size : PATH_HASH_SIZE;
+  StrHelper::strncpy(pending_ping.cli_prefix, cli_prefix ? cli_prefix : "", sizeof(pending_ping.cli_prefix));
+  pending_ping.count = count;
+  pending_ping.seq = 0;
+  pending_ping.recv = 0;
+  pending_ping.next_at = 0;
+  pending_ping.rtt_sum = pending_ping.rtt_min = pending_ping.rtt_max = 0;
+  pending_ping.lsnr_sum = 0; pending_ping.lsnr_min = pending_ping.lsnr_max = 0;
+  pending_ping.rsnr_sum = 0; pending_ping.rsnr_min = pending_ping.rsnr_max = 0;
+  pending_ping.active = false;
+
+  if (!firePing(error_reply)) {
+    pending_ping.session_active = false;
+    return false;
+  }
+  return true;
+}
+
+// Sends one TRACE for the next sequence number and arms the in-flight state.
+bool MyMesh::firePing(char* error_reply) {
+  uint8_t path[4];
+  memcpy(path, pending_ping.target.pub_key, sizeof(path));
+  uint8_t flags = 0x02; // 4-byte trace path hashes, same encoding as companion TRACE
+  uint32_t auth_code;
+  getRNG()->random((uint8_t*)&pending_ping.tag, 4);
+  getRNG()->random((uint8_t*)&auth_code, 4);
+
+  mesh::Packet* pkt = createTrace(pending_ping.tag, auth_code, flags);
+  if (pkt == NULL) {
+    if (error_reply) strcpy(error_reply, "Err - packet pool empty");
+    return false;
+  }
+
+  pending_ping.seq++;
+  pending_ping.active = true;
+  pending_ping.success = false;
+  pending_ping.started_at = millis();
+  pending_ping.expiry_at = futureMillis(PING_TIMEOUT_MILLIS);
+  pending_ping.next_at = 0;
+  pending_ping.remote_snr = 0;
+  pending_ping.local_snr = 0;
+
+  sendDirect(pkt, path, sizeof(path));
+  return true;
+}
+
+// Folds the just-completed in-flight ping into the session aggregates.
+void MyMesh::accumulatePingStats() {
+  if (!pending_ping.success) return;  // misses don't contribute to rtt/snr stats
+
+  unsigned long rtt = pending_ping.last_rtt;
+  if (pending_ping.recv == 0) {  // first sample seeds the min/max trackers
+    pending_ping.rtt_min = pending_ping.rtt_max = rtt;
+    pending_ping.lsnr_min = pending_ping.lsnr_max = pending_ping.local_snr;
+    pending_ping.rsnr_min = pending_ping.rsnr_max = pending_ping.remote_snr;
+  } else {
+    if (rtt < pending_ping.rtt_min) pending_ping.rtt_min = rtt;
+    if (rtt > pending_ping.rtt_max) pending_ping.rtt_max = rtt;
+    if (pending_ping.local_snr < pending_ping.lsnr_min) pending_ping.lsnr_min = pending_ping.local_snr;
+    if (pending_ping.local_snr > pending_ping.lsnr_max) pending_ping.lsnr_max = pending_ping.local_snr;
+    if (pending_ping.remote_snr < pending_ping.rsnr_min) pending_ping.rsnr_min = pending_ping.remote_snr;
+    if (pending_ping.remote_snr > pending_ping.rsnr_max) pending_ping.rsnr_max = pending_ping.remote_snr;
+  }
+  pending_ping.recv++;
+  pending_ping.rtt_sum += rtt;
+  pending_ping.lsnr_sum += pending_ping.local_snr;
+  pending_ping.rsnr_sum += pending_ping.remote_snr;
+}
+
+// One per-ping result line. For a single ping (count==1) the legacy format is preserved.
+void MyMesh::formatPingLine(char* out) const {
+  char* p = out;
+  if (pending_ping.count > 1) {
+    p += sprintf(p, "seq=%u/%u ", (unsigned)pending_ping.seq, (unsigned)pending_ping.count);
+  }
+  if (!pending_ping.success) {
+    strcpy(p, "timeout");
+    return;
+  }
+  sprintf(p,
+          "rtt=%lums snr_rx=%.2f snr_tx=%.2f",
+          pending_ping.last_rtt,
+          pending_ping.local_snr / 4.0f,
+          pending_ping.remote_snr / 4.0f);
+}
+
+// Global summary over the whole session.
+void MyMesh::formatPingSummary(char* out) const {
+  uint16_t sent = pending_ping.seq;   // pings actually transmitted
+  uint16_t recv = pending_ping.recv;
+  uint16_t lost = sent - recv;
+  uint32_t loss_permille = (sent == 0) ? 0 : ((uint32_t)lost * 1000UL) / sent;
+
+  char* p = out;
+  p += sprintf(p, "--- stats: sent=%u recv=%u loss=%lu.%lu%%",
+               (unsigned)sent, (unsigned)recv,
+               (unsigned long)(loss_permille / 10), (unsigned long)(loss_permille % 10));
+  if (recv > 0) {
+    p += sprintf(p, " rtt=%lu/%lu/%lu ms",
+                 pending_ping.rtt_min, pending_ping.rtt_sum / recv, pending_ping.rtt_max);
+    p += sprintf(p, " snr_rx=%.2f/%.2f/%.2f",
+                 pending_ping.lsnr_min / 4.0f, (pending_ping.lsnr_sum / (float)recv) / 4.0f, pending_ping.lsnr_max / 4.0f);
+    sprintf(p, " snr_tx=%.2f/%.2f/%.2f",
+            pending_ping.rsnr_min / 4.0f, (pending_ping.rsnr_sum / (float)recv) / 4.0f, pending_ping.rsnr_max / 4.0f);
+  }
+}
+
+// Sends one CLI-data datagram to the remote requester (a per-ping line or the summary).
+void MyMesh::sendRemotePingLine(bool summary) {
+  auto client = acl.getClient(pending_ping.requester.pub_key, PUB_KEY_SIZE);
+  if (client == NULL) {
+    endPingSession();
+    return;
+  }
+
+  uint8_t temp[166];
+  char* reply = (char*)&temp[5];
+  reply[0] = 0;
+  if (pending_ping.cli_prefix[0]) {
+    strcpy(reply, pending_ping.cli_prefix);
+    reply += strlen(reply);
+  }
+  if (summary) {
+    formatPingSummary(reply);
+  } else {
+    formatPingLine(reply);
+  }
+
+  int text_len = strlen((char*)&temp[5]);
+  uint32_t timestamp = getRTCClock()->getCurrentTimeUnique();
+  memcpy(temp, &timestamp, 4);
+  temp[4] = (TXT_TYPE_CLI_DATA << 2);
+
+  auto pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, client->id, client->shared_secret, temp, 5 + text_len);
+  if (pkt) {
+    if (client->out_path_len == OUT_PATH_UNKNOWN) {
+      sendFlood(pkt, CLI_REPLY_DELAY_MILLIS, pending_ping.requester_path_hash_size);
+    } else {
+      sendDirect(pkt, client->out_path, client->out_path_len, CLI_REPLY_DELAY_MILLIS);
+    }
+  }
+}
+
+// Drives a remote (async) session forward after one ping completes (success or timeout).
+void MyMesh::completePingAndAdvance() {
+  accumulatePingStats();
+  sendRemotePingLine(false);   // independent per-ping result
+
+  if (pending_ping.seq < pending_ping.count) {
+    pending_ping.next_at = futureMillis(PING_INTERVAL_MILLIS);  // pace the next ping
+  } else {
+    sendRemotePingLine(true);  // global summary
+    endPingSession();
+  }
+}
+
+void MyMesh::endPingSession() {
+  pending_ping.session_active = false;
+  pending_ping.active = false;
+  pending_ping.reply_remote = false;
+  pending_ping.next_at = 0;
+  pending_ping.cli_prefix[0] = 0;
+}
+
+// Local serial driver: blocks, printing each ping as it completes, and returns the summary in `reply`.
+void MyMesh::runLocalPingSession(char* reply) {
+  char line[120];
+  for (;;) {
+    // wait for the current in-flight ping to resolve or time out
+    while (pending_ping.active && !millisHasNowPassed(pending_ping.expiry_at)) {
+      loop();
+      delay(1);
+    }
+    if (pending_ping.active) {  // timed out (no trace response arrived)
+      pending_ping.success = false;
+      pending_ping.active = false;
+    }
+    accumulatePingStats();
+
+    if (pending_ping.count > 1) {  // print each ping independently; single ping keeps legacy single-line reply
+      formatPingLine(line);
+      Serial.print("  -> "); Serial.println(line);
+    }
+
+    if (pending_ping.seq >= pending_ping.count) break;
+
+    // pace the next ping (keep servicing the mesh while we wait)
+    unsigned long fire_at = futureMillis(PING_INTERVAL_MILLIS);
+    while (!millisHasNowPassed(fire_at)) {
+      loop();
+      delay(1);
+    }
+
+    char err[40];
+    if (!firePing(err)) {  // packet pool momentarily empty: stop and summarise what we have
+      Serial.print("  -> "); Serial.println(err);
+      break;
+    }
+  }
+
+  if (pending_ping.count > 1) {
+    formatPingSummary(reply);
+  } else {
+    formatPingLine(reply);  // legacy single-ping reply
+  }
+  endPingSession();
 }
 
 uint8_t MyMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood) {
@@ -151,6 +809,9 @@ uint8_t MyMesh::handleAnonRegionsReq(const mesh::Identity& sender, uint32_t send
     reply_path_hash_size = (*data >> 6) + 1;
     data++;
 
+    // Guard against a forged/oversized return path: reply_path is MAX_PATH_SIZE bytes,
+    // but len*hash_size can reach 63*4 = 252. Reject rather than overflow reply_path.
+    if ((int)reply_path_len * reply_path_hash_size > MAX_PATH_SIZE) return 0;
     memcpy(reply_path, data, ((uint8_t)reply_path_len) * reply_path_hash_size);
     // data += (uint8_t)reply_path_len * reply_path_hash_size;
 
@@ -170,6 +831,9 @@ uint8_t MyMesh::handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender
     reply_path_hash_size = (*data >> 6) + 1;
     data++;
 
+    // Guard against a forged/oversized return path: reply_path is MAX_PATH_SIZE bytes,
+    // but len*hash_size can reach 63*4 = 252. Reject rather than overflow reply_path.
+    if ((int)reply_path_len * reply_path_hash_size > MAX_PATH_SIZE) return 0;
     memcpy(reply_path, data, ((uint8_t)reply_path_len) * reply_path_hash_size);
     // data += (uint8_t)reply_path_len * reply_path_hash_size;
 
@@ -190,6 +854,9 @@ uint8_t MyMesh::handleAnonClockReq(const mesh::Identity& sender, uint32_t sender
     reply_path_hash_size = (*data >> 6) + 1;
     data++;
 
+    // Guard against a forged/oversized return path: reply_path is MAX_PATH_SIZE bytes,
+    // but len*hash_size can reach 63*4 = 252. Reject rather than overflow reply_path.
+    if ((int)reply_path_len * reply_path_hash_size > MAX_PATH_SIZE) return 0;
     memcpy(reply_path, data, ((uint8_t)reply_path_len) * reply_path_hash_size);
     // data += (uint8_t)reply_path_len * reply_path_hash_size;
 
@@ -375,6 +1042,37 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
   } else if (payload[0] == REQ_TYPE_GET_OWNER_INFO) {
     sprintf((char *) &reply_data[4], "%s\n%s\n%s", FIRMWARE_VERSION, _prefs.node_name, _prefs.owner_info);
     return 4 + strlen((char *) &reply_data[4]);
+  } else if (payload[0] == REQ_TYPE_OTA_BINARY) {
+#if defined(RP2040_PLATFORM)
+    if (sender == NULL || !sender->isAdmin()) {
+      strcpy((char*)&reply_data[4], "Err - admin required");
+      return 4 + strlen((char*)&reply_data[4]);
+    }
+    if (payload_len < 2) {
+      strcpy((char*)&reply_data[4], "Err - bad OTA req");
+      return 4 + strlen((char*)&reply_data[4]);
+    }
+
+    uint8_t opcode = payload[1];
+    const uint8_t *req_payload = payload_len > 2 ? &payload[2] : NULL;
+    size_t req_len = payload_len > 2 ? payload_len - 2 : 0;
+
+    char ota_reply[160];
+    ota_reply[0] = 0;
+    if (!board.handleOTABinaryCommand(opcode, req_payload, req_len, ota_reply)) {
+      strcpy(ota_reply, "Err - OTA unsupported");
+    }
+
+    size_t ota_reply_len = strlen(ota_reply);
+    if (ota_reply_len == 0) {
+      return 0; // no reply for intermediate write chunks
+    }
+    if (ota_reply_len > MAX_PACKET_PAYLOAD - 4) {
+      ota_reply_len = MAX_PACKET_PAYLOAD - 4;
+    }
+    memcpy(&reply_data[4], ota_reply, ota_reply_len);
+    return 4 + ota_reply_len;
+#endif
   }
   return 0; // unknown command
 }
@@ -428,7 +1126,11 @@ void MyMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, ui
 
 bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
   if (_prefs.disable_fwd) return false;
-  if (packet->isRouteFlood() && packet->getPathHashCount() >= _prefs.flood_max) return false;
+  if (packet->isRouteFlood()) {
+    if (packet->getPathHashCount() >= _prefs.flood_max) return false;
+    if (packet->getRouteType() == ROUTE_TYPE_FLOOD && packet->getPathHashCount() >= _prefs.flood_max_unscoped) return false;
+    if (packet->getPayloadType() == PAYLOAD_TYPE_ADVERT && packet->getPathHashCount() >= _prefs.flood_max_advert) return false;
+  }
   if (packet->isRouteFlood() && recv_pkt_region == NULL) {
     MESH_DEBUG_PRINTLN("allowPacketForward: unknown transport code, or wildcard not allowed for FLOOD packet");
     return false;
@@ -545,22 +1247,7 @@ uint32_t MyMesh::getDirectRetransmitDelay(const mesh::Packet *packet) {
   return getRNG()->nextInt(0, 5*t + 1);
 }
 
-bool MyMesh::filterRecvFloodPacket(mesh::Packet* pkt) {
-  // just try to determine region for packet (apply later in allowPacketForward())
-  if (pkt->getRouteType() == ROUTE_TYPE_TRANSPORT_FLOOD) {
-    recv_pkt_region = region_map.findMatch(pkt, REGION_DENY_FLOOD);
-  } else if (pkt->getRouteType() == ROUTE_TYPE_FLOOD) {
-    if (region_map.getWildcard().flags & REGION_DENY_FLOOD) {
-      recv_pkt_region = NULL;
-    } else {
-      recv_pkt_region =  &region_map.getWildcard();
-    }
-  } else {
-    recv_pkt_region = NULL;
-  }
-  // do normal processing
-  return false;
-}
+
 
 void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const mesh::Identity &sender,
                             uint8_t *data, size_t len) {
@@ -623,6 +1310,36 @@ void MyMesh::getPeerSharedSecret(uint8_t *dest_secret, int peer_idx) {
   }
 }
 
+void MyMesh::onTraceRecv(mesh::Packet* packet, uint32_t tag, uint32_t auth_code, uint8_t flags,
+                         const uint8_t* path_snrs, const uint8_t* path_hashes, uint8_t path_len) {
+  (void)auth_code;
+
+  if (!pending_ping.active || tag != pending_ping.tag) {
+    return;
+  }
+
+  uint8_t path_sz = 1 << (flags & 0x03);
+  if (path_len < path_sz || (path_len % path_sz) != 0) {
+    return;
+  }
+
+  uint8_t hop_count = path_len / path_sz;
+  if (memcmp(path_hashes, pending_ping.target.pub_key, path_sz) != 0 || hop_count == 0) {
+    return;
+  }
+
+  pending_ping.success = true;
+  pending_ping.remote_snr = (int8_t)path_snrs[0];
+  pending_ping.local_snr = (int8_t)(packet->getSNR() * 4.0f);
+  pending_ping.last_rtt = millis() - pending_ping.started_at;
+  pending_ping.active = false;  // this in-flight ping is resolved
+
+  if (pending_ping.reply_remote) {
+    completePingAndAdvance();   // remote: accumulate, reply, fire next or summarise
+  }
+  // local: runLocalPingSession() drives the session forward
+}
+
 static bool isShare(const mesh::Packet *packet) {
   if (packet->hasTransportCodes()) {
     return packet->transport_codes[0] == 0 && packet->transport_codes[1] == 0;  // codes { 0, 0 } means 'send to nowhere'
@@ -635,7 +1352,7 @@ void MyMesh::onAdvertRecv(mesh::Packet *packet, const mesh::Identity &id, uint32
   mesh::Mesh::onAdvertRecv(packet, id, timestamp, app_data, app_data_len); // chain to super impl
 
   // if this a zero hop advert (and not via 'Share'), add it to neighbours
-  if (packet->path_len == 0 && !isShare(packet)) {
+  if (packet->getPathHashCount() == 0 && !isShare(packet)) {
     AdvertDataParser parser(app_data, app_data_len);
     if (parser.isValid() && parser.getType() == ADV_TYPE_REPEATER) { // just keep neigbouring Repeaters
       putNeighbour(id, timestamp, packet->getSNR());
@@ -657,25 +1374,28 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
     memcpy(&timestamp, data, 4);
 
     if (timestamp > client->last_timestamp) { // prevent replay attacks
+      bool is_ota_req = (len > 4 && data[4] == REQ_TYPE_OTA_BINARY);
       int reply_len = handleRequest(client, timestamp, &data[4], len - 4);
       if (reply_len == 0) return; // invalid command
 
       client->last_timestamp = timestamp;
       client->last_activity = getRTCClock()->getCurrentTime();
 
+      uint32_t response_delay = is_ota_req ? OTA_SERVER_RESPONSE_DELAY_MILLIS : SERVER_RESPONSE_DELAY;
+
       if (packet->isRouteFlood()) {
         // let this sender know path TO here, so they can use sendDirect(), and ALSO encode the response
         mesh::Packet *path = createPathReturn(client->id, secret, packet->path, packet->path_len,
                                               PAYLOAD_TYPE_RESPONSE, reply_data, reply_len);
-        if (path) sendFloodReply(path, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+        if (path) sendFloodReply(path, response_delay, packet->getPathHashSize());
       } else {
         mesh::Packet *reply =
             createDatagram(PAYLOAD_TYPE_RESPONSE, client->id, secret, reply_data, reply_len);
         if (reply) {
           if (client->out_path_len != OUT_PATH_UNKNOWN) { // we have an out_path, so send DIRECT
-            sendDirect(reply, client->out_path, client->out_path_len, SERVER_RESPONSE_DELAY);
+            sendDirect(reply, client->out_path, client->out_path_len, response_delay);
           } else {
-            sendFloodReply(reply, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+            sendFloodReply(reply, response_delay, packet->getPathHashSize());
           }
         }
       }
@@ -696,6 +1416,8 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
       // len can be > original length, but 'text' will be padded with zeroes
       data[len] = 0; // need to make a C string again, with null terminator
+      char *command = (char *)&data[5];
+      bool ota_command = isOtaCLICommand(command);
 
       if (flags == TXT_TYPE_PLAIN) { // for legacy CLI, send Acks
         uint32_t ack_hash; // calc truncated hash of the message timestamp + text + sender pub_key, to prove
@@ -705,21 +1427,25 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
         mesh::Packet *ack = createAck(ack_hash);
         if (ack) {
+          uint32_t ack_delay = ota_command ? OTA_TXT_ACK_DELAY : TXT_ACK_DELAY;
           if (client->out_path_len == OUT_PATH_UNKNOWN) {
             sendFloodReply(ack, TXT_ACK_DELAY, packet->getPathHashSize());
           } else {
-            sendDirect(ack, client->out_path, client->out_path_len, TXT_ACK_DELAY);
+            sendDirect(ack, client->out_path, client->out_path_len, ack_delay);
           }
         }
       }
 
       uint8_t temp[166];
-      char *command = (char *)&data[5];
       char *reply = (char *)&temp[5];
       if (is_retry) {
         *reply = 0;
       } else {
+        active_cli_client = client;
+        active_cli_path_hash_size = packet->getPathHashSize();
         handleCommand(sender_timestamp, command, reply);
+        active_cli_client = NULL;
+        active_cli_path_hash_size = PATH_HASH_SIZE;
       }
       int text_len = strlen(reply);
       if (text_len > 0) {
@@ -733,10 +1459,11 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
         auto reply = createDatagram(PAYLOAD_TYPE_TXT_MSG, client->id, secret, temp, 5 + text_len);
         if (reply) {
+          uint32_t reply_delay = ota_command ? OTA_CLI_REPLY_DELAY_MILLIS : CLI_REPLY_DELAY_MILLIS;
           if (client->out_path_len == OUT_PATH_UNKNOWN) {
             sendFloodReply(reply, CLI_REPLY_DELAY_MILLIS, packet->getPathHashSize());
           } else {
-            sendDirect(reply, client->out_path, client->out_path_len, CLI_REPLY_DELAY_MILLIS);
+            sendDirect(reply, client->out_path, client->out_path_len, reply_delay);
           }
         }
       }
@@ -765,9 +1492,6 @@ bool MyMesh::onPeerPathRecv(mesh::Packet *packet, int sender_idx, const uint8_t 
   // NOTE: no reciprocal path send!!
   return false;
 }
-
-#define CTL_TYPE_NODE_DISCOVER_REQ   0x80
-#define CTL_TYPE_NODE_DISCOVER_RESP  0x90
 
 void MyMesh::onControlDataRecv(mesh::Packet* packet) {
   uint8_t type = packet->payload[0] & 0xF0;    // just test upper 4 bits
@@ -862,6 +1586,11 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   set_radio_at = revert_radio_at = 0;
   _logging = false;
   region_load_active = false;
+  active_cli_client = NULL;
+  active_cli_path_hash_size = PATH_HASH_SIZE;
+  clearFloodRetryState();
+  memset(&pending_ping, 0, sizeof(pending_ping));
+  recv_pkt_region = NULL;
 
 #if MAX_NEIGHBOURS
   memset(neighbours, 0, sizeof(neighbours));
@@ -883,9 +1612,13 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.cr = LORA_CR;
   _prefs.tx_power_dbm = LORA_TX_POWER;
   _prefs.advert_interval = 1;        // default to 2 minutes for NEW installs
-  _prefs.flood_advert_interval = 12; // 12 hours
+  _prefs.flood_advert_interval = 47; // 47 hours
   _prefs.flood_max = 64;
+  _prefs.flood_max_unscoped = 64;
+  _prefs.flood_max_advert = 8;
   _prefs.interference_threshold = 0; // disabled
+  _prefs.multi_acks = 1;             // default: send one extra ACK per hop for better ACK delivery
+  _prefs.cad_enabled = 0;            // hardware CAD before TX (off by default; 'set cad on')
 
   // bridge defaults
   _prefs.bridge_enabled = 1;    // enabled
@@ -910,6 +1643,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.rx_boosted_gain = 1; // enabled by default;
 #endif
 #endif
+  _prefs.radio_fem_rxgain = 1;
 
   pending_discover_tag = 0;
   pending_discover_until = 0;
@@ -922,6 +1656,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   _fs = fs;
   // load persisted prefs
   _cli.loadPrefs(_fs);
+  loadOtherPrefs();
   acl.load(_fs, self_id);
   // TODO: key_store.begin();
   region_map.load(_fs);
@@ -952,12 +1687,13 @@ void MyMesh::begin(FILESYSTEM *fs) {
   }
 #endif
 
-  radio_set_params(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-  radio_set_tx_power(_prefs.tx_power_dbm);
+  radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  radio_driver.setTxPower(_prefs.tx_power_dbm);
 
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
                      radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
+  board.setLoRaFemLnaEnabled(_prefs.radio_fem_rxgain);
 
   updateAdvertTimer();
   updateFloodAdvertTimer();
@@ -1049,14 +1785,12 @@ void MyMesh::dumpLogFile() {
 }
 
 void MyMesh::setTxPower(int8_t power_dbm) {
-  radio_set_tx_power(power_dbm);
+  radio_driver.setTxPower(power_dbm);
 }
 
-#if defined(USE_SX1262) || defined(USE_SX1268)
-void MyMesh::setRxBoostedGain(bool enable) {
-  radio_driver.setRxBoostedGainMode(enable);
+bool MyMesh::setRxBoostedGain(bool enable) {
+  return radio_driver.setRxBoostedGainMode(enable);
 }
-#endif
 
 void MyMesh::formatNeighborsReply(char *reply) {
   char *dp = reply;
@@ -1141,8 +1875,25 @@ void MyMesh::formatRadioStatsReply(char *reply) {
 }
 
 void MyMesh::formatPacketStatsReply(char *reply) {
-  StatsFormatHelper::formatPacketStats(reply, radio_driver, getNumSentFlood(), getNumSentDirect(), 
+  StatsFormatHelper::formatPacketStats(reply, radio_driver, getNumSentFlood(), getNumSentDirect(),
                                        getNumRecvFlood(), getNumRecvDirect());
+}
+
+void MyMesh::formatFloodStatsReply(char *reply) {
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  uint32_t resolved = _flood_retry_confirmed + _flood_retry_failed;
+  uint32_t loss_permille = (resolved == 0) ? 0 : (_flood_retry_failed * 1000UL) / resolved;
+  sprintf(reply,
+          "{\"trk\":%lu,\"ok\":%lu,\"fail\":%lu,\"retry\":%lu,\"loss\":\"%lu.%lu%%\"}",
+          _flood_retry_tracked,
+          _flood_retry_confirmed,
+          _flood_retry_failed,
+          _flood_retry_retransmits,
+          loss_permille / 10,
+          loss_permille % 10);
+#else
+  strcpy(reply, "flood retry disabled");
+#endif
 }
 
 void MyMesh::saveIdentity(const mesh::LocalIdentity &new_id) {
@@ -1162,6 +1913,7 @@ void MyMesh::clearStats() {
   radio_driver.resetStats();
   resetStats();
   ((SimpleMeshTables *)getTables())->resetStats();
+  clearFloodRetryState();
 }
 
 void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply) {
@@ -1199,12 +1951,19 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     return;
   }
 
-  while (*command == ' ') command++; // skip leading spaces
+  command = (char *) skipCommandSpaces(command);
+  char* reply_start = reply;
 
-  if (strlen(command) > 4 && command[2] == '|') { // optional prefix (for companion radio CLI)
-    memcpy(reply, command, 3);                    // reflect the prefix back
-    reply += 3;
-    command += 3;
+  size_t prefix_len = getCommandPrefixLen(command);
+  char cli_prefix[10];
+  cli_prefix[0] = 0;
+  if (prefix_len > 0) { // optional prefix (for companion radio CLI)
+    size_t copy_len = min(prefix_len, sizeof(cli_prefix) - 1);
+    memcpy(cli_prefix, command, copy_len);
+    cli_prefix[copy_len] = 0;
+    memcpy(reply, command, prefix_len); // reflect the prefix back
+    reply += prefix_len;
+    command += prefix_len;
   }
 
   // handle ACL related commands
@@ -1241,6 +2000,20 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       Serial.printf("\n");
     }
     reply[0] = 0;
+  } else if (strcmp(command, "usb on") == 0) {
+    if (meshcore_board_usb_on_demand()) {
+      strcpy(reply, "OK - USB enabled");
+    } else {
+      strcpy(reply, "Err - USB unsupported");
+    }
+  } else if (strcmp(command, "usb off") == 0) {
+    if (meshcore_board_usb_off_demand()) {
+      strcpy(reply, "OK - USB disabled");
+    } else {
+      strcpy(reply, "Err - USB unsupported");
+    }
+  } else if (strcmp(command, "usb status") == 0) {
+    strcpy(reply, meshcore_board_usb_is_connected() ? "> on" : "> off");
   } else if (memcmp(command, "discover.neighbors", 18) == 0) {
     const char* sub = command + 18;
     while (*sub == ' ') sub++;
@@ -1250,7 +2023,54 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       sendNodeDiscoverReq();
       strcpy(reply, "OK - Discover sent");
     }
-  } else{
+  } else if (memcmp(command, "ping ", 5) == 0) {
+    char* arg = command + 5;
+    while (*arg == ' ') arg++;
+    // optional 2nd argument: number of pings to send
+    int count = 1;
+    char* sp = strchr(arg, ' ');
+    if (sp != NULL) {
+      *sp = 0;  // terminate the pubkey token
+      const char* cp = sp + 1;
+      while (*cp == ' ') cp++;
+      if (*cp) count = atoi(cp);
+    }
+    if (count < 1) count = 1;
+    if (count > PING_MAX_COUNT) count = PING_MAX_COUNT;
+
+    mesh::Identity target;
+    bool reply_remote = sender_timestamp != 0 && active_cli_client != NULL;
+    if (resolvePingTarget(arg, target, reply) &&
+        startPingSession(target, (uint16_t)count, reply_remote, cli_prefix, reply)) {
+      if (reply_remote) {
+        reply_start[0] = 0;          // results are sent asynchronously (per-ping lines + summary)
+      } else {
+        runLocalPingSession(reply);  // blocks, prints each ping, returns the summary
+      }
+    }
+  } else if (memcmp(command, "set flood.maxretry ", 19) == 0) {
+    int val = atoi(command + 19);
+    if (val < 1 || val > 10) {
+      strcpy(reply, "Err - valid range: 1-10");
+    } else {
+      _other_prefs.flood_max_retries = (uint8_t)val;
+      saveOtherPrefs();
+      sprintf(reply, "OK flood.maxretry=%d", val);
+    }
+  } else if (memcmp(command, "set flood.timeout ", 18) == 0) {
+    int val = atoi(command + 18);
+    if (val < 500 || val > 10000) {
+      strcpy(reply, "Err - valid range: 500-10000 ms");
+    } else {
+      _other_prefs.flood_timeout_ms = (uint16_t)val;
+      saveOtherPrefs();
+      sprintf(reply, "OK flood.timeout=%d ms", val);
+    }
+  } else if (strcmp(command, "get flood") == 0) {
+    sprintf(reply, "flood.maxretry=%d flood.timeout=%d ms",
+            (int)_other_prefs.flood_max_retries,
+            (int)_other_prefs.flood_timeout_ms);
+  } else {
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
 }
@@ -1261,6 +2081,23 @@ void MyMesh::loop() {
 #endif
 
   mesh::Mesh::loop();
+  processFloodRetries();
+
+  // drive an in-progress remote (async) ping session
+  if (pending_ping.session_active && pending_ping.reply_remote) {
+    if (pending_ping.active) {
+      if (millisHasNowPassed(pending_ping.expiry_at)) {  // current ping timed out
+        pending_ping.success = false;
+        pending_ping.active = false;
+        completePingAndAdvance();
+      }
+    } else if (pending_ping.next_at && millisHasNowPassed(pending_ping.next_at)) {  // time to fire the next ping
+      pending_ping.next_at = 0;
+      if (!firePing(NULL)) {  // packet pool momentarily empty: retry after the pacing gap
+        pending_ping.next_at = futureMillis(PING_INTERVAL_MILLIS);
+      }
+    }
+  }
 
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
     mesh::Packet *pkt = createSelfAdvert();
@@ -1278,13 +2115,13 @@ void MyMesh::loop() {
 
   if (set_radio_at && millisHasNowPassed(set_radio_at)) { // apply pending (temporary) radio params
     set_radio_at = 0;                                     // clear timer
-    radio_set_params(pending_freq, pending_bw, pending_sf, pending_cr);
+    radio_driver.setParams(pending_freq, pending_bw, pending_sf, pending_cr);
     MESH_DEBUG_PRINTLN("Temp radio params");
   }
 
   if (revert_radio_at && millisHasNowPassed(revert_radio_at)) { // revert radio params to orig
     revert_radio_at = 0;                                        // clear timer
-    radio_set_params(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
     MESH_DEBUG_PRINTLN("Radio params restored");
   }
 
@@ -1304,6 +2141,11 @@ void MyMesh::loop() {
 bool MyMesh::hasPendingWork() const {
 #if defined(WITH_BRIDGE)
   if (bridge.isRunning()) return true;  // bridge needs WiFi radio, can't sleep
+#endif
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  for (int i = 0; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
+    if (_flood_retry[i].active) return true;
+  }
 #endif
   return _mgr->getOutboundTotal() > 0;
 }

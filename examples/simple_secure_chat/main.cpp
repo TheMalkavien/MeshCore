@@ -135,7 +135,7 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
     File file = _fs->open("/contacts", "w", true);
 #endif
     if (file) {
-      ContactsIterator iter;
+      ContactsIterator iter = startContactsIterator();
       ContactInfo c;
       uint8_t unused = 0;
       uint32_t reserved = 0;
@@ -562,7 +562,7 @@ void setup() {
 
   if (!radio_init()) { halt(); }
 
-  fast_rng.begin(radio_get_rng_seed());
+  fast_rng.begin(radio_driver.getRngSeed());
 
 #if defined(NRF52_PLATFORM)
   InternalFS.begin();
@@ -577,8 +577,8 @@ void setup() {
   #error "need to define filesystem"
 #endif
 
-  radio_set_params(the_mesh.getFreqPref(), LORA_BW, LORA_SF, LORA_CR);
-  radio_set_tx_power(the_mesh.getTxPowerPref());
+  radio_driver.setParams(the_mesh.getFreqPref(), LORA_BW, LORA_SF, LORA_CR);
+  radio_driver.setTxPower(the_mesh.getTxPowerPref());
 
   the_mesh.showWelcome();
 

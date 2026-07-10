@@ -129,13 +129,31 @@ uint16_t HeltecV4Board::getBattMilliVolts() {
 
   digitalWrite(PIN_ADC_CTRL, LOW);
 
-  return (5.42 * (3.3 / 1024.0) * raw) * 1000;
+  return (adc_mult * (3.3 / 1024.0) * raw) * 1000;
+}
+
+bool HeltecV4Board::setLoRaFemLnaEnabled(bool enable) {
+  if (!fem_control.isLnaCanControl()) {
+    return false;
+  }
+
+  fem_control.setLNAEnable(enable);
+  fem_control.setRxModeEnable();
+  return true;
+}
+
+bool HeltecV4Board::canControlLoRaFemLna() const {
+  return fem_control.isLnaCanControl();
+}
+
+bool HeltecV4Board::isLoRaFemLnaEnabled() const {
+  return fem_control.isLNAEnabled();
 }
 
 const char* HeltecV4Board::getManufacturerName() const {
 #ifdef HELTEC_LORA_V4_TFT
-  return "Heltec V4 TFT";
+  return fem_control.getFEMType() == KCT8103L_PA ? "Heltec V4.3 TFT" : "Heltec V4 TFT";
 #else
-  return "Heltec V4 OLED";
+  return fem_control.getFEMType() == KCT8103L_PA ? "Heltec V4.3 OLED" : "Heltec V4 OLED";
 #endif
 }

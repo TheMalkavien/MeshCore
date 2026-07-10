@@ -68,12 +68,41 @@ struct NeighbourInfo {
   int8_t snr; // multiplied by 4, user should divide to get float value
 };
 
+struct PendingPing {
+  // --- multi-ping session state (a run of 1..count pings) ---
+  bool session_active;       // a ping session is in progress
+  bool reply_remote;         // results go to a remote admin client (async) vs local serial (blocking)
+  mesh::Identity target;
+  mesh::Identity requester;
+  uint8_t requester_path_hash_size;
+  char cli_prefix[10];
+  uint16_t count;            // total pings requested
+  uint16_t seq;              // current ping number (1-based) = pings sent so far
+  uint16_t recv;             // successful responses so far
+  unsigned long next_at;     // remote pacing: when to fire the next ping (0 = none scheduled)
+
+  // --- aggregate stats over the session ---
+  unsigned long rtt_sum, rtt_min, rtt_max;   // ms
+  int32_t lsnr_sum;  int8_t lsnr_min, lsnr_max;  // local SNR (snr_rx), multiplied by 4
+  int32_t rsnr_sum;  int8_t rsnr_min, rsnr_max;  // remote SNR (snr_tx), multiplied by 4
+
+  // --- current in-flight ping ---
+  bool active;               // a single ping is awaiting its trace response
+  bool success;              // last in-flight ping succeeded
+  uint32_t tag;
+  unsigned long started_at;
+  unsigned long expiry_at;
+  unsigned long last_rtt;    // rtt (ms) of the last successful ping
+  int8_t remote_snr;         // multiplied by 4
+  int8_t local_snr;          // multiplied by 4
+};
+
 #ifndef FIRMWARE_BUILD_DATE
-  #define FIRMWARE_BUILD_DATE   "19 Apr 2026"
+  #define FIRMWARE_BUILD_DATE   "6 Jun 2026"
 #endif
 
 #ifndef FIRMWARE_VERSION
-  #define FIRMWARE_VERSION   "v1.15.0"
+  #define FIRMWARE_VERSION   "v1.16.0"
 #endif
 
 #define FIRMWARE_ROLE "repeater"
@@ -81,6 +110,25 @@ struct NeighbourInfo {
 #define PACKET_LOG_FILE  "/packet_log"
 
 class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
+  struct FloodRetryEntry {
+    uint8_t active;
+    uint8_t retries_sent;
+    uint8_t priority;
+    uint8_t raw_len;
+    uint8_t hash[MAX_HASH_SIZE];
+    uint8_t raw[MAX_TRANS_UNIT];
+    unsigned long created_at;
+    unsigned long next_retry_at;
+    uint32_t wait_ms;
+  };
+
+  // Extensible custom prefs stored in /other_prefs, independent of NodePrefs.
+  // Add new fields at the end only; bump OTHER_PREFS_VERSION on breaking changes.
+  struct OtherPrefs {
+    uint8_t  flood_max_retries; // max retransmit attempts per flood packet
+    uint16_t flood_timeout_ms;  // minimum confirm window before first retry (ms)
+  };
+
   FILESYSTEM* _fs;
   uint32_t last_millis;
   uint64_t uptime_millis;
@@ -106,6 +154,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 #if MAX_NEIGHBOURS
   NeighbourInfo neighbours[MAX_NEIGHBOURS];
 #endif
+  PendingPing pending_ping;
   CayenneLPP telemetry;
   unsigned long set_radio_at, revert_radio_at;
   float pending_freq;
@@ -113,6 +162,14 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t pending_sf;
   uint8_t pending_cr;
   int  matching_peer_indexes[MAX_CLIENTS];
+  ClientInfo* active_cli_client;
+  uint8_t active_cli_path_hash_size;
+  FloodRetryEntry _flood_retry[8];
+  uint32_t _flood_retry_tracked;
+  uint32_t _flood_retry_confirmed;
+  uint32_t _flood_retry_failed;
+  uint32_t _flood_retry_retransmits;
+  OtherPrefs _other_prefs;
 #if defined(WITH_RS232_BRIDGE)
   RS232Bridge bridge;
 #elif defined(WITH_ESPNOW_BRIDGE)
@@ -120,6 +177,23 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 #endif
 
   void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
+  void trackFloodForward(const mesh::Packet* pkt, mesh::DispatcherAction action);
+  void markFloodHeard(const mesh::Packet* pkt);
+  void processFloodRetries();
+  void clearFloodRetryState();
+  void loadOtherPrefs();
+  void saveOtherPrefs();
+  void onFloodQueued(const mesh::Packet* packet, uint8_t priority, uint32_t delay_ms) override;
+  bool resolvePingTarget(const char* destination, mesh::Identity& target, char* error_reply);
+  bool startPingSession(const mesh::Identity& target, uint16_t count, bool reply_remote, const char* cli_prefix, char* error_reply);
+  bool firePing(char* error_reply);
+  void accumulatePingStats();
+  void completePingAndAdvance();
+  void sendRemotePingLine(bool summary);
+  void endPingSession();
+  void runLocalPingSession(char* reply);
+  void formatPingLine(char* out) const;
+  void formatPingSummary(char* out) const;
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
@@ -135,6 +209,8 @@ protected:
     return _prefs.airtime_factor;
   }
 
+  mesh::DispatcherAction onRecvPacket(mesh::Packet* pkt) override;
+  uint32_t nextAppWake(uint32_t now) const override;
   bool allowPacketForward(const mesh::Packet* packet) override;
   const char* getLogDateTime() override;
   void logRxRaw(float snr, float rssi, const uint8_t raw[], int len) override;
@@ -150,9 +226,12 @@ protected:
   int getInterferenceThreshold() const override {
     return _prefs.interference_threshold;
   }
-  int getAGCResetInterval() const override {
-    return ((int)_prefs.agc_reset_interval) * 4000;   // milliseconds
+  bool getCADEnabled() const override {
+    return _prefs.cad_enabled;
   }
+  int getAGCResetInterval() const override;   // defined in .cpp: suspended during OTA
+  uint32_t getCADFailRetryDelay() const override;
+  uint32_t getCADFailMaxDuration() const override;
   uint8_t getExtraAckTransmitCount() const override {
     return _prefs.multi_acks;
   }
@@ -163,11 +242,11 @@ protected:
   }
 #endif
 
-  bool filterRecvFloodPacket(mesh::Packet* pkt) override;
-
   void onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, const mesh::Identity& sender, uint8_t* data, size_t len) override;
   int searchPeersByHash(const uint8_t* hash) override;
   void getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) override;
+  void onTraceRecv(mesh::Packet* packet, uint32_t tag, uint32_t auth_code, uint8_t flags,
+                   const uint8_t* path_snrs, const uint8_t* path_hashes, uint8_t path_len) override;
   void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len);
   void onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx, const uint8_t* secret, uint8_t* data, size_t len) override;
   bool onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_t* secret, uint8_t* path, uint8_t path_len, uint8_t extra_type, uint8_t* extra, uint8_t extra_len) override;
@@ -217,6 +296,7 @@ public:
   void startRegionsLoad() override;
   bool saveRegions() override;
   void onDefaultRegionChanged(const RegionEntry* r) override;
+  void formatFloodStatsReply(char *reply) override;
 
   mesh::LocalIdentity& getSelfId() override { return self_id; }
 
@@ -249,7 +329,6 @@ public:
   // To check if there is pending work
   bool hasPendingWork() const;
 
-#if defined(USE_SX1262) || defined(USE_SX1268)
-  void setRxBoostedGain(bool enable) override;
-#endif
+  bool setRxBoostedGain(bool enable) override;
+
 };

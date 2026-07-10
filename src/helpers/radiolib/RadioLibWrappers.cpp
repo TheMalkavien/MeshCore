@@ -12,6 +12,29 @@
 #define SAMPLING_THRESHOLD  14
 
 static volatile uint8_t state = STATE_IDLE;
+static PhysicalLayer* g_radio_for_sleep = NULL;
+
+// Optional board hook for platforms that want to wake the MCU on radio DIO1 IRQ
+// while RadioLib owns the interrupt callback on that pin.
+extern "C" void meshcore_on_lora_dio1_irq(void) __attribute__((weak));
+extern "C" void meshcore_on_lora_dio1_irq(void) {
+}
+extern "C" bool meshcore_radio_irq_pending(void) __attribute__((weak));
+extern "C" bool meshcore_radio_irq_pending(void) {
+  return (state & STATE_INT_READY) != 0;
+}
+extern "C" bool meshcore_radio_prepare_for_sleep(void) __attribute__((weak));
+extern "C" bool meshcore_radio_prepare_for_sleep(void) {
+  if (state & STATE_INT_READY) {
+    return true;
+  }
+  if (((state & ~STATE_INT_READY) != STATE_RX) && g_radio_for_sleep) {
+    if (g_radio_for_sleep->startReceive() == RADIOLIB_ERR_NONE) {
+      state = STATE_RX;
+    }
+  }
+  return (state & STATE_INT_READY) != 0;
+}
 
 // this function is called when a complete packet
 // is transmitted by the module
@@ -22,10 +45,14 @@ static
 void setFlag(void) {
   // we sent a packet, set the flag
   state |= STATE_INT_READY;
+  meshcore_on_lora_dio1_irq();
 }
 
 void RadioLibWrapper::begin() {
+  g_radio_for_sleep = _radio;
   _radio->setPacketReceivedAction(setFlag);  // this is also SentComplete interrupt
+  _preamble_sf = getSpreadingFactor();
+  _radio->setPreambleLength(preambleLengthForSF(_preamble_sf)); // longer preamble for lower SF improves reliability
   state = STATE_IDLE;
 
   if (_board->getStartupReason() == BD_STARTUP_RX_PACKET) {  // received a LoRa packet (while in deep sleep)
@@ -34,10 +61,19 @@ void RadioLibWrapper::begin() {
 
   _noise_floor = 0;
   _threshold = 0;
+  _cad_enabled = false;
 
   // start average out some samples
   _num_floor_samples = 0;
   _floor_sample_sum = 0;
+}
+
+uint32_t RadioLibWrapper::getRngSeed() {
+  return _radio->random(0x7FFFFFFF);
+}
+
+void RadioLibWrapper::setTxPower(int8_t dbm) {
+  _radio->setOutputPower(dbm);
 }
 
 void RadioLibWrapper::idle() {
@@ -168,10 +204,26 @@ void RadioLibWrapper::onSendFinished() {
   state = STATE_IDLE;
 }
 
+int16_t RadioLibWrapper::performChannelScan() {
+  return _radio->scanChannel();
+}
+
 bool RadioLibWrapper::isChannelActive() {
-  return _threshold == 0 
-          ? false    // interference check is disabled
-          : getCurrentRSSI() > _noise_floor + _threshold;
+  // int.thresh: RSSI-based interference detection (relative to noise floor)
+  if (_threshold != 0 && getCurrentRSSI() > _noise_floor + _threshold) return true;
+
+  // cad: hardware channel activity detection
+  if (_cad_enabled) {
+    int16_t result = performChannelScan();
+    // scanChannel() triggers DIO interrupt (CAD done) which sets STATE_INT_READY
+    // via setFlag() ISR. Clear it before restarting RX so recvRaw() doesn't
+    // try to read a non-existent packet and count a spurious recv error.
+    state = STATE_IDLE;
+    startRecv();
+    if (result != RADIOLIB_CHANNEL_FREE) return true;
+  }
+
+  return false;
 }
 
 float RadioLibWrapper::getLastRSSI() const {
