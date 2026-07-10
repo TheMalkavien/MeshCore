@@ -52,4 +52,5 @@ public:
   bool handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) override {
     return ota.handleBinaryCommand(opcode, payload, payload_len, reply);
   }
+  bool isOTASessionActive() const override { return ota.isSleepInhibited(); }
 };
