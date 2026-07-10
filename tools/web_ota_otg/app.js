@@ -3873,11 +3873,18 @@ ui.startOtaBtn.addEventListener("click", async () => {
           await restoreLocalRadioPresetAfterOta(restoreClientPreset);
           restoreClientPreset = await applyTempRadioPresetForOta(params.targetHex, tempPreset);
           probe = await getOtaStatusBinary(probeKey, 1, 4500);
-          if (probe.error) {
-            throw new Error("Cible injoignable sur le preset OTA temporaire (tempradio perdu ou cible hors de portée).");
-          }
         }
-        appendLog(`Cible joignable sur le preset temporaire (${String(probe.reply || "").trim() || "réponse reçue"}).`);
+        if (probe.error) {
+          // Une cible sans support OTA binaire (ex. room server, OTA texte
+          // uniquement) ne répond jamais au STATUS : ne pas abandonner ici,
+          // le déroulé normal (START binaire puis fallback texte) tranchera.
+          appendLog(
+            "Warning: cible silencieuse en binaire après renvoi de tempradio — "
+            + "hors de portée, ou cible sans OTA binaire (le fallback texte reste possible)."
+          );
+        } else {
+          appendLog(`Cible joignable sur le preset temporaire (${String(probe.reply || "").trim() || "réponse reçue"}).`);
+        }
       }
 
       if (ui.autoTune?.checked) {
