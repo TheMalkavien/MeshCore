@@ -150,9 +150,9 @@ protected:
   int getInterferenceThreshold() const override {
     return _prefs.interference_threshold;
   }
-  int getAGCResetInterval() const override {
-    return ((int)_prefs.agc_reset_interval) * 4000;   // milliseconds
-  }
+  int getAGCResetInterval() const override;
+  uint32_t getCADFailRetryDelay() const override;
+  uint32_t getCADFailMaxDuration() const override;
   uint8_t getExtraAckTransmitCount() const override {
     return _prefs.multi_acks;
   }

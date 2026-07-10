@@ -9,6 +9,10 @@
 #define BRIDGE_MAX_BAUD 115200
 #endif
 
+#ifndef OTA_CLI_DEBUG_LOGGING
+#define OTA_CLI_DEBUG_LOGGING 0
+#endif
+
 // Believe it or not, this std C function is busted on some platforms!
 static uint32_t _atoi(const char* sp) {
   uint32_t n = 0;
@@ -240,13 +244,18 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
         strcpy(reply, "ERR: clock cannot go backwards");
       }
     } else if (memcmp(command, "start ota", 9) == 0) {
+#if OTA_CLI_DEBUG_LOGGING
       Serial.println("[OTA] CLI start ota");
+#endif
       if (!_board->startOTAUpdate(_prefs->node_name, reply)) {
         strcpy(reply, "Error");
       }
     } else if (memcmp(command, "ota", 3) == 0 && (command[3] == 0 || command[3] == ' ')) {
       const char* sub = &command[3];
       while (*sub == ' ') sub++;
+#if OTA_CLI_DEBUG_LOGGING
+      // Per-chunk serial logging adds latency to every 'ota write' during a
+      // text-transport transfer, so it stays opt-in.
       char ota_sub[16];
       size_t j = 0;
       while (sub[j] != 0 && sub[j] != ' ' && j < sizeof(ota_sub) - 1) {
@@ -284,6 +293,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       } else {
         Serial.printf("[OTA] CLI ota %s\n", ota_sub);
       }
+#endif
       if (!_board->handleOTACommand(sub, reply)) {
         strcpy(reply, "Err - OTA unsupported");
       }
