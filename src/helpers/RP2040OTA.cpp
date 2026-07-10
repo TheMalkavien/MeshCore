@@ -12,6 +12,29 @@
 #define OTA_CMD_MAX_CHUNK_BYTES  160
 #define OTA_PROGRESS_LOG_STEP_BYTES 4096
 
+// A session that stays armed/active with no OTA traffic (client gone, lost
+// abort packet) would otherwise inhibit sleep and hold the OTA clock profile
+// forever. After this idle window the session is safely discarded on the next
+// OTA command, and isSleepInhibited() reports false so boards restore their
+// active clock profile.
+#ifndef RP2040_OTA_SESSION_TIMEOUT_MS
+  #define RP2040_OTA_SESSION_TIMEOUT_MS (5UL * 60UL * 1000UL)
+#endif
+
+// RAM staging buffer: chunks accumulate here and hit the flash (LittleFS) only
+// once per buffer-full. Every flash flush freezes the RP2040 (~50ms per 4KB
+// sector) and the OTA client must checkpoint around each freeze, so a bigger
+// staging block means 4x fewer mandatory checkpoints (the dominant transfer
+// cost over slow links). The active block size is advertised in the 'start
+// ota' reply as 'blk=' so the client aligns its checkpoints.
+#ifndef RP2040_OTA_STAGE_BUFFER_BYTES
+  #define RP2040_OTA_STAGE_BUFFER_BYTES 16384
+#endif
+
+// The Updater library's own internal buffer: flash gels happen at this
+// granularity when staging is unavailable.
+#define OTA_UPDATER_INTERNAL_BLOCK 4096
+
 #ifndef RP2040_OTA_SERIAL_DEBUG
   #define RP2040_OTA_SERIAL_DEBUG 1
 #endif
@@ -23,6 +46,9 @@
 #endif
 
 RP2040OTAController::RP2040OTAController() {
+  _stage = NULL;
+  _stage_size = 0;
+  _stage_fill = 0;
   clearState();
 }
 
@@ -34,6 +60,52 @@ void RP2040OTAController::clearState() {
   _next_progress_log = 0;
   _ack_every_chunks = 1;
   _chunks_since_ack = 0;
+  _last_activity_millis = millis();
+  if (_stage) {
+    free(_stage);
+    _stage = NULL;
+  }
+  _stage_size = 0;
+  _stage_fill = 0;
+}
+
+size_t RP2040OTAController::flushBlockBytes() const {
+  return _stage_size > 0 ? _stage_size : OTA_UPDATER_INTERNAL_BLOCK;
+}
+
+bool RP2040OTAController::isSleepInhibited() const {
+  return (_armed || _active) && !sessionExpired();
+}
+
+bool RP2040OTAController::sessionExpired() const {
+  if (!_armed && !_active) return false;
+  return (uint32_t)(millis() - _last_activity_millis) > RP2040_OTA_SESSION_TIMEOUT_MS;
+}
+
+void RP2040OTAController::expireIfIdle() {
+  if (!sessionExpired()) return;
+  OTA_DEBUG_PRINTLN("session idle > %lu ms, auto-abort", (unsigned long) RP2040_OTA_SESSION_TIMEOUT_MS);
+  abortUpdate();
+  clearState();
+}
+
+void RP2040OTAController::abortUpdate() {
+  // Update.end(true) must NEVER be used to abandon a session: with
+  // evenIfRemaining=true the framework finalizes whatever was received and,
+  // if no MD5 mismatch stops it, stages the truncated image for flashing on
+  // the next boot. end(false) takes the reset path mid-transfer. If the
+  // transfer happens to be 100% received, the poisoned MD5 below forces the
+  // verification to fail; the framework's MD5-mismatch branch skips _reset(),
+  // so a second end() is needed to clear that error state.
+  if (!Update.isRunning()) {
+    Update.clearError();
+    return;
+  }
+  Update.setMD5("00000000000000000000000000000000");
+  if (!Update.end(false) && Update.isRunning()) {
+    Update.end(false);
+  }
+  Update.clearError();
 }
 
 const char *RP2040OTAController::skipSpaces(const char *p) {
@@ -81,6 +153,7 @@ static void bytesToHex(const uint8_t *src, size_t len, char *dst) {
 
 bool RP2040OTAController::startSession(const char *id, char reply[]) {
   OTA_DEBUG_PRINTLN("start requested by %s", id ? id : "?");
+  expireIfIdle();
 
   if (!LittleFS.begin()) {
     strcpy(reply, "Err - LittleFS unavailable");
@@ -97,20 +170,32 @@ bool RP2040OTAController::startSession(const char *id, char reply[]) {
 
   clearState();
   _armed = true;
+  _last_activity_millis = millis();
+
+  _stage = (uint8_t *) malloc(RP2040_OTA_STAGE_BUFFER_BYTES);
+  _stage_size = _stage ? RP2040_OTA_STAGE_BUFFER_BYTES : 0;
+  _stage_fill = 0;
+  if (_stage_size == 0) {
+    OTA_DEBUG_PRINTLN("stage buffer alloc failed, falling back to %u", OTA_UPDATER_INTERNAL_BLOCK);
+  }
 
   FSInfo fs_info;
   if (LittleFS.info(fs_info) && fs_info.totalBytes >= fs_info.usedBytes) {
     uint32_t free_kb = (uint32_t)((fs_info.totalBytes - fs_info.usedBytes) / 1024ULL);
-    sprintf(reply, "OK - OTA ready (%lukB free)", (unsigned long) free_kb);
-    OTA_DEBUG_PRINTLN("session armed, free=%lu kB", (unsigned long) free_kb);
+    sprintf(reply, "OK - OTA ready (%lukB free, blk=%u)", (unsigned long) free_kb, (unsigned int) flushBlockBytes());
+    OTA_DEBUG_PRINTLN("session armed, free=%lu kB, blk=%u", (unsigned long) free_kb, (unsigned int) flushBlockBytes());
   } else {
-    strcpy(reply, "OK - OTA ready");
+    sprintf(reply, "OK - OTA ready (blk=%u)", (unsigned int) flushBlockBytes());
     OTA_DEBUG_PRINTLN("session armed, fs info unavailable");
   }
   return true;
 }
 
 bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
+  expireIfIdle();
+  if (_armed || _active) {
+    _last_activity_millis = millis();
+  }
   const char *sub = skipSpaces(command);
 
   if (*sub == 0 || strcmp(sub, "help") == 0) {
@@ -130,9 +215,7 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
   }
 
   if (strncmp(sub, "abort", 5) == 0 && (sub[5] == 0 || sub[5] == ' ')) {
-    if (Update.isRunning()) {
-      Update.end(true);  // force reset of update state
-    }
+    abortUpdate();
     clearState();
     OTA_DEBUG_PRINTLN("aborted");
     strcpy(reply, "OK - OTA aborted");
@@ -251,7 +334,7 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
     }
 
     if (has_md5 && !Update.setMD5(md5)) {
-      Update.end(true);
+      abortUpdate();
       clearState();
       OTA_DEBUG_PRINTLN("begin failed: invalid md5 format");
       strcpy(reply, "Err - invalid MD5");
@@ -303,14 +386,6 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
       }
     }
 
-    if (expected_offset != _received_size) {
-      OTA_DEBUG_PRINTLN("write rejected: bad offset %lu expected %lu",
-                        (unsigned long) expected_offset,
-                        (unsigned long) _received_size);
-      sprintf(reply, "Err - offset %lu expected %lu", (unsigned long) expected_offset, (unsigned long) _received_size);
-      return true;
-    }
-
     size_t hex_len = strlen(hex_start);
     sub = hex_start;
     while (hex_len > 0 && sub[hex_len - 1] == ' ') {
@@ -329,49 +404,8 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
       strcpy(reply, "Err - bad OTA hex");
       return true;
     }
-    if (chunk_len == 0) {
-      OTA_DEBUG_PRINTLN("write rejected: decoded empty chunk");
-      strcpy(reply, "Err - empty OTA chunk");
-      return true;
-    }
-    if (_received_size + chunk_len > _expected_size) {
-      OTA_DEBUG_PRINTLN("write rejected: overflow");
-      strcpy(reply, "Err - OTA overflow");
-      return true;
-    }
 
-    size_t written = Update.write(chunk, chunk_len);
-    if (written != chunk_len) {
-      if (Update.isRunning()) {
-        Update.end(true);
-      }
-      sprintf(reply, "Err - write failed (%u)", (uint32_t) Update.getError());
-      OTA_DEBUG_PRINTLN("write failed at %lu, err=%u",
-                        (unsigned long) _received_size,
-                        (uint32_t) Update.getError());
-      clearState();
-      return true;
-    }
-
-    _received_size += chunk_len;
-    _chunks_since_ack++;
-    if (_received_size >= _next_progress_log || _received_size == _expected_size) {
-      OTA_DEBUG_PRINTLN("progress %lu/%lu",
-                        (unsigned long) _received_size,
-                        (unsigned long) _expected_size);
-      _next_progress_log = _received_size + OTA_PROGRESS_LOG_STEP_BYTES;
-    }
-
-    bool should_ack_now = (_ack_every_chunks <= 1)
-                       || (_chunks_since_ack >= _ack_every_chunks)
-                       || (_received_size == _expected_size);
-    if (should_ack_now) {
-      _chunks_since_ack = 0;
-      strcpy(reply, "OK");
-    } else {
-      reply[0] = 0;  // suppress intermediate ack to reduce return traffic
-    }
-    return true;
+    return writeChunk(expected_offset, chunk, chunk_len, reply);
   }
 
   if (strncmp(sub, "end", 3) == 0 && (sub[3] == 0 || sub[3] == ' ')) {
@@ -386,6 +420,10 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
                         (unsigned long) _expected_size);
       sprintf(reply, "Err - size mismatch (%lu/%lu)", (unsigned long)_received_size, (unsigned long)_expected_size);
       return true;
+    }
+
+    if (!flushStage(reply)) {
+      return true;  // reply set by the failed flush
     }
 
     if (!Update.end(false)) {
@@ -406,6 +444,91 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
   return true;
 }
 
+bool RP2040OTAController::writeChunk(size_t offset, const uint8_t *chunk, size_t chunk_len, char reply[]) {
+  if (!_active || !Update.isRunning()) {
+    OTA_DEBUG_PRINTLN("write rejected: not started");
+    strcpy(reply, "Err - OTA not started");
+    return true;
+  }
+  if (chunk_len == 0) {
+    OTA_DEBUG_PRINTLN("write rejected: empty chunk");
+    strcpy(reply, "Err - empty OTA chunk");
+    return true;
+  }
+  if (offset != _received_size) {
+    OTA_DEBUG_PRINTLN("write rejected: bad offset %lu expected %lu",
+                      (unsigned long) offset,
+                      (unsigned long) _received_size);
+    sprintf(reply, "Err - offset %lu expected %lu", (unsigned long) offset, (unsigned long) _received_size);
+    return true;
+  }
+  if (_received_size + chunk_len > _expected_size) {
+    OTA_DEBUG_PRINTLN("write rejected: overflow");
+    strcpy(reply, "Err - OTA overflow");
+    return true;
+  }
+
+  if (_stage_size > 0) {
+    const uint8_t *src = chunk;
+    size_t remaining = chunk_len;
+    while (remaining > 0) {
+      size_t space = _stage_size - _stage_fill;
+      size_t n = remaining < space ? remaining : space;
+      memcpy(_stage + _stage_fill, src, n);
+      _stage_fill += n;
+      src += n;
+      remaining -= n;
+      if (_stage_fill == _stage_size && !flushStage(reply)) {
+        return true;  // reply set by the failed flush
+      }
+    }
+  } else if (!writeToUpdater(chunk, chunk_len, reply)) {
+    return true;
+  }
+
+  _received_size += chunk_len;
+  _chunks_since_ack++;
+  if (_received_size >= _next_progress_log || _received_size == _expected_size) {
+    OTA_DEBUG_PRINTLN("progress %lu/%lu",
+                      (unsigned long) _received_size,
+                      (unsigned long) _expected_size);
+    _next_progress_log = _received_size + OTA_PROGRESS_LOG_STEP_BYTES;
+  }
+
+  bool should_ack_now = (_ack_every_chunks <= 1)
+                     || (_chunks_since_ack >= _ack_every_chunks)
+                     || (_received_size == _expected_size);
+  if (should_ack_now) {
+    _chunks_since_ack = 0;
+    strcpy(reply, "OK");
+  } else {
+    reply[0] = 0;  // suppress intermediate ack to reduce return traffic
+  }
+  return true;
+}
+
+bool RP2040OTAController::writeToUpdater(const uint8_t *data, size_t len, char reply[]) {
+  size_t written = Update.write((uint8_t *) data, len);
+  if (written != len) {
+    uint32_t err = (uint32_t) Update.getError();
+    abortUpdate();
+    sprintf(reply, "Err - write failed (%u)", err);
+    OTA_DEBUG_PRINTLN("write failed at %lu, err=%u", (unsigned long) _received_size, err);
+    clearState();
+    return false;
+  }
+  return true;
+}
+
+bool RP2040OTAController::flushStage(char reply[]) {
+  if (_stage_fill == 0) {
+    return true;
+  }
+  size_t n = _stage_fill;
+  _stage_fill = 0;
+  return writeToUpdater(_stage, n, reply);
+}
+
 bool RP2040OTAController::handleBinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) {
   if (reply == NULL) {
     return false;
@@ -414,6 +537,11 @@ bool RP2040OTAController::handleBinaryCommand(uint8_t opcode, const uint8_t *pay
   if (payload == NULL && payload_len > 0) {
     strcpy(reply, "Err - bad payload");
     return true;
+  }
+
+  expireIfIdle();
+  if (_armed || _active) {
+    _last_activity_millis = millis();
   }
 
   switch (opcode) {
@@ -430,6 +558,10 @@ bool RP2040OTAController::handleBinaryCommand(uint8_t opcode, const uint8_t *pay
                     | ((uint32_t) payload[1] << 8)
                     | ((uint32_t) payload[2] << 16)
                     | ((uint32_t) payload[3] << 24);
+      // ack_every is validated and stored for parity with the text transport,
+      // but it has no effect in binary transport: every intermediate write ACK
+      // is suppressed there (see BIN_OP_WRITE), so the checkpoint cadence is
+      // decided entirely by the client via BIN_OP_STATUS.
       uint8_t ack_every = payload[4];
       if (ack_every < 1 || ack_every > 64) {
         strcpy(reply, "Err - ack_every range 1..64");
@@ -457,48 +589,25 @@ bool RP2040OTAController::handleBinaryCommand(uint8_t opcode, const uint8_t *pay
       //   <offset:u32 little-endian><chunk_len:u8><chunk_bytes...>
       // The packet payload can include trailing cipher padding bytes.
       // Use explicit chunk_len so we ignore padding.
-      if (payload_len < 6) {
-        strcpy(reply, "Err - bad write payload");
-        return true;
+      bool ok = true;
+      if (payload_len >= 6) {
+        uint32_t offset = (uint32_t) payload[0]
+                        | ((uint32_t) payload[1] << 8)
+                        | ((uint32_t) payload[2] << 16)
+                        | ((uint32_t) payload[3] << 24);
+        uint8_t declared_len = payload[4];
+        if (declared_len >= 1 && declared_len <= OTA_CMD_MAX_CHUNK_BYTES
+            && payload_len >= (size_t)(5 + declared_len)) {
+          ok = writeChunk((size_t) offset, &payload[5], declared_len, reply);
+        }
       }
-
-      uint32_t offset = (uint32_t) payload[0]
-                      | ((uint32_t) payload[1] << 8)
-                      | ((uint32_t) payload[2] << 16)
-                      | ((uint32_t) payload[3] << 24);
-      uint8_t declared_len = payload[4];
-      if (declared_len == 0 || declared_len > OTA_CMD_MAX_CHUNK_BYTES) {
-        strcpy(reply, "Err - bad chunk len");
-        return true;
-      }
-
-      if (payload_len < 5 + declared_len) {
-        strcpy(reply, "Err - short OTA chunk");
-        return true;
-      }
-
-      const uint8_t *chunk = &payload[5];
-      size_t chunk_len = declared_len;
-      if (chunk_len == 0) {
-        strcpy(reply, "Err - empty OTA chunk");
-        return true;
-      }
-      if (chunk_len > OTA_CMD_MAX_CHUNK_BYTES) {
-        strcpy(reply, "Err - chunk too large");
-        return true;
-      }
-
-      char hex_buf[(OTA_CMD_MAX_CHUNK_BYTES * 2) + 1];
-      bytesToHex(chunk, chunk_len, hex_buf);
-
-      // 24 covers "write " + up to 10 digits of offset + space + NUL, so a
-      // max-size chunk at a 32-bit offset still fits without snprintf truncation.
-      char cmd[24 + sizeof(hex_buf)];
-      snprintf(cmd, sizeof(cmd), "write %lu %s", (unsigned long) offset, hex_buf);
-      bool ok = handleCommand(cmd, reply);
-      // Suppress write ACK in binary transport: the ACK TX collides with the
-      // BIN_OP_STATUS immediately following. Progress is verified via BIN_OP_STATUS.
-      if (reply[0] == 'O' && reply[1] == 'K') reply[0] = 0;
+      // Binary transport: suppress EVERY per-write reply — the OK acks AND the
+      // "Err - offset" rejections. The radio is half-duplex: replying mid-batch
+      // blinds the receiver while the client is still streaming, so one RF-lost
+      // chunk would trigger an error reply for each subsequent chunk of the
+      // batch, each TX losing yet more incoming chunks (loss amplification).
+      // Progress and resync are handled exclusively via BIN_OP_STATUS.
+      reply[0] = 0;
       return ok;
     }
 
