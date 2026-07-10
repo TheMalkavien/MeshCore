@@ -46,7 +46,13 @@ bool PicoWBoard::startOTAUpdate(const char* id, char reply[]) {
 
 bool PicoWBoard::handleOTACommand(const char *command, char reply[]) {
 #if defined(ARDUINO_ARCH_RP2040)
-  rp2040_enter_ota_profile();
+  // Only switch to the OTA clock profile when not already holding it: during
+  // an active session isSleepInhibited() stays true, so we avoid re-running
+  // set_sys_clock_khz (and thrashing the PLL feeding the radio SPI) on every
+  // chunk.
+  if (!ota.isSleepInhibited()) {
+    rp2040_enter_ota_profile();
+  }
 #endif
   bool ok = ota.handleCommand(command, reply);
 #if defined(ARDUINO_ARCH_RP2040)
@@ -59,7 +65,10 @@ bool PicoWBoard::handleOTACommand(const char *command, char reply[]) {
 
 bool PicoWBoard::handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) {
 #if defined(ARDUINO_ARCH_RP2040)
-  rp2040_enter_ota_profile();
+  // See handleOTACommand: skip the profile switch while a session is active.
+  if (!ota.isSleepInhibited()) {
+    rp2040_enter_ota_profile();
+  }
 #endif
   bool ok = ota.handleBinaryCommand(opcode, payload, payload_len, reply);
 #if defined(ARDUINO_ARCH_RP2040)

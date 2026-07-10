@@ -229,9 +229,9 @@ protected:
   bool getCADEnabled() const override {
     return _prefs.cad_enabled;
   }
-  int getAGCResetInterval() const override {
-    return ((int)_prefs.agc_reset_interval) * 4000;   // milliseconds
-  }
+  int getAGCResetInterval() const override;   // defined in .cpp: suspended during OTA
+  uint32_t getCADFailRetryDelay() const override;
+  uint32_t getCADFailMaxDuration() const override;
   uint8_t getExtraAckTransmitCount() const override {
     return _prefs.multi_acks;
   }

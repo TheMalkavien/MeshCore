@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MeshCore OTA</title>
   <style>
     :root {
@@ -354,7 +354,7 @@
     #otaStatus.err { color: var(--red); }
     #otaStatus.run { color: #58a6ff; }
 
-    #metricsLine {
+    #metricsLine, #planLine {
       font-size: 0.78rem;
       font-family: var(--mono);
       color: var(--muted);
@@ -386,6 +386,76 @@
 
     /* ── Divider ── */
     .divider { height: 1px; background: var(--border); }
+
+    /* ── Mini buttons (log toolbar) ── */
+    .btn-mini {
+      width: auto;
+      min-height: 28px;
+      padding: 4px 10px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      background: var(--surface2);
+      border: 1px solid var(--border-hi);
+      color: var(--muted);
+      border-radius: var(--r-sm);
+    }
+    .btn-mini:hover:not(:disabled) { color: var(--text); border-color: #6e7681; }
+
+    /* ── Modal ── */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 200;
+      background: rgba(1, 4, 9, 0.7);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .modal-overlay[hidden] { display: none; }
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      padding: 20px 16px 16px;
+      width: 100%;
+      max-width: 360px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .modal-message { font-size: 0.92rem; line-height: 1.5; }
+
+    /* ── Toasts ── */
+    .toast-container {
+      position: fixed;
+      left: 50%;
+      bottom: 24px;
+      transform: translateX(-50%);
+      z-index: 300;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      align-items: center;
+      pointer-events: none;
+      max-width: min(92vw, 480px);
+    }
+    .toast {
+      background: var(--surface2);
+      border: 1px solid var(--border-hi);
+      color: var(--text);
+      font-size: 0.85rem;
+      padding: 9px 14px;
+      border-radius: var(--r-sm);
+      box-shadow: 0 6px 20px rgba(1, 4, 9, 0.5);
+      animation: toast-in .18s ease-out;
+    }
+    .toast.ok  { border-color: #238636; color: var(--green); }
+    .toast.err { border-color: #6e2020; color: var(--red); }
+    @keyframes toast-in {
+      from { opacity: 0; transform: translateY(8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
 
     /* ── File info ── */
     .file-info {
@@ -552,7 +622,7 @@
           </div>
 
           <div class="section-label">Actions</div>
-          <button type="button" id="rebootBtn" class="btn btn-secondary">Reboot à distance</button>
+          <button type="button" id="rebootBtn" class="btn-secondary">Reboot à distance</button>
         </div><!-- /advanced-body -->
       </div>
     </div>
@@ -580,6 +650,7 @@
           <div class="progress-wrap">
             <div class="progress-bar" id="progressBar"></div>
           </div>
+          <div id="planLine">Plan OTA : sélectionne un firmware</div>
           <div id="metricsLine">Aucune mise à jour lancée.</div>
         </div>
       </div>
@@ -590,6 +661,8 @@
       <div class="card-header" style="border-bottom:none; padding-bottom:0;">
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="10" rx="1.5" stroke="currentColor" stroke-width="1.4"/><path d="M5 6h6M5 9h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
         <div class="card-title">Journal</div>
+        <button type="button" id="copyLogBtn" class="btn-mini">Copier</button>
+        <button type="button" id="clearLogBtn" class="btn-mini">Vider</button>
       </div>
       <div class="card-body" style="padding-top:8px;">
         <textarea id="log" readonly></textarea>
@@ -599,6 +672,20 @@
   </main>
 
   <footer>Prototype OTA via companion protocol — USB OTG ou BLE</footer>
+
+  <!-- ── Confirm modal ── -->
+  <div id="modalOverlay" class="modal-overlay" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalMessage">
+      <div class="modal-message" id="modalMessage"></div>
+      <div class="btn-row">
+        <button type="button" id="modalCancelBtn" class="btn-secondary">Annuler</button>
+        <button type="button" id="modalConfirmBtn" class="btn-primary">Confirmer</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Toasts ── -->
+  <div id="toastContainer" class="toast-container"></div>
 
   <script>
     // ── Advanced toggle ──
@@ -622,47 +709,8 @@
         info.classList.remove('visible');
       }
     });
-
-    // ── Connection status helper (call from app.js if needed) ──
-    window.setConnectionStatus = function(text, state) {
-      const el = document.getElementById('connectionStatus');
-      el.textContent = text;
-      el.className = state || '';
-      const pills = document.getElementById('nodePills');
-      if (state === 'ok') {
-        pills.style.display = 'flex';
-        document.getElementById('step1badge').classList.add('done');
-      } else {
-        pills.style.display = 'none';
-        document.getElementById('step1badge').classList.remove('done');
-      }
-    };
-
-    // ── Remote reboot button ──
-    document.getElementById('rebootBtn').addEventListener('click', async function() {
-      const targetHex = getSelectedTargetHex();
-
-      if (!targetHex || targetHex.length < 12) {
-        alert('Sélectionnez un appareil d\'abord');
-        return;
-      }
-
-      const targetSelect = document.getElementById('targetSelect');
-      const label = targetSelect?.options[targetSelect.selectedIndex]?.textContent || targetHex;
-
-      if (!confirm(`Êtes-vous sûr de vouloir redémarrer ${label}?`)) {
-        return;
-      }
-      
-      this.disabled = true;
-      try {
-        await sendRemoteReboot(targetHex);
-      } finally {
-        this.disabled = false;
-      }
-    });
   </script>
 
-  <script defer src="./app.js?v=20260307-ble1"></script>
+  <script defer src="./app.js?v=20260710-r14"></script>
 </body>
 </html>

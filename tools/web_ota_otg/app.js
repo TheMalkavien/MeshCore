@@ -10,8 +10,20 @@ const OTA_BIN_OP = {
   STATUS: 5,
   ABORT: 6,
 };
+// Plafond réel de la chaîne : la trame série du companion (MAX_FRAME_SIZE =
+// 176) porte 40 octets d'en-tête + chunk, soit chunk <= 136. Au-delà, la trame
+// est tronquée et la cible rejette silencieusement chaque write (vérifié sur
+// le terrain avec 160). 132 garde une marge et reste la valeur éprouvée.
 const OTA_BINARY_MAX_CHUNK = 132;
 const CMD_SET_RADIO_PARAMS = 11;
+const CMD_SET_TUNING_PARAMS = 21;
+const CMD_GET_TUNING_PARAMS = 43;
+// Facteur de budget d'airtime du companion pendant l'OTA. Le dispatcher
+// maintient une réserve de 100 ms et attend (airtime/duty) après chaque TX :
+// même à 0.25 (80%), l'inter-paquet reste ~t/0.8 et la file se remplit dès que
+// l'alimentation va plus vite. 0 = duty 100% : plus aucune attente de budget,
+// le gap d'alimentation devient l'unique régulateur. Restauré en fin d'OTA.
+const OTA_AIRTIME_FACTOR = 0;
 
 const PACKET_TYPE = {
   OK: 0,
@@ -25,6 +37,7 @@ const PACKET_TYPE = {
   NO_MORE_MSGS: 10,
   DEVICE_INFO: 13,
   CONTACT_MSG_RECV_V3: 16,
+  TUNING_PARAMS: 23,
   MESSAGES_WAITING: 0x83,
   LOGIN_SUCCESS: 0x85,
   LOGIN_FAILED: 0x86,
@@ -161,7 +174,7 @@ function convertUf2ToBin(bytes) {
 
   const familyIds = parseUf2FamilyIds(bytes);
   if (familyIds.size > 0) {
-    appendLog(`UF2: families detectees ${Array.from(familyIds, (id) => `0x${id.toString(16).padStart(8, "0")}`).join(", ")}`);
+    appendLog(`UF2: familles détectées ${Array.from(familyIds, (id) => `0x${id.toString(16).padStart(8, "0")}`).join(", ")}`);
   } else {
     appendLog("UF2: aucun family id explicite, poursuite en mode compatible");
   }
@@ -235,14 +248,14 @@ function convertUf2ToBin(bytes) {
 }
 
 async function gzipBytes(bytes) {
-  appendLog(`GZIP: compression demarree (${formatByteCount(bytes.length)})`);
+  appendLog(`GZIP: compression démarrée (${formatByteCount(bytes.length)})`);
   const sourceStream = new Blob([bytes]).stream();
-  appendLog("GZIP: pipeline Blob.stream -> CompressionStream cree");
+  appendLog("GZIP: pipeline Blob.stream -> CompressionStream créé");
   const compressed = await new Response(
     sourceStream.pipeThrough(new CompressionStream("gzip"))
   ).arrayBuffer();
   const out = new Uint8Array(compressed);
-  appendLog(`GZIP: compression terminee (${formatByteCount(out.length)})`);
+  appendLog(`GZIP: compression terminée (${formatByteCount(out.length)})`);
   return out;
 }
 
@@ -613,11 +626,16 @@ function estimateOtaRadioProfile(radioBwKhz, radioSf, radioCr) {
   const crFactor = clamp(cr / 5.0, 1.0, 1.8);
   const airFactor = clamp(symRatio * crFactor, 0.1, 20.0);
 
-  let chunkBinary = 72;
+  // Le plaintext chiffre = 11 octets d'en-tete + chunk, padde AES par blocs de
+  // 16 : les tailles ≡ 5 (mod 16) evitent tout octet de padding transmis pour
+  // rien (117 -> 128 exact, 101 -> 112, 85 -> 96, 69 -> 80). 132 est garde au
+  // palier haut : au plafond de la trame serie du companion (chunk <= 136),
+  // +15 octets utiles battent 1 octet de padding economise.
+  let chunkBinary = 69;
   if (airFactor <= 1.2) chunkBinary = 132;
-  else if (airFactor <= 2.5) chunkBinary = 120;
-  else if (airFactor <= 5.0) chunkBinary = 104;
-  else if (airFactor <= 10.0) chunkBinary = 88;
+  else if (airFactor <= 2.5) chunkBinary = 117;
+  else if (airFactor <= 5.0) chunkBinary = 101;
+  else if (airFactor <= 10.0) chunkBinary = 85;
 
   let chunkText = 48;
   if (airFactor <= 1.2) chunkText = 80;
@@ -721,6 +739,7 @@ class MeshCoreSerialClient {
     this.contactsByKey = {};
     this.contactsScanTmp = {};
     this.onEvent = null;
+    this.onDisconnected = null;
     this.writeChain = Promise.resolve();
   }
 
@@ -737,7 +756,7 @@ class MeshCoreSerialClient {
       await this.connectBle(portOrDevice);
       return;
     }
-    throw new Error("transport non supporte");
+    throw new Error("transport non supporté");
   }
 
   async connectSerial(port, baudrate) {
@@ -759,7 +778,7 @@ class MeshCoreSerialClient {
   }
 
   async connectWebUsb(device, baudrate = 115200) {
-    if (!device) throw new Error("peripherique USB manquant");
+    if (!device) throw new Error("périphérique USB manquant");
 
     this.usbDevice = device;
     await this.usbDevice.open();
@@ -783,7 +802,7 @@ class MeshCoreSerialClient {
 
     const candidates = listWebUsbBulkCandidates(this.usbDevice);
     if (candidates.length < 1) {
-      throw new Error("interface CDC bulk IN/OUT non trouvee");
+      throw new Error("interface CDC bulk IN/OUT non trouvée");
     }
     this.log(
       `WebUSB candidates: ${candidates
@@ -822,7 +841,7 @@ class MeshCoreSerialClient {
     if (!selected) {
       const hint = preferred.mode === "generic"
         ? "interface USB bulk indisponible."
-        : "interface CDC serie detectee mais verrouillee par l'OS; utiliser Web Serial si disponible.";
+        : "interface CDC série détectée mais verrouillée par l'OS; utiliser Web Serial si disponible.";
       const details = preferred.claimCandidates
         .map((c) => `if${c.interfaceNumber}/cls0x${Number(c.classCode).toString(16)}`)
         .join(", ");
@@ -893,7 +912,7 @@ class MeshCoreSerialClient {
   }
 
   async connectBle(device) {
-    if (!device) throw new Error("peripherique BLE manquant");
+    if (!device) throw new Error("périphérique BLE manquant");
     this.bleDevice = device;
     this.bleDisconnectHandler = async () => {
       if (!this.connected) return;
@@ -913,7 +932,7 @@ class MeshCoreSerialClient {
       (c) => String(c.uuid || "").toLowerCase() === MESHCORE_BLE_TX_UUID
     ) || null;
     if (!this.bleRxCharacteristic || !this.bleTxCharacteristic) {
-      throw new Error("service BLE MeshCore detecte, mais caracteristiques RX/TX introuvables");
+      throw new Error("service BLE MeshCore détecté, mais caractéristiques RX/TX introuvables");
     }
 
     this.bleNotificationHandler = (event) => {
@@ -931,12 +950,16 @@ class MeshCoreSerialClient {
   }
 
   async disconnect() {
+    const wasConnected = this.connected;
     this.connected = false;
     this.waiters.forEach((w) => {
       clearTimeout(w.timer);
-      w.reject(new Error("deconnecte"));
+      w.reject(new Error("déconnecté"));
     });
     this.waiters = [];
+    if (wasConnected && this.onDisconnected) {
+      try { this.onDisconnected(); } catch {}
+    }
     if (this.reader) {
       try { await this.reader.cancel(); } catch {}
       try { this.reader.releaseLock(); } catch {}
@@ -1017,7 +1040,7 @@ class MeshCoreSerialClient {
       this.parseFrames();
     }
     if (this.connected) {
-      this.log("Connexion serie interrompue.");
+      this.log("Connexion série interrompue.");
       await this.disconnect();
     }
   }
@@ -1123,6 +1146,12 @@ class MeshCoreSerialClient {
         this.emit("contact_msg_recv", msg);
         break;
       }
+      case PACKET_TYPE.TUNING_PARAMS:
+        this.emit("tuning_params", {
+          rx_delay_base: frame.length >= 9 ? parseU32LE(frame, 1) / 1000.0 : null,
+          airtime_factor: frame.length >= 9 ? parseU32LE(frame, 5) / 1000.0 : null,
+        });
+        break;
       case PACKET_TYPE.NO_MORE_MSGS:
         this.emit("no_more_msgs", {});
         break;
@@ -1316,7 +1345,7 @@ class MeshCoreSerialClient {
 
   async sendFrame(payload) {
     if (!this.connected) {
-      throw new Error("non connecte");
+      throw new Error("non connecté");
     }
     if (!(payload instanceof Uint8Array)) {
       payload = new Uint8Array(payload);
@@ -1370,7 +1399,7 @@ class MeshCoreSerialClient {
       }
       return;
     }
-    throw new Error("transport ecriture indisponible");
+    throw new Error("transport écriture indisponible");
   }
 
   enqueueWrite(task) {
@@ -1402,10 +1431,42 @@ class MeshCoreSerialClient {
     return this.sendCommand(Uint8Array.of(0x16, 0x03), ["device_info", "error"], null, waitMs);
   }
 
+  async getTuningParams(timeoutMs = 3000) {
+    const evt = await this.sendCommand(
+      Uint8Array.of(CMD_GET_TUNING_PARAMS),
+      ["tuning_params", "error"],
+      null,
+      timeoutMs
+    );
+    if (!evt || evt.type === "error") {
+      return null; // firmware companion trop ancien ou commande refusée
+    }
+    const rx = Number(evt.payload?.rx_delay_base);
+    const af = Number(evt.payload?.airtime_factor);
+    if (!Number.isFinite(rx) || !Number.isFinite(af)) return null;
+    return { rx_delay_base: rx, airtime_factor: af };
+  }
+
+  async setTuningParams(rxDelayBase, airtimeFactor, timeoutMs = 3000) {
+    const rx = Math.round(Math.max(0, Number(rxDelayBase) || 0) * 1000);
+    const af = Math.round(Math.max(0, Number(airtimeFactor) || 0) * 1000);
+    const payload = concatBytes(
+      Uint8Array.of(CMD_SET_TUNING_PARAMS),
+      u32ToBytesLE(rx),
+      u32ToBytesLE(af)
+    );
+    const evt = await this.sendCommand(payload, ["ok", "error"], null, timeoutMs);
+    if (!evt || evt.type === "error") {
+      const code = evt?.payload?.error_code;
+      return { ok: false, error: `set tuning error${code !== undefined ? ` (code=${code})` : ""}` };
+    }
+    return { ok: true };
+  }
+
   async setLocalRadioParams(freqMhz, bwKhz, sf, cr, repeat = 0) {
     const norm = normalizeRadioPreset({ freq: freqMhz, bw: bwKhz, sf, cr });
     if (!norm) {
-      return { ok: false, error: "parametres radio invalides" };
+      return { ok: false, error: "paramètres radio invalides" };
     }
     const freqKhz = Math.round(norm.freq * 1000.0);
     const bwHz = Math.round(norm.bw * 1000.0);
@@ -1426,7 +1487,7 @@ class MeshCoreSerialClient {
   normalizeTargetPrefix(targetHex) {
     const clean = normalizeHex(targetHex);
     if (clean.length < 12) {
-      throw new Error("pubkey cible invalide (minimum 12 caracteres hex)");
+      throw new Error("pubkey cible invalide (minimum 12 caractères hex)");
     }
     return clean.slice(0, 12);
   }
@@ -1434,7 +1495,7 @@ class MeshCoreSerialClient {
   normalizeTargetFullKey(targetHex) {
     const clean = normalizeHex(targetHex);
     if (clean.length < 64) {
-      throw new Error("cle publique complete requise (64 hex)");
+      throw new Error("clé publique complète requise (64 hex)");
     }
     return clean.slice(0, 64);
   }
@@ -1472,7 +1533,7 @@ class MeshCoreSerialClient {
       const keys = Object.keys(map || {}).filter((k) => k.startsWith(prefix));
       if (keys.length === 1) return keys[0];
       if (keys.length > 1) {
-        throw new Error(`prefix ambigu (${keys.length} contacts)`);
+        throw new Error(`préfixe ambigu (${keys.length} contacts)`);
       }
       return null;
     };
@@ -1509,8 +1570,9 @@ class MeshCoreSerialClient {
       const code = sentEvt?.payload?.error_code;
       return { replyText: null, error: `send error${code !== undefined ? ` (code=${code})` : ""}` };
     }
+    const routeFlood = Number(sentEvt.payload?.type) === 1;
     if (!waitReply) {
-      return { replyText: "", error: null };
+      return { replyText: "", error: null, routeFlood };
     }
 
     const tag = String(sentEvt.payload?.expected_ack || "");
@@ -1521,7 +1583,7 @@ class MeshCoreSerialClient {
     const queued = this.popQueuedBinary(tag);
     if (queued) {
       const text = String(queued.text || "").replace(/\0+$/g, "");
-      return { replyText: text, error: null };
+      return { replyText: text, error: null, routeFlood };
     }
 
     let responseEvt = null;
@@ -1538,7 +1600,7 @@ class MeshCoreSerialClient {
       return { replyText: null, error: `timeout waiting binary reply` };
     }
     const text = String(responseEvt.payload?.text || "").replace(/\0+$/g, "");
-    return { replyText: text, error: null };
+    return { replyText: text, error: null, routeFlood };
   }
 
   async sendOtaBinaryCmd(targetFullKeyHex, opcode, payload = new Uint8Array(), waitReply = true, timeoutMs = 0, minTimeoutMs = 200) {
@@ -1777,6 +1839,18 @@ const ui = {
   selfName: document.querySelector("#selfName"),
   selfKey: document.querySelector("#selfKey"),
   selfRadio: document.querySelector("#selfRadio"),
+  nodePills: document.querySelector("#nodePills"),
+  step1badge: document.querySelector("#step1badge"),
+  step2badge: document.querySelector("#step2badge"),
+  step3badge: document.querySelector("#step3badge"),
+  rebootBtn: document.querySelector("#rebootBtn"),
+  copyLogBtn: document.querySelector("#copyLogBtn"),
+  clearLogBtn: document.querySelector("#clearLogBtn"),
+  modalOverlay: document.querySelector("#modalOverlay"),
+  modalMessage: document.querySelector("#modalMessage"),
+  modalConfirmBtn: document.querySelector("#modalConfirmBtn"),
+  modalCancelBtn: document.querySelector("#modalCancelBtn"),
+  toastContainer: document.querySelector("#toastContainer"),
   progressBar: document.querySelector("#progressBar"),
   log: document.querySelector("#log"),
 };
@@ -1784,16 +1858,70 @@ const ui = {
 let client = null;
 let otaRunning = false;
 let otaCancelRequested = false;
+let otaCompleted = false;
+// Compteurs de backpressure locale (code=3), partagés entre runBinaryOta et
+// getOtaStatusBinary, remis à zéro à chaque transfert.
+const otaBusyStats = { events: 0, sleepMs: 0 };
 let lastSelfInfo = null;
 let lastPlanSummary = "";
 
+const LOG_MAX_CHARS = 200000;
+
 function appendLog(line) {
-  ui.log.value += `[${nowTime()}] ${line}\n`;
+  let value = `${ui.log.value}[${nowTime()}] ${line}\n`;
+  if (value.length > LOG_MAX_CHARS) {
+    const cut = value.indexOf("\n", value.length - Math.floor(LOG_MAX_CHARS * 0.75));
+    value = `[journal tronqué]\n${value.slice(cut + 1)}`;
+  }
+  ui.log.value = value;
   ui.log.scrollTop = ui.log.scrollHeight;
 }
 
-function setConnectionStatus(text, ok = false) {
-  ui.connectionStatus.innerHTML = ok ? `<strong>${text}</strong>` : text;
+function showToast(message, kind = "") {
+  if (!ui.toastContainer) return;
+  const toast = document.createElement("div");
+  toast.className = `toast${kind ? ` ${kind}` : ""}`;
+  toast.textContent = message;
+  ui.toastContainer.appendChild(toast);
+  setTimeout(() => toast.remove(), 3500);
+}
+
+function showConfirm(message) {
+  if (!ui.modalOverlay || !ui.modalMessage) {
+    return Promise.resolve(window.confirm(message));
+  }
+  return new Promise((resolve) => {
+    ui.modalMessage.textContent = message;
+    ui.modalOverlay.hidden = false;
+    const done = (value) => {
+      ui.modalOverlay.hidden = true;
+      ui.modalConfirmBtn.onclick = null;
+      ui.modalCancelBtn.onclick = null;
+      ui.modalOverlay.onclick = null;
+      resolve(value);
+    };
+    ui.modalConfirmBtn.onclick = () => done(true);
+    ui.modalCancelBtn.onclick = () => done(false);
+    ui.modalOverlay.onclick = (e) => {
+      if (e.target === ui.modalOverlay) done(false);
+    };
+  });
+}
+
+function updateStepBadges() {
+  const connected = Boolean(client && client.connected);
+  const hasTarget = getSelectedTargetHex().length >= 12;
+  const hasFile = Boolean(ui.firmwareFile?.files && ui.firmwareFile.files[0]);
+  if (ui.step1badge) ui.step1badge.classList.toggle("done", connected);
+  if (ui.step2badge) ui.step2badge.classList.toggle("done", connected && hasTarget && hasFile);
+  if (ui.step3badge) ui.step3badge.classList.toggle("done", otaCompleted);
+}
+
+function setConnectionStatus(text, state = "") {
+  ui.connectionStatus.textContent = text;
+  ui.connectionStatus.className = state;
+  if (ui.nodePills) ui.nodePills.style.display = state === "ok" ? "flex" : "none";
+  updateStepBadges();
 }
 
 function setOtaStatus(text) {
@@ -1802,7 +1930,12 @@ function setOtaStatus(text) {
 
 function setProgress(percent) {
   const p = Math.max(0, Math.min(100, Number(percent) || 0));
+  ui.progressBar.classList.remove("indeterminate");
   ui.progressBar.style.width = `${p}%`;
+}
+
+function setProgressIndeterminate() {
+  ui.progressBar.classList.add("indeterminate");
 }
 
 function getTransportLabel(transport) {
@@ -1843,7 +1976,7 @@ function resetTargetRepeaterSelect() {
   ui.targetSelect.innerHTML = "";
   const option = document.createElement("option");
   option.value = "";
-  option.textContent = "Selectionner un repetiteur...";
+  option.textContent = "Sélectionner un répéteur…";
   ui.targetSelect.appendChild(option);
   ui.targetSelect.value = "";
 }
@@ -1911,12 +2044,12 @@ function updateLiveMetrics(transport, doneBytes, totalBytes, startTs, attempts, 
 
   if (!Number.isFinite(etaSec) || doneBytes <= 0) {
     ui.metricsLine.textContent =
-      `Transport ${tr} | ${pct}% | Estimation en cours... | Rejets ${totalRejects}/${attempts} (${totalRejectRatePct.toFixed(2)}%)`;
+      `Transport ${tr} | ${pct}% | Estimation en cours… | Rejets ${totalRejects}/${attempts} (${totalRejectRatePct.toFixed(2)}%)`;
     return;
   }
 
   ui.metricsLine.textContent =
-    `Transport ${tr} | ${pct}% | Restant ~${formatDuration(etaSec)} | `
+    `Transport ${tr} | ${pct}% | ${(rateBps / 1024).toFixed(2)} ko/s | Restant ~${formatDuration(etaSec)} | `
     + `Rejets ${totalRejects}/${attempts} (${totalRejectRatePct.toFixed(2)}%) `
     + `[send ${sendFailures}/${attempts} ${sendFailureRatePct.toFixed(2)}%, `
     + `srv ${serverRejects}/${attempts} ${serverRejectRatePct.toFixed(2)}%]`;
@@ -1924,6 +2057,7 @@ function updateLiveMetrics(transport, doneBytes, totalBytes, startTs, attempts, 
 
 function updateButtons() {
   const connected = Boolean(client && client.connected);
+  const isBle = String(ui.connectionMode?.value || "usb") === "ble";
   ui.connectBtn.disabled = connected || otaRunning;
   ui.disconnectBtn.disabled = !connected || otaRunning;
   ui.startOtaBtn.disabled = !connected || otaRunning;
@@ -1931,10 +2065,16 @@ function updateButtons() {
   if (ui.refreshTargetsBtn) ui.refreshTargetsBtn.disabled = !connected || otaRunning;
   if (ui.targetSelect) ui.targetSelect.disabled = !connected || otaRunning;
   if (ui.targetKey) ui.targetKey.disabled = otaRunning;
+  if (ui.targetPassword) ui.targetPassword.disabled = otaRunning;
+  if (ui.firmwareFile) ui.firmwareFile.disabled = otaRunning;
+  if (ui.connectionMode) ui.connectionMode.disabled = otaRunning;
+  if (ui.baudrate) ui.baudrate.disabled = otaRunning || isBle;
+  if (ui.rebootBtn) ui.rebootBtn.disabled = otaRunning;
   if (ui.useTempRadio) {
     ui.useTempRadio.disabled = otaRunning;
   }
   updateTempRadioInputsState();
+  updateStepBadges();
 }
 
 function updateTuneInputsState() {
@@ -1959,7 +2099,7 @@ function updatePlanLine(logToConsole = true) {
   const fwSize = file ? Number(file.size || 0) : 0;
   const chunkInput = Number.parseInt(ui.chunkSize?.value || "0", 10) || 0;
   const ackEvery = Number.parseInt(ui.ackEvery?.value || "0", 10) || 0;
-  let planText = "Plan OTA: selectionne un firmware";
+  let planText = "Plan OTA: sélectionne un firmware";
 
   if (!file || fwSize <= 0 || chunkInput < 1) {
     if (ui.planLine) ui.planLine.textContent = planText;
@@ -2051,7 +2191,7 @@ function recalcAutoFromCurrentSelection(logReason = null) {
       return applyAutoOtaSettingsForPreset(preset, logReason);
     } catch (e) {
       if (logReason) {
-        appendLog(`Auto tuning ignore (preset OTA invalide): ${e.message}`);
+        appendLog(`Auto tuning ignoré (preset OTA invalide): ${e.message}`);
       }
       return null;
     }
@@ -2065,7 +2205,7 @@ async function getFirmwareBytes(file) {
   appendLog(`Lecture firmware: ${file.name} (${formatByteCount(sourceBytes.length)})`);
 
   if (fileName.endsWith(".uf2")) {
-    appendLog("Firmware: format source detecte = uf2");
+    appendLog("Firmware: format source détecté = uf2");
     const binBytes = convertUf2ToBin(sourceBytes);
     if (typeof CompressionStream === "function") {
       appendLog("Firmware: CompressionStream disponible, conversion uf2 -> bin.gz");
@@ -2091,7 +2231,30 @@ async function getFirmwareBytes(file) {
   }
 
   const isGzip = fileName.endsWith(".gz");
-  appendLog(`Firmware: format source detecte = ${isGzip ? "bin.gz" : "bin"}`);
+  appendLog(`Firmware: format source détecté = ${isGzip ? "bin.gz" : "bin"}`);
+
+  // Le bootloader OTA arduino-pico détecte l'en-tête gzip et décompresse
+  // nativement : compresser un .bin brut réduit le volume transmis (~40-50%)
+  // et évite de saturer la partition LittleFS de staging.
+  if (!isGzip && typeof CompressionStream === "function") {
+    const gzipPayload = await gzipBytes(sourceBytes);
+    if (gzipPayload.length < sourceBytes.length) {
+      appendLog(
+        `Firmware: compression auto ${formatByteCount(sourceBytes.length)} -> ${formatByteCount(gzipPayload.length)} `
+        + `(${Math.round((1 - (gzipPayload.length / sourceBytes.length)) * 100)}% de moins à transmettre)`
+      );
+      return {
+        firmware: gzipPayload,
+        sourceFormat: "bin",
+        uploadFormat: "bin.gz",
+        originalSize: sourceBytes.length,
+        extractedSize: sourceBytes.length,
+        uploadSize: gzipPayload.length,
+      };
+    }
+    appendLog("Firmware: gzip sans gain, envoi du bin brut");
+  }
+
   return {
     firmware: sourceBytes,
     sourceFormat: isGzip ? "bin.gz" : "bin",
@@ -2119,7 +2282,7 @@ async function getOtaStatus(targetHex, timeoutSec = 10) {
 async function getOtaStatusBinary(targetFullKeyHex, maxAttempts = 2, timeoutMs = 4000) {
   let lastErr = null;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const res = await client.sendOtaBinaryCmd(
+    let res = await client.sendOtaBinaryCmd(
       targetFullKeyHex,
       OTA_BIN_OP.STATUS,
       new Uint8Array(),
@@ -2127,6 +2290,25 @@ async function getOtaStatusBinary(targetFullKeyHex, maxAttempts = 2, timeoutMs =
       timeoutMs,
       250
     );
+    // ERR_CODE_TABLE_FULL (code=3) : la file TX du companion est pleine — le
+    // STATUS de checkpoint est soumis au pic de remplissage, juste après le
+    // dernier chunk du lot. Condition purement locale : on attend le drain et
+    // on resoumet sans consommer de tentative radio. Ce délai laisse aussi le
+    // chunk-frontière atterrir et le gel flash de la cible se terminer avant
+    // que le STATUS ne parte en l'air.
+    for (let busy = 0; busy < 4 && res.error && String(res.error).includes("code=3"); busy += 1) {
+      otaBusyStats.events += 1;
+      otaBusyStats.sleepMs += 90 + (60 * busy);
+      await sleep(90 + (60 * busy));
+      res = await client.sendOtaBinaryCmd(
+        targetFullKeyHex,
+        OTA_BIN_OP.STATUS,
+        new Uint8Array(),
+        true,
+        timeoutMs,
+        250
+      );
+    }
     if (!res.error) {
       return { reply: res.replyText, status: parseOtaStatus(res.replyText), error: null };
     }
@@ -2144,7 +2326,7 @@ async function abortTargetOtaSession(targetHex, targetFullKeyHex = "", reason = 
   const cleanFull = normalizeHex(targetFullKeyHex || "");
   const cleanTarget = normalizeHex(targetHex || "");
 
-  appendLog(`OTA cleanup (${reason}): tentative de remise a zero de la session cible.`);
+  appendLog(`OTA cleanup (${reason}): tentative de remise à zéro de la session cible.`);
 
   if (cleanFull.length >= 64) {
     try {
@@ -2157,12 +2339,12 @@ async function abortTargetOtaSession(targetHex, targetFullKeyHex = "", reason = 
         400
       );
       if (!binRes.error && isOkOtaReply(binRes.replyText)) {
-        appendLog(`OTA cleanup (${reason}): abort binaire confirme.`);
+        appendLog(`OTA cleanup (${reason}): abort binaire confirmé.`);
         return true;
       }
       appendLog(
-        `OTA cleanup (${reason}): abort binaire non confirme`
-        + `${binRes.error ? ` (${binRes.error})` : ` (${String(binRes.replyText || "").trim() || "reponse vide"})`}.`
+        `OTA cleanup (${reason}): abort binaire non confirmé`
+        + `${binRes.error ? ` (${binRes.error})` : ` (${String(binRes.replyText || "").trim() || "réponse vide"})`}.`
       );
     } catch (e) {
       appendLog(`OTA cleanup (${reason}): exception abort binaire (${e.message}).`);
@@ -2173,19 +2355,19 @@ async function abortTargetOtaSession(targetHex, targetFullKeyHex = "", reason = 
     try {
       const textRes = await client.sendRepeaterCmdAndWaitReply(cleanTarget, "ota abort", 8);
       if (!textRes.error && isOkOtaReply(textRes.reply)) {
-        appendLog(`OTA cleanup (${reason}): abort texte confirme.`);
+        appendLog(`OTA cleanup (${reason}): abort texte confirmé.`);
         return true;
       }
       appendLog(
-        `OTA cleanup (${reason}): abort texte non confirme`
-        + `${textRes.error ? ` (${textRes.error})` : ` (${String(textRes.reply || "").trim() || "reponse vide"})`}.`
+        `OTA cleanup (${reason}): abort texte non confirmé`
+        + `${textRes.error ? ` (${textRes.error})` : ` (${String(textRes.reply || "").trim() || "réponse vide"})`}.`
       );
     } catch (e) {
       appendLog(`OTA cleanup (${reason}): exception abort texte (${e.message}).`);
     }
   }
 
-  appendLog(`OTA cleanup (${reason}): remise a zero non confirmee.`);
+  appendLog(`OTA cleanup (${reason}): remise à zéro non confirmée.`);
   return false;
 }
 
@@ -2236,10 +2418,10 @@ async function runBinaryOta(params) {
   } = params;
 
   if (chunkSizeInput < 16 || chunkSizeInput > OTA_BINARY_MAX_CHUNK) {
-    throw new Error(`chunk_size doit etre entre 16 et ${OTA_BINARY_MAX_CHUNK} en mode binaire`);
+    throw new Error(`chunk_size doit être entre 16 et ${OTA_BINARY_MAX_CHUNK} en mode binaire`);
   }
   if (ackEveryInput < 1 || ackEveryInput > 64) {
-    throw new Error("ack_every doit etre entre 1 et 64");
+    throw new Error("ack_every doit être entre 1 et 64");
   }
   if (!firmware || firmware.length === 0) {
     throw new Error("firmware vide");
@@ -2250,13 +2432,23 @@ async function runBinaryOta(params) {
 
   const fwSize = firmware.length;
   let chunkSize = Math.min(chunkSizeInput, OTA_BINARY_MAX_CHUNK);
-  const ackEvery = ackEveryInput;
+  // En binaire, le firmware supprime tous les ACK d'écriture : la cadence des
+  // checkpoints STATUS est purement côté client, donc adaptable en cours de
+  // route sans renégocier le BEGIN.
+  // Avec le staging 16 Ko de la cible, les checkpoints obligatoires tombent
+  // tous les ~124 chunks : le plafond d'ack doit pouvoir monter au-delà pour
+  // que la cadence soit dictée par les frontières de flush, pas par le compte.
+  const ACK_EVERY_MAX = 128;
+  const ACK_EVERY_MIN = 2; // jamais 1 : un STATUS par chunk effondre le débit
+  let ackEvery = Math.max(ACK_EVERY_MIN, ackEveryInput);
+  let ackEveryCeiling = ACK_EVERY_MAX;
+  let cleanCheckpoints = 0;
   const totalChunks = Math.ceil(fwSize / chunkSize);
 
   appendLog(`Transport: binary req`);
   appendLog(`Firmware: ${fwSize} bytes (md5=${firmwareMd5})`);
   appendLog(`Chunk size: ${chunkSize} bytes (${totalChunks} chunks)`);
-  appendLog(`Ack every: ${ackEvery} chunk(s)`);
+  appendLog(`Ack every: ${ackEvery} chunk(s) (adaptatif ${ACK_EVERY_MIN}..${ACK_EVERY_MAX})`);
   appendLog("Checkpoint mode: status");
   if (radioProfile) {
     appendLog(
@@ -2268,6 +2460,16 @@ async function runBinaryOta(params) {
   const tStart = performance.now();
   const statusTimeout = Math.max(500, Number(statusTimeoutMs) || 4000);
   const quickStatusTimeout = Math.max(450, Math.min(2000, Math.round(statusTimeout * 0.55)));
+
+  // La cible gèle sa flash à chaque flush de son tampon de staging : les chunks
+  // arrivant pendant ce gel sont perdus. Une pause côté client ne suffit pas
+  // (elle suspend l'alimentation de la file du companion, pas l'antenne). On
+  // force donc un checkpoint à chaque frontière de bloc : le client se tait,
+  // la file se draine, et le seul paquet en vol pendant le gel (le STATUS)
+  // survit dans le FIFO du SX1262. Les firmwares récents mettent en tampon RAM
+  // 16 Ko et annoncent leur taille de bloc via 'blk=' dans la réponse START ;
+  // 4096 (le tampon interne de l'Updater) reste le défaut sûr.
+  let targetFlushBlock = 4096;
   let offset = 0;
   let chunkIndex = 0;
   let chunksSinceAck = 0;
@@ -2278,6 +2480,31 @@ async function runBinaryOta(params) {
   const writeMaxRetries = 3;
   const checkpointMaxRetries = 10;
   let shouldCleanupTargetOta = false;
+  let resuming = false;
+
+  // Instrumentation : où part le temps ? (résumé loggé en fin de transfert)
+  let writeRttSumMs = 0;
+  let writeRttCount = 0;
+  let writeRttMaxMs = 0;
+  let checkpointSumMs = 0;
+  let checkpointCount = 0;
+  otaBusyStats.events = 0;
+  otaBusyStats.sleepMs = 0;
+
+  // Détection de stagnation : si les checkpoints resynchronisent en boucle sans
+  // que le serveur avance (lien asymétrique), on abandonne au lieu de tourner
+  // indéfiniment.
+  let lastResyncOffset = -1;
+  let resyncStalls = 0;
+  const noteResync = (newOffset) => {
+    resyncStalls = newOffset <= lastResyncOffset ? resyncStalls + 1 : 0;
+    lastResyncOffset = newOffset;
+    appendLog(`Resync offset -> ${newOffset}/${fwSize}`);
+    if (resyncStalls >= 5) {
+      throw new Error(`OTA bloquée: resynchronisations répétées sans progression à l'offset ${newOffset}`);
+    }
+  };
+
   updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
 
   try {
@@ -2292,7 +2519,7 @@ async function runBinaryOta(params) {
 
     if (startRes.error) {
       if (startRes.error.startsWith("timeout waiting binary reply")) {
-        appendLog("Binary OTA non disponible (pas de reponse binaire).");
+        appendLog("Binary OTA non disponible (pas de réponse binaire).");
         return null;
       }
       throw new Error(`Start OTA failed (binary): ${startRes.error}`);
@@ -2306,10 +2533,11 @@ async function runBinaryOta(params) {
         if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
           offset = st.status.done;
           chunkIndex = Math.floor(offset / chunkSize);
-          appendLog(`Resuming OTA session at offset ${offset}/${fwSize}`);
+          resuming = true;
+          appendLog(`Reprise de session OTA à l'offset ${offset}/${fwSize}`);
         } else {
           appendLog(
-            `Binary OTA: session precedente incompatible, reset requis`
+            `Binary OTA: session précédente incompatible, reset requis`
             + `${st.error ? ` (${st.error})` : st.reply ? ` (${st.reply})` : ""}.`
           );
           const resetOk = await abortTargetOtaSession(targetHex, targetFullKeyHex, "restart binary");
@@ -2345,7 +2573,29 @@ async function runBinaryOta(params) {
 
     shouldCleanupTargetOta = true;
 
-    if (offset === 0) {
+    {
+      const blkMatch = /blk=(\d+)/.exec(startReply);
+      if (blkMatch) {
+        targetFlushBlock = Math.max(1024, Number.parseInt(blkMatch[1], 10) || 4096);
+        appendLog(
+          `Bloc de flush cible: ${targetFlushBlock} octets `
+          + `(checkpoint obligatoire ~tous les ${Math.floor(targetFlushBlock / chunkSize)} chunks)`
+        );
+      }
+    }
+
+    if (startRes.routeFlood !== undefined) {
+      appendLog(
+        `Route vers la cible: ${startRes.routeFlood
+          ? "FLOOD (chemin direct inconnu — les réponses de la cible gardent le délai standard de 300ms !)"
+          : "directe"}`
+      );
+    }
+
+    // En reprise, le BEGIN a déjà été accepté par la session en cours : le
+    // renvoyer répondrait "already running" et ferait échouer l'OTA (y compris
+    // à offset 0).
+    if (!resuming) {
       const md5Bytes = hexToBytes(firmwareMd5);
       if (md5Bytes.length !== 16) {
         throw new Error("md5 firmware invalide (taille)");
@@ -2379,22 +2629,19 @@ async function runBinaryOta(params) {
 
     while (offset < fwSize) {
       if (otaCancelRequested) {
-        await client.sendOtaBinaryCmd(
-          targetFullKeyHex,
-          OTA_BIN_OP.ABORT,
-          new Uint8Array(),
-          false,
-          0,
-          100
-        );
+        // Abort confirmé (avec retry et fallback texte) : un ABORT perdu
+        // laisserait la session cible armée et son profil horloge OTA actif.
+        await abortTargetOtaSession(targetHex, targetFullKeyHex, "annulation");
         shouldCleanupTargetOta = false;
-        throw new Error("OTA annulee.");
+        throw new Error("OTA annulée.");
       }
 
       const chunkLen = Math.min(chunkSize, fwSize - offset);
       const chunk = firmware.subarray(offset, offset + chunkLen);
       const isLastChunk = offset + chunkLen >= fwSize;
-      const checkpointDue = (chunksSinceAck + 1 >= ackEvery) || isLastChunk;
+      const crossesFlushBoundary =
+        Math.floor((offset + chunkLen) / targetFlushBlock) !== Math.floor(offset / targetFlushBlock);
+      const checkpointDue = crossesFlushBoundary || (chunksSinceAck + 1 >= ackEvery) || isLastChunk;
       const writePayload = concatBytes(
         u32ToBytesLE(offset),
         Uint8Array.of(chunkLen & 0xff),
@@ -2402,11 +2649,13 @@ async function runBinaryOta(params) {
       );
 
       const writeOffset = offset;
+      const writeStartMs = performance.now();
       let writeOk = false;
       let failure = "write failed";
 
       for (let attempt = 1; attempt <= writeMaxRetries; attempt += 1) {
         chunkWriteAttempts += 1;
+        const attemptStartMs = performance.now();
         const writeRes = await client.sendOtaBinaryCmd(
           targetFullKeyHex,
           OTA_BIN_OP.WRITE,
@@ -2416,19 +2665,41 @@ async function runBinaryOta(params) {
           100
         );
         if (!writeRes.error) {
+          const rtt = performance.now() - attemptStartMs;
+          writeRttSumMs += rtt;
+          writeRttCount += 1;
+          if (rtt > writeRttMaxMs) writeRttMaxMs = rtt;
           writeOk = true;
           break;
         }
 
         chunkWriteFailures += 1;
         failure = writeRes.error || failure;
+        updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
+
+        // ERR_CODE_TABLE_FULL (code=3) : la file TX du companion est pleine —
+        // condition purement locale. Un aller-retour STATUS radio ne servirait
+        // à rien : on laisse la radio drainer puis on retente directement.
+        // Le STATUS ne part que si l'erreur persiste au dernier essai.
+        const isLocalBusy = String(writeRes.error || "").includes("code=3");
+        if (isLocalBusy && attempt < writeMaxRetries) {
+          const busySleep = Math.max(40, noAckGapMs * 2) * attempt;
+          otaBusyStats.events += 1;
+          otaBusyStats.sleepMs += busySleep;
+          await sleep(busySleep);
+          continue;
+        }
 
         const st = await getOtaStatusBinary(targetFullKeyHex, 1, quickStatusTimeout);
         if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
           const srvOffset = st.status.done;
           if (srvOffset !== offset) {
-            chunkServerRejects += estimateRejectedChunks(offset, srvOffset, chunkSize);
-            appendLog(`Resync offset to ${srvOffset}/${fwSize}`);
+            if (srvOffset < offset) {
+              chunkServerRejects += estimateRejectedChunks(offset, srvOffset, chunkSize);
+              noteResync(srvOffset);
+            } else {
+              appendLog(`Serveur en avance (${srvOffset}/${fwSize}), rattrapage sans pénalité`);
+            }
             offset = srvOffset;
             chunkIndex = Math.floor(offset / chunkSize);
             chunksSinceAck = 0;
@@ -2456,7 +2727,13 @@ async function runBinaryOta(params) {
         offset += chunkLen;
         chunkIndex += 1;
         chunksSinceAck += 1;
-        if (!checkpointDue && noAckGapMs > 0) await sleep(noAckGapMs);
+        if (!checkpointDue && noAckGapMs > 0) {
+          // Le round-trip série (attente du msg_sent) fait déjà partie de
+          // l'espacement entre chunks : on ne dort que le reliquat du gap au
+          // lieu de l'additionner (~20 ms/chunk économisés).
+          const gapLeft = noAckGapMs - (performance.now() - writeStartMs);
+          if (gapLeft > 0) await sleep(gapLeft);
+        }
       } else {
         continue;
       }
@@ -2464,6 +2741,7 @@ async function runBinaryOta(params) {
       if (checkpointDue) {
         let checkpointOk = false;
         failure = "checkpoint status missing";
+        const checkpointStartMs = performance.now();
 
         for (let attempt = 1; attempt <= checkpointMaxRetries; attempt += 1) {
           const st = await getOtaStatusBinary(
@@ -2472,20 +2750,59 @@ async function runBinaryOta(params) {
             Math.max(1500, checkpointTimeoutMs, statusTimeout)
           );
           if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
-            if (st.status.done !== offset) {
-              chunkServerRejects += estimateRejectedChunks(offset, st.status.done, chunkSize);
-              appendLog(`Resync offset to ${st.status.done}/${fwSize}`);
+            const srvDone = st.status.done;
+            // behind = des chunks ont réellement été perdus en l'air.
+            // ahead  = le serveur avait déjà reçu ce qu'on croyait perdu (course
+            //          entre chunks en vol et resync arrière) : c'est du progrès,
+            //          aucune pénalité à appliquer.
+            const behind = srvDone < offset;
+            const ahead = srvDone > offset;
+            if (behind) {
+              chunkServerRejects += estimateRejectedChunks(offset, srvDone, chunkSize);
+              noteResync(srvDone);
+            } else if (ahead) {
+              appendLog(`Serveur en avance (${srvDone}/${fwSize}), rattrapage sans pénalité`);
             }
-            offset = st.status.done;
+            offset = srvDone;
             chunkIndex = Math.floor(offset / chunkSize);
             chunksSinceAck = 0;
             checkpointOk = true;
+
+            // ack_every adaptatif (AIMD borné) : pertes -> on divise par 2 et le
+            // plafond descend d'un cran ; lien propre -> on remonte après 3
+            // checkpoints propres, et le plafond lui-même se relève après 5
+            // checkpoints propres consécutifs au plafond. Une perte RF sporadique
+            // ne condamne donc plus la session (l'ancien plafond irréversible
+            // faisait s'effondrer ack jusqu'à 1).
+            if (behind) {
+              cleanCheckpoints = 0;
+              if (ackEvery > ACK_EVERY_MIN) {
+                ackEvery = Math.max(ACK_EVERY_MIN, Math.floor(ackEvery / 2));
+                ackEveryCeiling = Math.max(ACK_EVERY_MIN, Math.min(ackEveryCeiling, ackEvery * 2));
+                appendLog(`Ack adaptatif: réduit à ${ackEvery} (pertes, plafond ${ackEveryCeiling})`);
+              }
+            } else {
+              cleanCheckpoints += 1;
+              if (ackEvery < ackEveryCeiling) {
+                if (cleanCheckpoints >= 3) {
+                  ackEvery = Math.min(ackEveryCeiling, ackEvery * 2);
+                  cleanCheckpoints = 0;
+                  appendLog(`Ack adaptatif: augmenté à ${ackEvery} (lien propre)`);
+                }
+              } else if (ackEveryCeiling < ACK_EVERY_MAX && cleanCheckpoints >= 5) {
+                ackEveryCeiling = Math.min(ACK_EVERY_MAX, ackEveryCeiling * 2);
+                ackEvery = Math.min(ackEveryCeiling, ackEvery * 2);
+                cleanCheckpoints = 0;
+                appendLog(`Ack adaptatif: plafond relevé à ${ackEveryCeiling}, ack ${ackEvery}`);
+              }
+            }
             break;
           }
 
           failure = st.error || (st.reply ? `status=${st.reply}` : "invalid status response");
           if (attempt < checkpointMaxRetries) {
             appendLog(`Retry checkpoint status (binary) at offset ${offset} (${attempt}/${checkpointMaxRetries}): ${failure}`);
+            updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
             await sleep(120 * attempt);
           }
         }
@@ -2493,6 +2810,8 @@ async function runBinaryOta(params) {
         if (!checkpointOk) {
           throw new Error(`OTA checkpoint failed (binary) at offset ${offset}: ${failure}`);
         }
+        checkpointSumMs += performance.now() - checkpointStartMs;
+        checkpointCount += 1;
       }
 
       const pct = Math.floor((offset * 100) / fwSize);
@@ -2527,6 +2846,16 @@ async function runBinaryOta(params) {
       throw new Error(`OTA end failed (binary): ${endRes.replyText}`);
     }
     shouldCleanupTargetOta = false;
+
+    if (writeRttCount > 0) {
+      appendLog(
+        `Timing: write RTT moyen ${(writeRttSumMs / writeRttCount).toFixed(1)}ms `
+        + `(max ${writeRttMaxMs.toFixed(0)}ms, ${writeRttCount} mesures) | `
+        + `checkpoints ${checkpointCount} x ${checkpointCount > 0 ? (checkpointSumMs / checkpointCount).toFixed(0) : 0}ms `
+        + `(total ${(checkpointSumMs / 1000).toFixed(1)}s) | `
+        + `backpressure code=3: ${otaBusyStats.events} attentes, ${(otaBusyStats.sleepMs / 1000).toFixed(1)}s`
+      );
+    }
 
     await sleep(1000);
     await client.sendRepeaterCmdNoReply(targetHex, "reboot");
@@ -2581,10 +2910,10 @@ async function runTextOta(params) {
   } = params;
 
   if (chunkSizeInput < 16 || chunkSizeInput > 80) {
-    throw new Error("chunk_size doit etre entre 16 et 80 en mode texte");
+    throw new Error("chunk_size doit être entre 16 et 80 en mode texte");
   }
   if (ackEveryInput < 1 || ackEveryInput > 64) {
-    throw new Error("ack_every doit etre entre 1 et 64");
+    throw new Error("ack_every doit être entre 1 et 64");
   }
   if (!firmware || firmware.length === 0) {
     throw new Error("firmware vide");
@@ -2600,10 +2929,10 @@ async function runTextOta(params) {
 
   const safeChunkLimit = maxOtaChunkForOffset(Math.max(0, fwSize - 1));
   if (safeChunkLimit < 16) {
-    throw new Error(`transport texte trop limite pour OTA (chunk max securise ${safeChunkLimit})`);
+    throw new Error(`transport texte trop limité pour OTA (chunk max sécurisé ${safeChunkLimit})`);
   }
   if (chunkSize > safeChunkLimit) {
-    appendLog(`Chunk size ajuste de ${chunkSize} a ${safeChunkLimit} (limite transport texte).`);
+    appendLog(`Chunk size ajusté de ${chunkSize} à ${safeChunkLimit} (limite transport texte).`);
     chunkSize = safeChunkLimit;
   }
 
@@ -2638,6 +2967,20 @@ async function runTextOta(params) {
   let chunkServerRejects = 0;
   let lastProgressPct = -1;
   let shouldCleanupTargetOta = false;
+  let resuming = false;
+
+  // Voir runBinaryOta : coupe court aux boucles de resynchronisation sans progrès.
+  let lastResyncOffset = -1;
+  let resyncStalls = 0;
+  const noteResync = (newOffset) => {
+    resyncStalls = newOffset <= lastResyncOffset ? resyncStalls + 1 : 0;
+    lastResyncOffset = newOffset;
+    appendLog(`Resync offset -> ${newOffset}/${fwSize}`);
+    if (resyncStalls >= 5) {
+      throw new Error(`OTA bloquée: resynchronisations répétées sans progression à l'offset ${newOffset}`);
+    }
+  };
+
   updateLiveMetrics("text_cmd", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
 
   try {
@@ -2653,10 +2996,11 @@ async function runTextOta(params) {
         if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
           offset = st.status.done;
           chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
-          appendLog(`Resuming OTA session at offset ${offset}/${fwSize}`);
+          resuming = true;
+          appendLog(`Reprise de session OTA à l'offset ${offset}/${fwSize}`);
         } else {
           appendLog(
-            `Text OTA: session precedente incompatible, reset requis`
+            `Text OTA: session précédente incompatible, reset requis`
             + `${st.error ? ` (${st.error})` : st.reply ? ` (${st.reply})` : ""}.`
           );
           const resetOk = await abortTargetOtaSession(targetHex, "", "restart text");
@@ -2682,13 +3026,15 @@ async function runTextOta(params) {
 
     shouldCleanupTargetOta = true;
 
-    if (offset === 0) {
+    // En reprise, la session a déjà accepté son BEGIN : le renvoyer ferait
+    // échouer l'OTA ("already running"), y compris à offset 0.
+    if (!resuming) {
       let beginCmd = `ota begin ${fwSize} ${firmwareMd5} ${ackEvery}`;
       let beginRes = await client.sendRepeaterCmdAndWaitReply(targetHex, beginCmd, beginTimeoutSec);
       if (!beginRes.error && !isOkOtaReply(beginRes.reply) && ackEvery > 1) {
         const r = String(beginRes.reply || "").toLowerCase();
         if (r.includes("too many args") || r.includes("bad ack")) {
-          appendLog("Target ne supporte pas ack_every sur begin, fallback a ack_every=1.");
+          appendLog("Target ne supporte pas ack_every sur begin, fallback à ack_every=1.");
           ackEvery = 1;
           beginCmd = `ota begin ${fwSize} ${firmwareMd5}`;
           beginRes = await client.sendRepeaterCmdAndWaitReply(targetHex, beginCmd, beginTimeoutSec);
@@ -2704,9 +3050,10 @@ async function runTextOta(params) {
 
     while (offset < fwSize) {
       if (otaCancelRequested) {
-        await client.sendRepeaterCmdNoReply(targetHex, "ota abort");
+        // Abort confirmé : un "ota abort" perdu laisserait la session cible armée.
+        await abortTargetOtaSession(targetHex, "", "annulation");
         shouldCleanupTargetOta = false;
-        throw new Error("OTA annulee.");
+        throw new Error("OTA annulée.");
       }
 
       const pendingOffsetErr = client.popLatestOffsetError(targetPrefix);
@@ -2716,7 +3063,7 @@ async function runTextOta(params) {
         offset = pendingOffsetErr.expected;
         chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
         chunksSinceAck = 0;
-        appendLog(`Resync offset to ${offset}/${fwSize}`);
+        noteResync(offset);
         continue;
       }
 
@@ -2736,13 +3083,14 @@ async function runTextOta(params) {
         const sendErr = await client.sendRepeaterCmdNoReply(targetHex, chunkCmd);
         if (sendErr) {
           chunkWriteFailures += 1;
+          updateLiveMetrics("text_cmd", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
           const st = await getOtaStatus(targetHex, statusTimeoutSec);
           if (st.status && st.status.done !== offset) {
             chunkServerRejects += estimateRejectedChunks(offset, st.status.done, chunkSize);
             offset = st.status.done;
             chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
             chunksSinceAck = 0;
-            appendLog(`Resync offset to ${offset}/${fwSize}`);
+            noteResync(offset);
             continue;
           }
           const failure = st.error ? sendErr : `${sendErr}; status=${st.reply}`;
@@ -2759,7 +3107,7 @@ async function runTextOta(params) {
           offset = postSendErr.expected;
           chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
           chunksSinceAck = 0;
-          appendLog(`Resync offset to ${offset}/${fwSize}`);
+          noteResync(offset);
           continue;
         }
         if (noAckGapMs > 0) await sleep(noAckGapMs);
@@ -2809,7 +3157,7 @@ async function runTextOta(params) {
               chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
               chunksSinceAck = 0;
               chunkSent = true;
-              appendLog(`Resync offset to ${offset}/${fwSize}`);
+              noteResync(offset);
               break;
             }
           }
@@ -2817,6 +3165,7 @@ async function runTextOta(params) {
           failure = writeRes.error || reply || failure;
           if (attempt < checkpointMaxRetries) {
             appendLog(`Retry checkpoint at offset ${offset} (${attempt}/${checkpointMaxRetries})`);
+            updateLiveMetrics("text_cmd", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
             await sleep(120 * attempt);
             continue;
           }
@@ -2836,7 +3185,7 @@ async function runTextOta(params) {
               chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
               chunksSinceAck = 0;
               chunkSent = true;
-              appendLog(`Resync offset to ${offset}/${fwSize}`);
+              noteResync(offset);
               break;
             }
           }
@@ -2927,7 +3276,7 @@ async function runOtaWithAutoTransport(params) {
     }
     appendLog("Fallback OTA transport: text commands");
   } else {
-    appendLog("Binary OTA non possible (cle complete non resolue), fallback texte.");
+    appendLog("Binary OTA non possible (clé complète non résolue), fallback texte.");
   }
 
   const textParams = { ...params };
@@ -2954,7 +3303,7 @@ function formatUsbDeviceLabel(device) {
 function updateSelfInfoUi(selfInfo, logRadio = false) {
   if (selfInfo) {
     lastSelfInfo = selfInfo;
-    ui.selfName.textContent = `Noeud: ${selfInfo.name || "-"}`;
+    ui.selfName.textContent = `Nœud: ${selfInfo.name || "-"}`;
     const pub = selfInfo.public_key || "";
     ui.selfKey.textContent = `PubKey: ${pub ? pub.slice(0, 12) : "-"}`;
     if (ui.selfRadio) {
@@ -2980,7 +3329,7 @@ function updateSelfInfoUi(selfInfo, logRadio = false) {
     return;
   }
   lastSelfInfo = null;
-  ui.selfName.textContent = "Noeud: inconnu";
+  ui.selfName.textContent = "Nœud: inconnu";
   ui.selfKey.textContent = "PubKey: -";
   if (ui.selfRadio) ui.selfRadio.textContent = "Radio: -";
 }
@@ -3041,12 +3390,12 @@ async function refreshKnownRepeaters(logToConsole = false) {
     updateTargetRepeaterSelect(contacts, true);
     const repeaters = Object.values(contacts || {}).filter((c) => isRepeaterContact(c)).length;
     if (logToConsole) {
-      appendLog(`Repetiteurs connus: ${repeaters}`);
+      appendLog(`Répéteurs connus: ${repeaters}`);
     }
     return contacts;
   } catch (e) {
     resetTargetRepeaterSelect();
-    if (logToConsole) appendLog(`Lecture contacts echouee: ${e.message}`);
+    if (logToConsole) appendLog(`Lecture contacts échouée: ${e.message}`);
     return {};
   }
 }
@@ -3061,7 +3410,7 @@ async function initClientSession(baudrate) {
 
   const mode = getTransportLabel(client.transport);
   const speedSuffix = client.transport === "web_ble" ? "" : ` (${baudrate} bps)`;
-  setConnectionStatus(`Connecte ${mode}${speedSuffix}`, true);
+  setConnectionStatus(`Connecté ${mode}${speedSuffix}`, "ok");
 }
 
 function readTempRadioPresetFromUi() {
@@ -3076,7 +3425,7 @@ function readTempRadioPresetFromUi() {
   }
   const timeoutMins = Number.parseInt(ui.tempRadioMins?.value || "", 10);
   if (!Number.isFinite(timeoutMins) || timeoutMins < 1 || timeoutMins > 240) {
-    throw new Error("Duree temp invalide (1-240 minutes)");
+    throw new Error("Durée temp invalide (1-240 minutes)");
   }
   return { ...preset, timeoutMins };
 }
@@ -3105,9 +3454,9 @@ async function applyTempRadioPresetForOta(targetHex, preset) {
   const sentEvt = await client.sendMeshCmd(targetHex, cmd, true);
   if (!sentEvt || sentEvt.type === "error") {
     const code = sentEvt?.payload?.error_code;
-    throw new Error(`tempradio cible echoue: send error${code !== undefined ? ` (code=${code})` : ""}`);
+    throw new Error(`tempradio cible échoué: send error${code !== undefined ? ` (code=${code})` : ""}`);
   }
-  appendLog("Target tempradio: commande envoyee (pas d'ACK attendu).");
+  appendLog("Target tempradio: commande envoyée (pas d'ACK attendu).");
 
   const suggested = Number(sentEvt.payload?.suggested_timeout || 0);
   // The firmware delays the actual radio switch by 2000ms (futureMillis(2000) in MyMesh.cpp)
@@ -3122,10 +3471,10 @@ async function applyTempRadioPresetForOta(targetHex, preset) {
 
   const localRes = await client.setLocalRadioParams(preset.freq, preset.bw, preset.sf, preset.cr, 0);
   if (!localRes.ok) {
-    throw new Error(`set radio client echoue: ${localRes.error}`);
+    throw new Error(`set radio client échoué: ${localRes.error}`);
   }
   applySelfRadioPresetToCache(preset);
-  appendLog("Client radio preset bascule pour OTA.");
+  appendLog("Client radio preset basculé pour OTA.");
 
   const settleMs = 2400;
   appendLog(`Attente ${settleMs}ms pour synchroniser le changement radio...`);
@@ -3151,7 +3500,7 @@ async function restoreLocalRadioPresetAfterOta(previousPreset) {
     throw new Error(res.error || "set radio restore error");
   }
   applySelfRadioPresetToCache(previousPreset);
-  appendLog("Preset radio client restaure.");
+  appendLog("Preset radio client restauré.");
 }
 
 function attachClientDebugHooks(c) {
@@ -3163,11 +3512,16 @@ function attachClientDebugHooks(c) {
       }
     }
   };
+  c.onDisconnected = () => {
+    if (client !== c) return;
+    setConnectionStatus("Connexion perdue", "err");
+    updateButtons();
+  };
 }
 
 async function connectClientViaBle() {
   if (!("bluetooth" in navigator)) {
-    throw new Error("Web Bluetooth non supporte par ce navigateur");
+    throw new Error("Web Bluetooth non supporté par ce navigateur");
   }
   appendLog("Tentative de connexion Web Bluetooth...");
   const device = await navigator.bluetooth.requestDevice({
@@ -3177,7 +3531,7 @@ async function connectClientViaBle() {
   attachClientDebugHooks(c);
   await c.connectBle(device);
   client = c;
-  appendLog(`BLE connecte (${device.name || "MeshCore"}).`);
+  appendLog(`BLE connecté (${device.name || "MeshCore"}).`);
 }
 
 async function connectClientWithBestUsbTransport(baudrate) {
@@ -3187,31 +3541,31 @@ async function connectClientWithBestUsbTransport(baudrate) {
 
   if (preference === "webserial") {
     if (!("serial" in navigator)) {
-      throw new Error("Web Serial non supporte par ce navigateur desktop");
+      throw new Error("Web Serial non supporté par ce navigateur desktop");
     }
-    appendLog("Plateforme detectee: desktop, Web Serial force.");
+    appendLog("Plateforme détectée: desktop, Web Serial forcé.");
     appendLog("Tentative de connexion Web Serial...");
     const port = await navigator.serial.requestPort();
     const c = new MeshCoreSerialClient(appendLog);
     attachClientDebugHooks(c);
     await c.connectSerial(port, baudrate);
     client = c;
-    appendLog("USB serie connecte via Web Serial.");
+    appendLog("USB série connecté via Web Serial.");
     return;
   }
 
   if (preference === "webusb") {
     if (!("usb" in navigator)) {
-      throw new Error("WebUSB non supporte par ce navigateur Android");
+      throw new Error("WebUSB non supporté par ce navigateur Android");
     }
-    appendLog("Plateforme detectee: Android, WebUSB force.");
+    appendLog("Plateforme détectée: Android, WebUSB forcé.");
     appendLog("Tentative de connexion WebUSB...");
     const device = await navigator.usb.requestDevice({ filters: WEBUSB_DEVICE_FILTERS });
     const c = new MeshCoreSerialClient(appendLog);
     attachClientDebugHooks(c);
     await c.connectWebUsb(device, baudrate);
     client = c;
-    appendLog(`USB connecte via WebUSB (${formatUsbDeviceLabel(device)}).`);
+    appendLog(`USB connecté via WebUSB (${formatUsbDeviceLabel(device)}).`);
     return;
   }
 
@@ -3223,18 +3577,18 @@ async function connectClientWithBestUsbTransport(baudrate) {
       attachClientDebugHooks(c);
       await c.connectSerial(port, baudrate);
       client = c;
-      appendLog("USB serie connecte via Web Serial.");
+      appendLog("USB série connecté via Web Serial.");
       return;
     } catch (e) {
       serialErr = e;
       appendLog(`Web Serial indisponible: ${e.message}`);
     }
   } else {
-    appendLog("Web Serial non supporte par ce navigateur.");
+    appendLog("Web Serial non supporté par ce navigateur.");
   }
 
   if (!("usb" in navigator)) {
-    throw serialErr || new Error("WebUSB non supporte par ce navigateur");
+    throw serialErr || new Error("WebUSB non supporté par ce navigateur");
   }
 
   appendLog("Tentative de connexion WebUSB...");
@@ -3244,7 +3598,7 @@ async function connectClientWithBestUsbTransport(baudrate) {
     attachClientDebugHooks(c);
     await c.connectWebUsb(device, baudrate);
     client = c;
-    appendLog(`USB connecte via WebUSB (${formatUsbDeviceLabel(device)}).`);
+    appendLog(`USB connecté via WebUSB (${formatUsbDeviceLabel(device)}).`);
   } catch (e) {
     usbErr = e;
     throw serialErr || usbErr;
@@ -3266,11 +3620,11 @@ ui.connectBtn.addEventListener("click", async () => {
     const mode = String(ui.connectionMode?.value || "usb");
     if (mode === "ble") {
       if (!("bluetooth" in navigator)) {
-        appendLog("Web Bluetooth non supporte par ce navigateur.");
+        appendLog("Web Bluetooth non supporté par ce navigateur.");
         return;
       }
     } else if (!("serial" in navigator) && !("usb" in navigator)) {
-      appendLog("Ni Web Serial ni WebUSB ne sont supportes par ce navigateur.");
+      appendLog("Ni Web Serial ni WebUSB ne sont supportés par ce navigateur.");
       return;
     }
     const baudrate = Number.parseInt(ui.baudrate.value, 10) || 115200;
@@ -3278,7 +3632,7 @@ ui.connectBtn.addEventListener("click", async () => {
     await initClientSession(baudrate);
   } catch (e) {
     appendLog(`Connexion impossible: ${e.message}`);
-    setConnectionStatus("Connexion echouee");
+    setConnectionStatus("Connexion échouée", "err");
     if (client) {
       await client.disconnect();
       client = null;
@@ -3295,22 +3649,23 @@ ui.disconnectBtn.addEventListener("click", async () => {
     client = null;
   }
   lastSelfInfo = null;
-  setConnectionStatus("Non connecte");
-  ui.selfName.textContent = "Noeud: -";
+  otaCompleted = false;
+  setConnectionStatus("Non connecté");
+  ui.selfName.textContent = "Nœud: -";
   ui.selfKey.textContent = "PubKey: -";
   if (ui.selfRadio) ui.selfRadio.textContent = "Radio: -";
   resetTargetRepeaterSelect();
   if (ui.targetKey) ui.targetKey.value = "";
   if (ui.autoTune?.checked) applyAutoOtaSettings("disconnect");
-  appendLog("Deconnecte.");
+  appendLog("Déconnecté.");
   updateButtons();
 });
 
 ui.cancelOtaBtn.addEventListener("click", () => {
   if (!otaRunning) return;
   otaCancelRequested = true;
-  setOtaStatus("Annulation demandee...");
-  appendLog("Annulation OTA demandee.");
+  setOtaStatus("Annulation demandée...");
+  appendLog("Annulation OTA demandée.");
 });
 
 if (ui.targetSelect) {
@@ -3320,7 +3675,55 @@ if (ui.targetSelect) {
       ui.targetKey.value = selected;
     }
     if (selected.length >= 12) {
-      appendLog(`Cible OTA selectionnee: ${targetKeyPreview(selected)}`);
+      appendLog(`Cible OTA sélectionnée: ${targetKeyPreview(selected)}`);
+    }
+    updateStepBadges();
+  });
+}
+
+if (ui.rebootBtn) {
+  ui.rebootBtn.addEventListener("click", async () => {
+    if (!client || !client.connected) {
+      showToast("Connecte d'abord un appareil", "err");
+      return;
+    }
+    const targetHex = getSelectedTargetHex();
+    if (!targetHex || targetHex.length < 12) {
+      showToast("Sélectionne d'abord une cible", "err");
+      return;
+    }
+    const label = ui.targetSelect?.options[ui.targetSelect.selectedIndex]?.textContent?.trim()
+      || targetKeyPreview(targetHex);
+    const confirmed = await showConfirm(`Redémarrer ${label} ?`);
+    if (!confirmed) return;
+
+    ui.rebootBtn.disabled = true;
+    try {
+      const res = await sendRemoteReboot(targetHex);
+      if (res.error) {
+        showToast(`Reboot échoué: ${res.message}`, "err");
+      } else {
+        showToast("Commande reboot envoyée", "ok");
+      }
+    } finally {
+      ui.rebootBtn.disabled = false;
+    }
+  });
+}
+
+if (ui.clearLogBtn) {
+  ui.clearLogBtn.addEventListener("click", () => {
+    ui.log.value = "";
+  });
+}
+
+if (ui.copyLogBtn) {
+  ui.copyLogBtn.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(ui.log.value);
+      showToast("Journal copié", "ok");
+    } catch (e) {
+      showToast(`Copie impossible: ${e.message}`, "err");
     }
   });
 }
@@ -3333,31 +3736,31 @@ if (ui.refreshTargetsBtn) {
 }
 
 ui.startOtaBtn.addEventListener("click", async () => {
-  appendLog("Lancer OTA: clic detecte.");
+  appendLog("Lancer OTA: clic détecté.");
   if (!client || !client.connected) {
     appendLog(`Lancer OTA: abandon, connexion inactive (client=${Boolean(client)}, connected=${Boolean(client?.connected)}).`);
     return;
   }
   if (otaRunning) {
-    appendLog("Lancer OTA: ignore, OTA deja en cours.");
+    appendLog("Lancer OTA: ignoré, OTA déjà en cours.");
     return;
   }
 
   const file = ui.firmwareFile.files && ui.firmwareFile.files[0];
   if (!file) {
-    appendLog("Lancer OTA: aucun firmware selectionne (.bin/.bin.gz/.uf2).");
+    appendLog("Lancer OTA: aucun firmware sélectionné (.bin/.bin.gz/.uf2).");
     return;
   }
-  appendLog(`Lancer OTA: preparation du fichier ${file.name}.`);
+  appendLog(`Lancer OTA: préparation du fichier ${file.name}.`);
 
   let firmware;
   let firmwareInfo;
   try {
     firmwareInfo = await getFirmwareBytes(file);
     firmware = firmwareInfo.firmware;
-    appendLog(`Lancer OTA: payload pret (${formatByteCount(firmware.length)}, ${firmwareInfo.uploadFormat}).`);
+    appendLog(`Lancer OTA: payload prêt (${formatByteCount(firmware.length)}, ${firmwareInfo.uploadFormat}).`);
   } catch (e) {
-    appendLog(`Lecture firmware echouee: ${e.message}`);
+    appendLog(`Lecture firmware échouée: ${e.message}`);
     return;
   }
 
@@ -3365,25 +3768,28 @@ ui.startOtaBtn.addEventListener("click", async () => {
   try {
     appendLog("Lancer OTA: calcul MD5...");
     firmwareMd5 = md5Hex(firmware);
-    appendLog("Lancer OTA: MD5 calcule.");
+    appendLog("Lancer OTA: MD5 calculé.");
   } catch (e) {
-    appendLog(`Calcul MD5 echoue: ${e.message}`);
+    appendLog(`Calcul MD5 échoué: ${e.message}`);
     return;
   }
 
   otaRunning = true;
   otaCancelRequested = false;
+  otaCompleted = false;
   updateButtons();
   setProgress(0);
-  setOtaStatus("Demarrage OTA...");
-  ui.metricsLine.textContent = "OTA en cours...";
+  setProgressIndeterminate();
+  setOtaStatus("Démarrage OTA…");
+  ui.metricsLine.textContent = "OTA en cours…";
 
   let restoreClientPreset = null;
+  let restoreTuningParams = null;
 
   try {
     const selectedTargetHex = getSelectedTargetHex();
     if (selectedTargetHex.length < 12) {
-      throw new Error("Selectionne un repetiteur cible ou renseigne une pubkey manuelle (>=12 hex).");
+      throw new Error("Sélectionne un répéteur cible ou renseigne une pubkey manuelle (>=12 hex).");
     }
 
     const autoSettings = ui.autoTune?.checked ? recalcAutoFromCurrentSelection("ota-start") : null;
@@ -3425,23 +3831,74 @@ ui.startOtaBtn.addEventListener("click", async () => {
       appendLog("Tentative de login...");
       const fullKeyForLogin = await client.resolveTargetFullKeyForBinary(params.targetHex);
       if (!fullKeyForLogin) {
-        throw new Error("Impossible de resoudre la cle complete de la cible pour login. Renseigne la cle 64 hex.");
+        throw new Error("Impossible de résoudre la clé complète de la cible pour login. Renseigne la clé 64 hex.");
       }
       const loginRes = await client.sendLogin(fullKeyForLogin, password);
       if (!loginRes.ok) {
-        throw new Error(`Authentification echouee: ${loginRes.error}`);
+        throw new Error(`Authentification échouée: ${loginRes.error}`);
       }
       appendLog(`Login OK${loginRes.is_admin ? " (admin)" : ""}`);
+    }
+
+    // Booste le budget d'airtime du companion local le temps de l'OTA (réglage
+    // par USB, restauré en fin de transfert). Sans ça, le duty cycle par défaut
+    // plafonne le débit radio bien en dessous de l'airtime réel des chunks.
+    try {
+      const tuning = await client.getTuningParams();
+      if (tuning && tuning.airtime_factor > OTA_AIRTIME_FACTOR) {
+        const set = await client.setTuningParams(tuning.rx_delay_base, OTA_AIRTIME_FACTOR);
+        if (set.ok) {
+          restoreTuningParams = tuning;
+          appendLog(
+            `Airtime factor companion: ${tuning.airtime_factor} -> ${OTA_AIRTIME_FACTOR} `
+            + `(duty ${Math.round(100 / (1 + tuning.airtime_factor))}% -> ${Math.round(100 / (1 + OTA_AIRTIME_FACTOR))}%, durée de l'OTA)`
+          );
+        } else {
+          appendLog(`Airtime factor companion non ajusté: ${set.error}`);
+        }
+      } else if (!tuning) {
+        appendLog("Airtime factor companion: lecture non supportée, réglage inchangé.");
+      }
+    } catch (e) {
+      appendLog(`Airtime factor companion non ajusté: ${e.message}`);
     }
 
     if (ui.useTempRadio?.checked) {
       const tempPreset = readTempRadioPresetFromUi();
       restoreClientPreset = await applyTempRadioPresetForOta(params.targetHex, tempPreset);
 
+      // Sonde de joignabilité : si la commande tempradio s'est perdue, la cible
+      // est restée sur le preset principal et tout le déroulé échouerait en
+      // cascade (START binaire 8s + fallback texte 8s+) avec un diagnostic
+      // trompeur. Un STATUS court le détecte tout de suite ; on rejoue la
+      // séquence tempradio une fois avant d'abandonner proprement.
+      const probeKey = await client.resolveTargetFullKeyForBinary(params.targetHex);
+      if (probeKey) {
+        setOtaStatus("Vérification de la cible…");
+        let probe = await getOtaStatusBinary(probeKey, 1, 3500);
+        if (probe.error) {
+          appendLog("Cible silencieuse sur le preset temporaire, renvoi de tempradio…");
+          await restoreLocalRadioPresetAfterOta(restoreClientPreset);
+          restoreClientPreset = await applyTempRadioPresetForOta(params.targetHex, tempPreset);
+          probe = await getOtaStatusBinary(probeKey, 1, 4500);
+        }
+        if (probe.error) {
+          // Une cible sans support OTA binaire (ex. room server, OTA texte
+          // uniquement) ne répond jamais au STATUS : ne pas abandonner ici,
+          // le déroulé normal (START binaire puis fallback texte) tranchera.
+          appendLog(
+            "Warning: cible silencieuse en binaire après renvoi de tempradio — "
+            + "hors de portée, ou cible sans OTA binaire (le fallback texte reste possible)."
+          );
+        } else {
+          appendLog(`Cible joignable sur le preset temporaire (${String(probe.reply || "").trim() || "réponse reçue"}).`);
+        }
+      }
+
       if (ui.autoTune?.checked) {
         const tempAuto = recalcAutoFromCurrentSelection("temp-radio");
         if (!tempAuto) {
-          throw new Error("auto tuning indisponible apres application du preset temp");
+          throw new Error("auto tuning indisponible après application du preset temp");
         }
         params.chunkSizeInput = tempAuto.chunkSize;
         params.ackEveryInput = tempAuto.ackEvery;
@@ -3459,25 +3916,41 @@ ui.startOtaBtn.addEventListener("click", async () => {
 
     const result = await runOtaWithAutoTransport(params);
     appendLog("OTA staged successfully, reboot command sent.");
-    appendLog(`Transport utilise: ${result.transport === "binary_req" ? "binary req" : "text cmd"}`);
+    appendLog(`Transport utilisé: ${result.transport === "binary_req" ? "binary req" : "text cmd"}`);
     appendLog(`Duration: ${formatDuration(result.durationSec)}`);
     appendLog(
       `Rejets chunks: total ${result.totalRejects}/${result.chunkWriteAttempts} (${result.failureRatePct.toFixed(2)}%), `
       + `send ${result.chunkWriteFailures}/${result.chunkWriteAttempts} (${result.sendFailureRatePct.toFixed(2)}%), `
       + `serveur ${result.chunkServerRejects}/${result.chunkWriteAttempts} (${result.serverRejectRatePct.toFixed(2)}%)`
     );
+    otaCompleted = true;
     setProgress(100);
-    setOtaStatus("OTA terminee");
+    setOtaStatus("OTA terminée");
+    showToast("OTA terminée, reboot envoyé", "ok");
     ui.metricsLine.textContent =
-      `Transport ${result.transport === "binary_req" ? "binary" : "text"} | Duree ${formatDuration(result.durationSec)} | `
+      `Transport ${result.transport === "binary_req" ? "binary" : "text"} | Durée ${formatDuration(result.durationSec)} | `
       + `Rejets total ${result.totalRejects}/${result.chunkWriteAttempts} (${result.failureRatePct.toFixed(2)}%) `
       + `[send ${result.chunkWriteFailures}/${result.chunkWriteAttempts} ${result.sendFailureRatePct.toFixed(2)}%, `
       + `srv ${result.chunkServerRejects}/${result.chunkWriteAttempts} ${result.serverRejectRatePct.toFixed(2)}%]`;
   } catch (e) {
     appendLog(`OTA error: ${e.message}`);
-    setOtaStatus("OTA echouee");
+    setOtaStatus("OTA échouée");
+    showToast(`OTA échouée: ${e.message}`, "err");
     ui.metricsLine.textContent = `Erreur: ${e.message}`;
   } finally {
+    ui.progressBar.classList.remove("indeterminate");
+    if (restoreTuningParams) {
+      try {
+        const r = await client.setTuningParams(restoreTuningParams.rx_delay_base, restoreTuningParams.airtime_factor);
+        if (r.ok) {
+          appendLog(`Airtime factor companion restauré (${restoreTuningParams.airtime_factor}).`);
+        } else {
+          appendLog(`Warning: restauration airtime factor échouée (${r.error}) — vérifie les réglages du companion.`);
+        }
+      } catch (tuningErr) {
+        appendLog(`Warning: restauration airtime factor échouée (${tuningErr.message}) — vérifie les réglages du companion.`);
+      }
+    }
     if (restoreClientPreset) {
       try {
         await restoreLocalRadioPresetAfterOta(restoreClientPreset);
@@ -3485,7 +3958,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
           applyAutoOtaSettings("restore");
         }
       } catch (restoreErr) {
-        appendLog(`Warning: restauration preset client echouee: ${restoreErr.message}`);
+        appendLog(`Warning: restauration preset client échouée: ${restoreErr.message}`);
       }
     }
     otaRunning = false;
@@ -3500,7 +3973,7 @@ if (ui.autoTune) {
     if (ui.autoTune.checked) {
       recalcAutoFromCurrentSelection("toggle");
     } else {
-      appendLog("Auto tuning desactive.");
+      appendLog("Auto tuning désactivé.");
       updatePlanLine(true);
     }
   });
@@ -3515,8 +3988,8 @@ if (ui.connectionMode) {
 if (ui.useTempRadio) {
   ui.useTempRadio.addEventListener("change", () => {
     updateTempRadioInputsState();
-    if (ui.useTempRadio.checked) appendLog("Preset OTA temporaire active.");
-    else appendLog("Preset OTA temporaire desactive.");
+    if (ui.useTempRadio.checked) appendLog("Preset OTA temporaire activé.");
+    else appendLog("Preset OTA temporaire désactivé.");
 
     if (ui.autoTune?.checked) {
       recalcAutoFromCurrentSelection(ui.useTempRadio.checked ? "temp-on" : "temp-off");
@@ -3538,6 +4011,7 @@ for (const el of [ui.tempRadioFreq, ui.tempRadioBw, ui.tempRadioSf, ui.tempRadio
 if (ui.firmwareFile) {
   ui.firmwareFile.addEventListener("change", () => {
     updatePlanLine(true);
+    updateStepBadges();
   });
 }
 if (ui.chunkSize) {
@@ -3553,8 +4027,12 @@ if (ui.ackEvery) {
 if (ui.targetKey) {
   ui.targetKey.addEventListener("input", () => {
     const manual = normalizeHex(ui.targetKey.value || "");
-    if (!ui.targetSelect) return;
+    if (!ui.targetSelect) {
+      updateStepBadges();
+      return;
+    }
     if (!manual) {
+      updateStepBadges();
       return;
     }
     const match = Array.from(ui.targetSelect.options).find((opt) => {
@@ -3566,10 +4044,11 @@ if (ui.targetKey) {
     } else {
       ui.targetSelect.value = "";
     }
+    updateStepBadges();
   });
 }
 
-setConnectionStatus("Non connecte");
+setConnectionStatus("Non connecté");
 setProgress(0);
 resetTargetRepeaterSelect();
 updateTuneInputsState();

@@ -107,6 +107,14 @@ static bool readPacketWireExact(mesh::Packet* dst, const uint8_t raw[], uint8_t 
   #define OTA_TXT_ACK_DELAY 0
 #endif
 
+// The OTA binary STATUS checkpoints gate the whole transfer: the standard
+// 300ms SERVER_RESPONSE_DELAY would add ~15s to a typical firmware upload.
+// During OTA the preset is quiet and the client sits in RX waiting, so a
+// short turnaround is safe.
+#ifndef OTA_SERVER_RESPONSE_DELAY_MILLIS
+  #define OTA_SERVER_RESPONSE_DELAY_MILLIS 40
+#endif
+
 #define LAZY_CONTACTS_WRITE_DELAY    5000
 #define PING_TIMEOUT_MILLIS          8000
 #define PING_MAX_COUNT               100   // max pings accepted by a single 'ping' command
@@ -397,6 +405,36 @@ void MyMesh::processFloodRetries() {
     slot.next_retry_at = futureMillis(slot.wait_ms + gap);
   }
 #endif
+}
+
+int MyMesh::getAGCResetInterval() const {
+  // The periodic AGC reset puts the radio into a brief warm sleep; during an
+  // OTA chunk stream that RX gap loses packets (seen as periodic resync
+  // bursts), so suspend it while a session is active.
+  if (board.isOTASessionActive()) {
+    return 0;
+  }
+  return ((int)_prefs.agc_reset_interval) * 4000;   // milliseconds
+}
+
+uint32_t MyMesh::getCADFailRetryDelay() const {
+  // At the fast OTA presets (low SF) the sticky PREAMBLE_DETECTED flag is
+  // frequently raised by noise; the default 120-360ms backoff quantizes every
+  // STATUS reply stall to multiples of that and dominates checkpoint latency.
+  // During an OTA session the channel is otherwise quiet, so re-check quickly.
+  if (board.isOTASessionActive()) {
+    return 20;
+  }
+  return mesh::Mesh::getCADFailRetryDelay();
+}
+
+uint32_t MyMesh::getCADFailMaxDuration() const {
+  // Bound how long a noise-stuck preamble flag can defer the STATUS reply;
+  // the OTA client is silent while waiting, so forcing TX after 400ms is safe.
+  if (board.isOTASessionActive()) {
+    return 400;
+  }
+  return mesh::Mesh::getCADFailMaxDuration();
 }
 
 void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
@@ -1336,25 +1374,28 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
     memcpy(&timestamp, data, 4);
 
     if (timestamp > client->last_timestamp) { // prevent replay attacks
+      bool is_ota_req = (len > 4 && data[4] == REQ_TYPE_OTA_BINARY);
       int reply_len = handleRequest(client, timestamp, &data[4], len - 4);
       if (reply_len == 0) return; // invalid command
 
       client->last_timestamp = timestamp;
       client->last_activity = getRTCClock()->getCurrentTime();
 
+      uint32_t response_delay = is_ota_req ? OTA_SERVER_RESPONSE_DELAY_MILLIS : SERVER_RESPONSE_DELAY;
+
       if (packet->isRouteFlood()) {
         // let this sender know path TO here, so they can use sendDirect(), and ALSO encode the response
         mesh::Packet *path = createPathReturn(client->id, secret, packet->path, packet->path_len,
                                               PAYLOAD_TYPE_RESPONSE, reply_data, reply_len);
-        if (path) sendFloodReply(path, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+        if (path) sendFloodReply(path, response_delay, packet->getPathHashSize());
       } else {
         mesh::Packet *reply =
             createDatagram(PAYLOAD_TYPE_RESPONSE, client->id, secret, reply_data, reply_len);
         if (reply) {
           if (client->out_path_len != OUT_PATH_UNKNOWN) { // we have an out_path, so send DIRECT
-            sendDirect(reply, client->out_path, client->out_path_len, SERVER_RESPONSE_DELAY);
+            sendDirect(reply, client->out_path, client->out_path_len, response_delay);
           } else {
-            sendFloodReply(reply, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+            sendFloodReply(reply, response_delay, packet->getPathHashSize());
           }
         }
       }
