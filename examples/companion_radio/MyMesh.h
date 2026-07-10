@@ -23,6 +23,7 @@
 #include <SPIFFS.h>
 #endif
 
+#include "BridgeAdapter.h"
 #include "DataStore.h"
 #include "NodePrefs.h"
 
@@ -118,6 +119,10 @@ protected:
   void sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis=0) override;
 
   void logRxRaw(float snr, float rssi, const uint8_t raw[], int len) override;
+#ifdef WITH_BRIDGE
+  void logRx(mesh::Packet *pkt, int len, float score) override;
+  void logTx(mesh::Packet *pkt, int len) override;
+#endif
   bool isAutoAddEnabled() const override;
   bool shouldAutoAddContactType(uint8_t type) const override;
   bool shouldOverwriteWhenFull() const override;

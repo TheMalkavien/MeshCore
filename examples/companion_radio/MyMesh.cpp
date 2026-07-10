@@ -296,6 +296,19 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
   }
 }
 
+#ifdef WITH_BRIDGE
+// Mirror all LoRa traffic (received and transmitted) onto the bridge. The
+// bridge's seen-packets table stops packets that arrived from the bridge
+// from being echoed back to it.
+void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
+  companion_bridge::sendPacket(pkt);
+}
+
+void MyMesh::logTx(mesh::Packet *pkt, int len) {
+  companion_bridge::sendPacket(pkt);
+}
+#endif
+
 bool MyMesh::isAutoAddEnabled() const {
   return (_prefs.manual_add_contacts & 1) == 0;
 }
@@ -969,6 +982,10 @@ void MyMesh::begin(bool has_display) {
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
                      radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
+
+#ifdef WITH_BRIDGE
+  companion_bridge::begin(_mgr, getRTCClock());
+#endif
 }
 
 const char *MyMesh::getNodeName() {
@@ -2212,6 +2229,10 @@ void MyMesh::checkSerialInterface() {
 
 void MyMesh::loop() {
   BaseChatMesh::loop();
+
+#ifdef WITH_BRIDGE
+  companion_bridge::loop();
+#endif
 
   if (_cli_rescue) {
     checkCLIRescueCmd();
