@@ -179,9 +179,6 @@ public:
   }
 #endif
 
-  // To check if there is pending work
-  bool hasPendingWork() const;
-
 private:
   void writeOKFrame();
   void writeErrFrame(uint8_t err_code);
