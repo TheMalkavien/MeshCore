@@ -31,12 +31,19 @@ void ESPNowBridge::begin() {
 
   // Initialize WiFi in station mode
   WiFi.mode(WIFI_STA);
-  
+
+#ifdef ESPNOW_BRIDGE_SHARED_WIFI
+  // WiFi STA is shared with the application (e.g. companion WiFi interface):
+  // the channel is dictated by the AP association, so it must not be forced here.
+  // Modem power-save would make ESP-NOW reception unreliable while associated.
+  WiFi.setSleep(false);
+#else
   // Set Wi-Fi channel
   if (esp_wifi_set_channel(_prefs->bridge_channel, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
     BRIDGE_DEBUG_PRINTLN("Error setting WIFI channel to %d\n", _prefs->bridge_channel);
     return;
   }
+#endif
 
   // Initialize ESP-NOW
   if (esp_now_init() != ESP_OK) {
@@ -52,7 +59,11 @@ void ESPNowBridge::begin() {
   esp_now_peer_info_t peerInfo = {};
   memset(&peerInfo, 0, sizeof(peerInfo));
   memset(peerInfo.peer_addr, 0xFF, ESP_NOW_ETH_ALEN); // Broadcast address
+#ifdef ESPNOW_BRIDGE_SHARED_WIFI
+  peerInfo.channel = 0;   // 0 = follow whatever channel the WiFi STA is currently on
+#else
   peerInfo.channel = _prefs->bridge_channel;
+#endif
   peerInfo.encrypt = false;
 
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
@@ -82,8 +93,10 @@ void ESPNowBridge::end() {
     BRIDGE_DEBUG_PRINTLN("Error deinitializing ESP-NOW\n");
   }
 
-  // Turn off WiFi
+#ifndef ESPNOW_BRIDGE_SHARED_WIFI
+  // Turn off WiFi (owned by the bridge in standalone mode)
   WiFi.mode(WIFI_OFF);
+#endif
 
   // Update bridge state
   _initialized = false;
