@@ -259,6 +259,46 @@ async function gzipBytes(bytes) {
   return out;
 }
 
+async function gunzipBytes(bytes) {
+  const sourceStream = new Blob([bytes]).stream();
+  const decompressed = await new Response(
+    sourceStream.pipeThrough(new DecompressionStream("gzip"))
+  ).arrayBuffer();
+  const out = new Uint8Array(decompressed);
+  appendLog(`GZIP: décompression ${formatByteCount(bytes.length)} -> ${formatByteCount(out.length)}`);
+  return out;
+}
+
+// La cible annonce sa capacité gzip dans la réponse START via 'gz=' : gz=1 →
+// décompression embarquée, gz=0 → image brute exigée (ESP32 sans inflater).
+// Les firmwares RP2040 antérieurs à ce jeton décompressent nativement via le
+// bootloader arduino-pico, d'où le défaut à true en son absence.
+function targetSupportsGzip(startReply) {
+  const m = /gz=([01])/.exec(String(startReply || ""));
+  return m ? m[1] === "1" : true;
+}
+
+function chooseFirmwareVariant(startReply, variants) {
+  if (!variants) return null;
+  if (targetSupportsGzip(startReply)) {
+    return variants.gz || variants.raw || null;
+  }
+  if (variants.raw) return variants.raw;
+  throw new Error(
+    "La cible exige un .bin brut (gz=0) mais seule la forme gzip est disponible "
+    + "(source .gz non décompressable dans ce navigateur)."
+  );
+}
+
+// En reprise de session, la capacité gzip n'est pas re-annoncée : on identifie
+// la forme (gzip ou brute) déjà en cours par la taille totale de la session.
+function matchFirmwareVariantBySize(variants, total) {
+  if (!variants || !Number.isFinite(total)) return null;
+  if (variants.gz && variants.gz.bytes.length === total) return variants.gz;
+  if (variants.raw && variants.raw.bytes.length === total) return variants.raw;
+  return null;
+}
+
 function isWebSerialPortLike(port) {
   return Boolean(
     port
@@ -2191,69 +2231,77 @@ function recalcAutoFromCurrentSelection(logReason = null) {
   return applyAutoOtaSettings(logReason);
 }
 
+// Prépare les DEUX formes du firmware (brute et gzip) sans en choisir une :
+// le choix dépend de la capacité de la cible ('gz=' dans la réponse START,
+// connue seulement après la sonde) — voir chooseFirmwareVariant(). Le gzip
+// réduit le volume transmis de ~40-50% quand la cible sait décompresser
+// (bootloader arduino-pico, inflater ROM des ESP32).
 async function getFirmwareBytes(file) {
   const sourceBytes = new Uint8Array(await file.arrayBuffer());
   const fileName = lowerFileName(file);
   appendLog(`Lecture firmware: ${file.name} (${formatByteCount(sourceBytes.length)})`);
 
+  const canGzip = typeof CompressionStream === "function";
+  const canGunzip = typeof DecompressionStream === "function";
+
+  const buildGzCandidate = async (rawBytes) => {
+    if (!canGzip) {
+      appendLog("Firmware: CompressionStream indisponible, forme gzip non préparée");
+      return null;
+    }
+    const gzipPayload = await gzipBytes(rawBytes);
+    if (gzipPayload.length >= rawBytes.length) {
+      appendLog("Firmware: gzip sans gain, forme gzip écartée");
+      return null;
+    }
+    appendLog(
+      `Firmware: forme gzip prête ${formatByteCount(rawBytes.length)} -> ${formatByteCount(gzipPayload.length)} `
+      + `(${Math.round((1 - (gzipPayload.length / rawBytes.length)) * 100)}% de moins si la cible décompresse)`
+    );
+    return gzipPayload;
+  };
+
   if (fileName.endsWith(".uf2")) {
     appendLog("Firmware: format source détecté = uf2");
     const binBytes = convertUf2ToBin(sourceBytes);
-    if (typeof CompressionStream === "function") {
-      appendLog("Firmware: CompressionStream disponible, conversion uf2 -> bin.gz");
-      const gzipPayload = await gzipBytes(binBytes);
-      return {
-        firmware: gzipPayload,
-        sourceFormat: "uf2",
-        uploadFormat: "bin.gz",
-        originalSize: sourceBytes.length,
-        extractedSize: binBytes.length,
-        uploadSize: gzipPayload.length,
-      };
-    }
-    appendLog("Firmware: CompressionStream indisponible, envoi du bin extrait sans gzip");
     return {
-      firmware: binBytes,
       sourceFormat: "uf2",
-      uploadFormat: "bin",
       originalSize: sourceBytes.length,
       extractedSize: binBytes.length,
-      uploadSize: binBytes.length,
+      rawBytes: binBytes,
+      gzBytes: await buildGzCandidate(binBytes),
     };
   }
 
   const isGzip = fileName.endsWith(".gz");
   appendLog(`Firmware: format source détecté = ${isGzip ? "bin.gz" : "bin"}`);
 
-  // Le bootloader OTA arduino-pico détecte l'en-tête gzip et décompresse
-  // nativement : compresser un .bin brut réduit le volume transmis (~40-50%)
-  // et évite de saturer la partition LittleFS de staging.
-  if (!isGzip && typeof CompressionStream === "function") {
-    const gzipPayload = await gzipBytes(sourceBytes);
-    if (gzipPayload.length < sourceBytes.length) {
-      appendLog(
-        `Firmware: compression auto ${formatByteCount(sourceBytes.length)} -> ${formatByteCount(gzipPayload.length)} `
-        + `(${Math.round((1 - (gzipPayload.length / sourceBytes.length)) * 100)}% de moins à transmettre)`
-      );
-      return {
-        firmware: gzipPayload,
-        sourceFormat: "bin",
-        uploadFormat: "bin.gz",
-        originalSize: sourceBytes.length,
-        extractedSize: sourceBytes.length,
-        uploadSize: gzipPayload.length,
-      };
+  if (isGzip) {
+    let rawBytes = null;
+    if (canGunzip) {
+      try {
+        rawBytes = await gunzipBytes(sourceBytes);
+      } catch (e) {
+        appendLog(`Firmware: décompression du .gz impossible (${e.message}), forme brute non préparée`);
+      }
+    } else {
+      appendLog("Firmware: DecompressionStream indisponible, forme brute non préparée");
     }
-    appendLog("Firmware: gzip sans gain, envoi du bin brut");
+    return {
+      sourceFormat: "bin.gz",
+      originalSize: sourceBytes.length,
+      extractedSize: rawBytes ? rawBytes.length : null,
+      rawBytes,
+      gzBytes: sourceBytes,
+    };
   }
 
   return {
-    firmware: sourceBytes,
-    sourceFormat: isGzip ? "bin.gz" : "bin",
-    uploadFormat: isGzip ? "bin.gz" : "bin",
+    sourceFormat: "bin",
     originalSize: sourceBytes.length,
     extractedSize: sourceBytes.length,
-    uploadSize: sourceBytes.length,
+    rawBytes: sourceBytes,
+    gzBytes: await buildGzCandidate(sourceBytes),
   };
 }
 
@@ -2399,8 +2447,7 @@ async function runBinaryOta(params) {
   const {
     targetHex,
     targetFullKeyHex,
-    firmware,
-    firmwareMd5,
+    firmwareVariants,
     chunkSizeInput,
     ackEveryInput,
     noAckGapMs,
@@ -2408,6 +2455,8 @@ async function runBinaryOta(params) {
     statusTimeoutMs,
     radioProfile,
   } = params;
+  let firmware = params.firmware;
+  let firmwareMd5 = params.firmwareMd5;
 
   if (chunkSizeInput < 16 || chunkSizeInput > OTA_BINARY_MAX_CHUNK) {
     throw new Error(`chunk_size doit être entre 16 et ${OTA_BINARY_MAX_CHUNK} en mode binaire`);
@@ -2422,7 +2471,7 @@ async function runBinaryOta(params) {
     throw new Error("md5 firmware invalide");
   }
 
-  const fwSize = firmware.length;
+  let fwSize = firmware.length;
   let chunkSize = Math.min(chunkSizeInput, OTA_BINARY_MAX_CHUNK);
   // En binaire, le firmware supprime tous les ACK d'écriture : la cadence des
   // checkpoints STATUS est purement côté client, donc adaptable en cours de
@@ -2435,7 +2484,20 @@ async function runBinaryOta(params) {
   let ackEvery = Math.max(ACK_EVERY_MIN, ackEveryInput);
   let ackEveryCeiling = ACK_EVERY_MAX;
   let cleanCheckpoints = 0;
-  const totalChunks = Math.ceil(fwSize / chunkSize);
+  let totalChunks = Math.ceil(fwSize / chunkSize);
+
+  // Bascule sur la forme (gzip ou brute) que la cible sait consommer, connue
+  // après la réponse START ('gz=') ou déduite de la taille en reprise.
+  const applyFirmwareVariant = (variant, why) => {
+    if (!variant) return;
+    if (firmware !== variant.bytes) {
+      firmware = variant.bytes;
+      firmwareMd5 = variant.md5;
+      fwSize = firmware.length;
+      totalChunks = Math.ceil(fwSize / chunkSize);
+    }
+    appendLog(`Firmware retenu: ${variant.format} ${fwSize} bytes (md5=${firmwareMd5}) [${why}]`);
+  };
 
   appendLog(`Transport: binary req`);
   appendLog(`Firmware: ${fwSize} bytes (md5=${firmwareMd5})`);
@@ -2522,7 +2584,14 @@ async function runBinaryOta(params) {
       const low = startReply.toLowerCase();
       if (low.includes("already running")) {
         const st = await getOtaStatusBinary(targetFullKeyHex, 2, statusTimeout);
-        if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
+        let resumeVariant = (st.status && st.status.done <= st.status.total)
+          ? matchFirmwareVariantBySize(firmwareVariants, st.status.total)
+          : null;
+        if (!resumeVariant && st.status && st.status.total === fwSize && st.status.done <= fwSize) {
+          resumeVariant = { bytes: firmware, md5: firmwareMd5, format: "forme courante" };
+        }
+        if (resumeVariant) {
+          applyFirmwareVariant(resumeVariant, "reprise de session");
           offset = st.status.done;
           chunkIndex = Math.floor(offset / chunkSize);
           resuming = true;
@@ -2582,6 +2651,13 @@ async function runBinaryOta(params) {
           ? "FLOOD (chemin direct inconnu — les réponses de la cible gardent le délai standard de 300ms !)"
           : "directe"}`
       );
+    }
+
+    if (!resuming) {
+      const chosen = chooseFirmwareVariant(startReply, firmwareVariants);
+      if (chosen) {
+        applyFirmwareVariant(chosen, targetSupportsGzip(startReply) ? "cible avec décompression" : "cible gz=0, bin brut");
+      }
     }
 
     // En reprise, le BEGIN a déjà été accepté par la session en cours : le
@@ -2890,8 +2966,7 @@ async function runBinaryOta(params) {
 async function runTextOta(params) {
   const {
     targetHex,
-    firmware,
-    firmwareMd5,
+    firmwareVariants,
     chunkSizeInput,
     ackEveryInput,
     noAckGapMs,
@@ -2900,6 +2975,8 @@ async function runTextOta(params) {
     ackSettleGapMs,
     radioProfile,
   } = params;
+  let firmware = params.firmware;
+  let firmwareMd5 = params.firmwareMd5;
 
   if (chunkSizeInput < 16 || chunkSizeInput > 80) {
     throw new Error("chunk_size doit être entre 16 et 80 en mode texte");
@@ -2915,23 +2992,39 @@ async function runTextOta(params) {
   }
 
   const targetPrefix = client.normalizeTargetPrefix(targetHex);
-  const fwSize = firmware.length;
+  let fwSize = firmware.length;
   let chunkSize = chunkSizeInput;
   let ackEvery = ackEveryInput;
 
-  const safeChunkLimit = maxOtaChunkForOffset(Math.max(0, fwSize - 1));
-  if (safeChunkLimit < 16) {
-    throw new Error(`transport texte trop limité pour OTA (chunk max sécurisé ${safeChunkLimit})`);
-  }
-  if (chunkSize > safeChunkLimit) {
-    appendLog(`Chunk size ajusté de ${chunkSize} à ${safeChunkLimit} (limite transport texte).`);
-    chunkSize = safeChunkLimit;
-  }
+  const computeSafeChunkLimit = () => {
+    const limit = maxOtaChunkForOffset(Math.max(0, fwSize - 1));
+    if (limit < 16) {
+      throw new Error(`transport texte trop limité pour OTA (chunk max sécurisé ${limit})`);
+    }
+    if (chunkSize > limit) {
+      appendLog(`Chunk size ajusté de ${chunkSize} à ${limit} (limite transport texte).`);
+      chunkSize = limit;
+    }
+  };
+  computeSafeChunkLimit();
 
-  const totalChunks = estimateOtaChunkCount(fwSize, chunkSize);
+  let totalChunks = estimateOtaChunkCount(fwSize, chunkSize);
   if (totalChunks <= 0) {
     throw new Error("impossible de calculer le plan de chunks");
   }
+
+  // Voir runBinaryOta : la forme (gzip ou brute) est choisie après la sonde.
+  const applyFirmwareVariant = (variant, why) => {
+    if (!variant) return;
+    if (firmware !== variant.bytes) {
+      firmware = variant.bytes;
+      firmwareMd5 = variant.md5;
+      fwSize = firmware.length;
+      computeSafeChunkLimit();
+      totalChunks = estimateOtaChunkCount(fwSize, chunkSize);
+    }
+    appendLog(`Firmware retenu: ${variant.format} ${fwSize} bytes (md5=${firmwareMd5}) [${why}]`);
+  };
 
   appendLog(`OTA target prefix: ${targetPrefix}`);
   appendLog(`Firmware: ${fwSize} bytes (md5=${firmwareMd5})`);
@@ -2985,7 +3078,14 @@ async function runTextOta(params) {
     if (!isOkOtaReply(startReply)) {
       if (startReply.toLowerCase().includes("already running")) {
         const st = await getOtaStatus(targetHex, statusTimeoutSec);
-        if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
+        let resumeVariant = (st.status && st.status.done <= st.status.total)
+          ? matchFirmwareVariantBySize(firmwareVariants, st.status.total)
+          : null;
+        if (!resumeVariant && st.status && st.status.total === fwSize && st.status.done <= fwSize) {
+          resumeVariant = { bytes: firmware, md5: firmwareMd5, format: "forme courante" };
+        }
+        if (resumeVariant) {
+          applyFirmwareVariant(resumeVariant, "reprise de session");
           offset = st.status.done;
           chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
           resuming = true;
@@ -3017,6 +3117,13 @@ async function runTextOta(params) {
     }
 
     shouldCleanupTargetOta = true;
+
+    if (!resuming) {
+      const chosen = chooseFirmwareVariant(startReply, firmwareVariants);
+      if (chosen) {
+        applyFirmwareVariant(chosen, targetSupportsGzip(startReply) ? "cible avec décompression" : "cible gz=0, bin brut");
+      }
+    }
 
     // En reprise, la session a déjà accepté son BEGIN : le renvoyer ferait
     // échouer l'OTA ("already running"), y compris à offset 0.
@@ -3745,24 +3852,37 @@ ui.startOtaBtn.addEventListener("click", async () => {
   }
   appendLog(`Lancer OTA: préparation du fichier ${file.name}.`);
 
-  let firmware;
   let firmwareInfo;
-  try {
-    firmwareInfo = await getFirmwareBytes(file);
-    firmware = firmwareInfo.firmware;
-    appendLog(`Lancer OTA: payload prêt (${formatByteCount(firmware.length)}, ${firmwareInfo.uploadFormat}).`);
-  } catch (e) {
-    appendLog(`Lecture firmware échouée: ${e.message}`);
-    return;
-  }
-
+  let firmwareVariants;
+  let firmware;
   let firmwareMd5;
   try {
-    appendLog("Lancer OTA: calcul MD5...");
-    firmwareMd5 = md5Hex(firmware);
-    appendLog("Lancer OTA: MD5 calculé.");
+    firmwareInfo = await getFirmwareBytes(file);
+    appendLog("Lancer OTA: calcul MD5 des formes disponibles...");
+    firmwareVariants = {
+      raw: firmwareInfo.rawBytes
+        ? { bytes: firmwareInfo.rawBytes, md5: md5Hex(firmwareInfo.rawBytes), format: "bin" }
+        : null,
+      gz: firmwareInfo.gzBytes
+        ? { bytes: firmwareInfo.gzBytes, md5: md5Hex(firmwareInfo.gzBytes), format: "bin.gz" }
+        : null,
+    };
+    // Forme par défaut (métriques initiales) : gzip si disponible, comme les
+    // cibles historiques ; le choix définitif se fait sur la réponse START.
+    const preferred = firmwareVariants.gz || firmwareVariants.raw;
+    if (!preferred) {
+      throw new Error("aucune forme de firmware exploitable");
+    }
+    firmware = preferred.bytes;
+    firmwareMd5 = preferred.md5;
+    appendLog(
+      "Lancer OTA: payload prêt ("
+      + (firmwareVariants.raw ? `bin ${formatByteCount(firmwareVariants.raw.bytes.length)}` : "bin indisponible")
+      + (firmwareVariants.gz ? `, bin.gz ${formatByteCount(firmwareVariants.gz.bytes.length)}` : ", gzip indisponible")
+      + ") — choix final après sonde de la cible."
+    );
   } catch (e) {
-    appendLog(`Calcul MD5 échoué: ${e.message}`);
+    appendLog(`Préparation firmware échouée: ${e.message}`);
     return;
   }
 
@@ -3795,6 +3915,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
       targetHex: selectedTargetHex,
       firmware,
       firmwareMd5,
+      firmwareVariants,
       chunkSizeInput: autoSettings ? autoSettings.chunkSize : manualChunk,
       ackEveryInput: autoSettings ? autoSettings.ackEvery : manualAck,
       noAckGapMs: autoSettings ? autoSettings.noAckGapMs : manualNoAckGap,
@@ -3808,13 +3929,12 @@ ui.startOtaBtn.addEventListener("click", async () => {
     if (firmwareInfo?.sourceFormat === "uf2") {
       appendLog(
         `Firmware: ${file.name} (${formatByteCount(firmwareInfo.originalSize)}) `
-        + `-> bin ${formatByteCount(firmwareInfo.extractedSize)} `
-        + `-> ${firmwareInfo.uploadFormat} ${formatByteCount(firmwareInfo.uploadSize)}`
+        + `-> bin ${formatByteCount(firmwareInfo.extractedSize)}`
+        + (firmwareVariants.gz ? ` (+ forme gzip ${formatByteCount(firmwareVariants.gz.bytes.length)})` : "")
       );
     } else {
-      appendLog(`Firmware: ${file.name} (${firmware.length} bytes, ${firmwareInfo?.uploadFormat || "bin"})`);
+      appendLog(`Firmware: ${file.name} (${firmware.length} bytes, ${firmwareInfo?.sourceFormat || "bin"})`);
     }
-    appendLog(`MD5: ${firmwareMd5}`);
     updatePlanLine(true);
 
     const password = String(ui.targetPassword.value || "").trim();
