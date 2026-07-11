@@ -470,7 +470,9 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
     sprintf((char *) &reply_data[4], "%s\n%s\n%s", FIRMWARE_VERSION, _prefs.node_name, _prefs.owner_info);
     return 4 + strlen((char *) &reply_data[4]);
   } else if (payload[0] == REQ_TYPE_OTA_BINARY) {
-#if defined(RP2040_PLATFORM)
+    // Platform-neutral: the board decides whether mesh OTA is supported
+    // (RP2040 and ESP32 boards implement it; others reply 'unsupported'
+    // instead of staying silent, which the web client reports clearly).
     if (sender == NULL || !sender->isAdmin()) {
       strcpy((char*)&reply_data[4], "Err - admin required");
       return 4 + strlen((char*)&reply_data[4]);
@@ -499,7 +501,6 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
     }
     memcpy(&reply_data[4], ota_reply, ota_reply_len);
     return 4 + ota_reply_len;
-#endif
   }
   return 0; // unknown command
 }

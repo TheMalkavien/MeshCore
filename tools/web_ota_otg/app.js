@@ -3933,7 +3933,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
         + (firmwareVariants.gz ? ` (+ forme gzip ${formatByteCount(firmwareVariants.gz.bytes.length)})` : "")
       );
     } else {
-      appendLog(`Firmware: ${file.name} (${firmware.length} bytes, ${firmwareInfo?.sourceFormat || "bin"})`);
+      appendLog(`Firmware: ${file.name} (source ${firmwareInfo?.sourceFormat || "bin"} ${formatByteCount(firmwareInfo?.originalSize || firmware.length)})`);
     }
     updatePlanLine(true);
 
