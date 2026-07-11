@@ -269,7 +269,8 @@ private:
 ESP32OTAController::ESP32OTAController() {
   _stage = NULL;
   _stage_size = 0;
-  _stage_fill = 0;
+  _stage_base = 0;
+  _stage_range_count = 0;
   _gz = NULL;
   clearState();
 }
@@ -291,13 +292,95 @@ void ESP32OTAController::clearState() {
     _stage = NULL;
   }
   _stage_size = 0;
-  _stage_fill = 0;
+  _stage_base = 0;
+  _stage_range_count = 0;
 #if ESP32_OTA_GZIP
   if (_gz) {
     delete _gz;
     _gz = NULL;
   }
 #endif
+}
+
+// Size of the staging block currently being received (the last block of the
+// transfer can be shorter than the buffer).
+size_t ESP32OTAController::stageExtent() const {
+  if (_stage_size == 0 || _expected_size <= _stage_base) return 0;
+  size_t left = _expected_size - _stage_base;
+  return left < _stage_size ? left : _stage_size;
+}
+
+// Contiguous bytes received from the start of the current block.
+size_t ESP32OTAController::stagePrefix() const {
+  if (_stage_range_count == 0 || _stage_ranges[0].start != 0) return 0;
+  return _stage_ranges[0].end;
+}
+
+// Insert [start,end) into the sorted disjoint range set, merging overlapping
+// and adjacent segments. Returns false only when a brand-new hole-bounded
+// segment would overflow the table (the caller then degrades to
+// sequential-only acceptance; strictly in-order streams always merge into
+// ranges[0] and cannot fail).
+bool ESP32OTAController::insertStageRange(size_t start, size_t end) {
+  int i = 0;
+  while (i < _stage_range_count && _stage_ranges[i].end < start) {
+    i++;
+  }
+
+  if (i == _stage_range_count || _stage_ranges[i].start > end) {
+    if (_stage_range_count >= MAX_STAGE_RANGES) return false;
+    memmove(&_stage_ranges[i + 1], &_stage_ranges[i],
+            (_stage_range_count - i) * sizeof(StageRange));
+    _stage_ranges[i].start = (uint16_t) start;
+    _stage_ranges[i].end = (uint16_t) end;
+    _stage_range_count++;
+    return true;
+  }
+
+  if (start < _stage_ranges[i].start) _stage_ranges[i].start = (uint16_t) start;
+  if (end > _stage_ranges[i].end) _stage_ranges[i].end = (uint16_t) end;
+
+  int j = i + 1;
+  while (j < _stage_range_count && _stage_ranges[j].start <= _stage_ranges[i].end) {
+    if (_stage_ranges[j].end > _stage_ranges[i].end) {
+      _stage_ranges[i].end = _stage_ranges[j].end;
+    }
+    j++;
+  }
+  if (j > i + 1) {
+    memmove(&_stage_ranges[i + 1], &_stage_ranges[j],
+            (_stage_range_count - j) * sizeof(StageRange));
+    _stage_range_count -= (uint8_t)(j - i - 1);
+  }
+  return true;
+}
+
+// Append ' miss=<abs>+<len>,...' for the holes BETWEEN received segments of
+// the current block (the tail past the last segment is data the client simply
+// hasn't sent yet, not a loss). Old clients ignore the suffix: their status
+// parser only reads the leading done/total pair.
+void ESP32OTAController::appendMissList(char reply[], size_t max_len) const {
+  if (_stage_range_count == 0) return;
+
+  size_t len = strlen(reply);
+  int added = 0;
+  size_t hole_start = 0;  // block-relative
+  for (int k = 0; k <= _stage_range_count - 1; k++) {
+    if (_stage_ranges[k].start > hole_start) {
+      char item[32];
+      snprintf(item, sizeof(item), "%s%lu+%lu",
+               added == 0 ? " miss=" : ",",
+               (unsigned long)(_stage_base + hole_start),
+               (unsigned long)(_stage_ranges[k].start - hole_start));
+      size_t item_len = strlen(item);
+      if (len + item_len >= max_len) break;
+      strcpy(reply + len, item);
+      len += item_len;
+      added++;
+      if (added >= 8) break;
+    }
+    hole_start = _stage_ranges[k].end;
+  }
 }
 
 size_t ESP32OTAController::flushBlockBytes() const {
@@ -396,13 +479,14 @@ bool ESP32OTAController::startSession(const char *id, char reply[]) {
 
   _stage = (uint8_t *) malloc(ESP32_OTA_STAGE_BUFFER_BYTES);
   _stage_size = _stage ? ESP32_OTA_STAGE_BUFFER_BYTES : 0;
-  _stage_fill = 0;
+  _stage_base = 0;
+  _stage_range_count = 0;
   if (_stage_size == 0) {
     OTA_DEBUG_PRINTLN("stage buffer alloc failed, falling back to %u", OTA_UPDATER_INTERNAL_BLOCK);
   }
 
   uint32_t free_kb = (uint32_t)(part->size / 1024UL);
-  sprintf(reply, "OK - OTA ready (%lukB free, blk=%u, gz=%d)",
+  sprintf(reply, "OK - OTA ready (%lukB free, blk=%u, gz=%d, nack=miss)",
           (unsigned long) free_kb, (unsigned int) flushBlockBytes(),
           ESP32_OTA_GZIP ? 1 : 0);
   OTA_DEBUG_PRINTLN("session armed, part=%s free=%lu kB, blk=%u, gz=%d",
@@ -425,7 +509,15 @@ bool ESP32OTAController::handleCommand(const char *command, char reply[]) {
 
   if (strncmp(sub, "status", 6) == 0 && (sub[6] == 0 || sub[6] == ' ')) {
     if (_active) {
-      sprintf(reply, "OTA active %lu/%lu", (unsigned long) _received_size, (unsigned long) _expected_size);
+      sprintf(reply, "OTA active %lu/%lu nack=miss blk=%u",
+              (unsigned long) _received_size, (unsigned long) _expected_size,
+              (unsigned int) flushBlockBytes());
+      // Capability marker lets the web client distinguish an old target from
+      // a selective-NACK target that simply has no holes to report.
+      // NACK sélectif : annonce les trous du bloc courant pour que le client
+      // ne réémette qu'eux. Suffixe ignoré par les anciens clients (leur
+      // parseur ne lit que done/total).
+      appendMissList(reply, 140);
     } else if (_armed) {
       strcpy(reply, "OTA armed");
     } else {
@@ -571,6 +663,8 @@ bool ESP32OTAController::handleCommand(const char *command, char reply[]) {
     memcpy(_md5, md5, sizeof(_md5));
     _expected_size = (size_t) size_ul;
     _received_size = 0;
+    _stage_base = 0;
+    _stage_range_count = 0;
     _next_progress_log = OTA_PROGRESS_LOG_STEP_BYTES;
     _ack_every_chunks = ack_every;
     _chunks_since_ack = 0;
@@ -781,45 +875,119 @@ bool ESP32OTAController::writeChunk(size_t offset, const uint8_t *chunk, size_t 
     strcpy(reply, "Err - empty OTA chunk");
     return true;
   }
-  if (offset != _received_size) {
-    OTA_DEBUG_PRINTLN("write rejected: bad offset %lu expected %lu",
-                      (unsigned long) offset,
-                      (unsigned long) _received_size);
-    sprintf(reply, "Err - offset %lu expected %lu", (unsigned long) offset, (unsigned long) _received_size);
-    return true;
-  }
-  if (_received_size + chunk_len > _expected_size) {
+  if (offset + chunk_len > _expected_size) {
     OTA_DEBUG_PRINTLN("write rejected: overflow");
     strcpy(reply, "Err - OTA overflow");
     return true;
   }
 
+  bool was_contiguous = (offset == _received_size);
+
   if (_stage_size > 0) {
+    // Out-of-order acceptance within the current staging block: the stage is
+    // random-access RAM, so a chunk landing past a lost one is stored at its
+    // place instead of being rejected (holes are advertised via 'miss=' in
+    // the status reply). Duplicates and rewound resends from legacy clients
+    // simply overwrite the same bytes. Data leaves the stage — towards
+    // Update/gzip, which are strictly sequential — only as complete blocks.
+    //
+    // Externally the legacy contract is preserved: any non-contiguous chunk
+    // still gets the 'Err - offset' reply (see below) so sequential clients
+    // that rely on it keep rewinding exactly as before — they just find the
+    // ahead-data already accepted, which shortens their rewind rounds. The
+    // binary transport suppresses per-write replies either way.
     const uint8_t *src = chunk;
+    size_t off = offset;
     size_t remaining = chunk_len;
+    bool consumed_any = false;
+
     while (remaining > 0) {
-      size_t space = _stage_size - _stage_fill;
-      size_t n = remaining < space ? remaining : space;
-      memcpy(_stage + _stage_fill, src, n);
-      _stage_fill += n;
+      if (off < _stage_base) {  // duplicate of already-flushed data: idempotent
+        size_t skip = _stage_base - off;
+        if (skip > remaining) skip = remaining;
+        off += skip;
+        src += skip;
+        remaining -= skip;
+        consumed_any = true;
+        continue;
+      }
+
+      size_t extent = stageExtent();
+      size_t win_end = _stage_base + extent;
+      if (extent == 0 || off >= win_end) {
+        if (!consumed_any) {
+          // Entirely past the receive window: same reject as the legacy
+          // sequential rule, so old clients rewind exactly as before.
+          OTA_DEBUG_PRINTLN("write rejected: bad offset %lu expected %lu",
+                            (unsigned long) off, (unsigned long) _received_size);
+          sprintf(reply, "Err - offset %lu expected %lu",
+                  (unsigned long) off, (unsigned long) _received_size);
+          return true;
+        }
+        // Straddler tail into a block that can't flush yet (holes remain):
+        // drop it, the contiguous 'done' will make the client resend it.
+        OTA_DEBUG_PRINTLN("write tail dropped at %lu (window end %lu)",
+                          (unsigned long) off, (unsigned long) win_end);
+        break;
+      }
+
+      size_t n = win_end - off;
+      if (n > remaining) n = remaining;
+      size_t rel = off - _stage_base;
+      if (!insertStageRange(rel, rel + n)) {
+        // Range table full: degrade to sequential-only for this chunk.
+        if (!consumed_any) {
+          OTA_DEBUG_PRINTLN("write rejected: range table full at %lu (done %lu)",
+                            (unsigned long) off, (unsigned long) _received_size);
+          sprintf(reply, "Err - offset %lu expected %lu",
+                  (unsigned long) off, (unsigned long) _received_size);
+          return true;
+        }
+        break;
+      }
+      memcpy(_stage + rel, src, n);
+      off += n;
       src += n;
       remaining -= n;
-      if (_stage_fill == _stage_size && !flushStage(reply)) {
+      consumed_any = true;
+
+      _received_size = _stage_base + stagePrefix();
+      if (stagePrefix() == extent && !flushStage(reply)) {
         return true;  // reply set by the failed flush
       }
     }
-  } else if (!writePayload(chunk, chunk_len, reply)) {
-    return true;
+  } else {
+    // No staging buffer (alloc failed): strict sequential mode, as before.
+    if (!was_contiguous) {
+      OTA_DEBUG_PRINTLN("write rejected: bad offset %lu expected %lu",
+                        (unsigned long) offset,
+                        (unsigned long) _received_size);
+      sprintf(reply, "Err - offset %lu expected %lu", (unsigned long) offset, (unsigned long) _received_size);
+      return true;
+    }
+    if (!writePayload(chunk, chunk_len, reply)) {
+      return true;
+    }
+    _received_size += chunk_len;
   }
 
-  _received_size += chunk_len;
-  _chunks_since_ack++;
   if (_received_size >= _next_progress_log || _received_size == _expected_size) {
     OTA_DEBUG_PRINTLN("progress %lu/%lu",
                       (unsigned long) _received_size,
                       (unsigned long) _expected_size);
     _next_progress_log = _received_size + OTA_PROGRESS_LOG_STEP_BYTES;
   }
+
+  if (!was_contiguous) {
+    // Accepted into the block, but not contiguous: reply the legacy offset
+    // error so rewind-based clients resync as they always did (suppressed in
+    // binary transport, where recovery is 'miss='-driven instead).
+    sprintf(reply, "Err - offset %lu expected %lu",
+            (unsigned long) offset, (unsigned long) _received_size);
+    return true;
+  }
+
+  _chunks_since_ack++;
 
   bool should_ack_now = (_ack_every_chunks <= 1)
                      || (_chunks_since_ack >= _ack_every_chunks)
@@ -866,12 +1034,17 @@ bool ESP32OTAController::writePayload(const uint8_t *data, size_t len, char repl
 }
 
 bool ESP32OTAController::flushStage(char reply[]) {
-  if (_stage_fill == 0) {
-    return true;
+  size_t extent = stageExtent();
+  if (extent == 0 || stagePrefix() < extent) {
+    return true;  // block incomplete (holes or nothing staged): nothing to flush
   }
-  size_t n = _stage_fill;
-  _stage_fill = 0;
-  return writePayload(_stage, n, reply);
+  if (!writePayload(_stage, extent, reply)) {
+    return false;  // fatal, state cleared by writePayload
+  }
+  _stage_base += extent;
+  _stage_range_count = 0;
+  _received_size = _stage_base;
+  return true;
 }
 
 bool ESP32OTAController::handleBinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) {

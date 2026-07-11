@@ -48,7 +48,8 @@
 RP2040OTAController::RP2040OTAController() {
   _stage = NULL;
   _stage_size = 0;
-  _stage_fill = 0;
+  _stage_base = 0;
+  _stage_range_count = 0;
   clearState();
 }
 
@@ -66,7 +67,70 @@ void RP2040OTAController::clearState() {
     _stage = NULL;
   }
   _stage_size = 0;
-  _stage_fill = 0;
+  _stage_base = 0;
+  _stage_range_count = 0;
+}
+
+size_t RP2040OTAController::stageExtent() const {
+  if (_stage_size == 0 || _expected_size <= _stage_base) return 0;
+  size_t left = _expected_size - _stage_base;
+  return left < _stage_size ? left : _stage_size;
+}
+
+size_t RP2040OTAController::stagePrefix() const {
+  if (_stage_range_count == 0 || _stage_ranges[0].start != 0) return 0;
+  return _stage_ranges[0].end;
+}
+
+bool RP2040OTAController::insertStageRange(size_t start, size_t end) {
+  int i = 0;
+  while (i < _stage_range_count && _stage_ranges[i].end < start) i++;
+
+  if (i == _stage_range_count || _stage_ranges[i].start > end) {
+    if (_stage_range_count >= MAX_STAGE_RANGES) return false;
+    memmove(&_stage_ranges[i + 1], &_stage_ranges[i],
+            (_stage_range_count - i) * sizeof(StageRange));
+    _stage_ranges[i].start = (uint16_t) start;
+    _stage_ranges[i].end = (uint16_t) end;
+    _stage_range_count++;
+    return true;
+  }
+
+  if (start < _stage_ranges[i].start) _stage_ranges[i].start = (uint16_t) start;
+  if (end > _stage_ranges[i].end) _stage_ranges[i].end = (uint16_t) end;
+  int j = i + 1;
+  while (j < _stage_range_count && _stage_ranges[j].start <= _stage_ranges[i].end) {
+    if (_stage_ranges[j].end > _stage_ranges[i].end) _stage_ranges[i].end = _stage_ranges[j].end;
+    j++;
+  }
+  if (j > i + 1) {
+    memmove(&_stage_ranges[i + 1], &_stage_ranges[j],
+            (_stage_range_count - j) * sizeof(StageRange));
+    _stage_range_count -= (uint8_t)(j - i - 1);
+  }
+  return true;
+}
+
+void RP2040OTAController::appendMissList(char reply[], size_t max_len) const {
+  if (_stage_range_count == 0) return;
+  size_t len = strlen(reply);
+  int added = 0;
+  size_t hole_start = 0;
+  for (int k = 0; k < _stage_range_count; k++) {
+    if (_stage_ranges[k].start > hole_start) {
+      char item[32];
+      snprintf(item, sizeof(item), "%s%lu+%lu",
+               added == 0 ? " miss=" : ",",
+               (unsigned long)(_stage_base + hole_start),
+               (unsigned long)(_stage_ranges[k].start - hole_start));
+      size_t item_len = strlen(item);
+      if (len + item_len >= max_len) break;
+      strcpy(reply + len, item);
+      len += item_len;
+      if (++added >= 8) break;
+    }
+    hole_start = _stage_ranges[k].end;
+  }
 }
 
 size_t RP2040OTAController::flushBlockBytes() const {
@@ -174,7 +238,8 @@ bool RP2040OTAController::startSession(const char *id, char reply[]) {
 
   _stage = (uint8_t *) malloc(RP2040_OTA_STAGE_BUFFER_BYTES);
   _stage_size = _stage ? RP2040_OTA_STAGE_BUFFER_BYTES : 0;
-  _stage_fill = 0;
+  _stage_base = 0;
+  _stage_range_count = 0;
   if (_stage_size == 0) {
     OTA_DEBUG_PRINTLN("stage buffer alloc failed, falling back to %u", OTA_UPDATER_INTERNAL_BLOCK);
   }
@@ -182,10 +247,11 @@ bool RP2040OTAController::startSession(const char *id, char reply[]) {
   FSInfo fs_info;
   if (LittleFS.info(fs_info) && fs_info.totalBytes >= fs_info.usedBytes) {
     uint32_t free_kb = (uint32_t)((fs_info.totalBytes - fs_info.usedBytes) / 1024ULL);
-    sprintf(reply, "OK - OTA ready (%lukB free, blk=%u)", (unsigned long) free_kb, (unsigned int) flushBlockBytes());
+    sprintf(reply, "OK - OTA ready (%lukB free, blk=%u, nack=miss)",
+            (unsigned long) free_kb, (unsigned int) flushBlockBytes());
     OTA_DEBUG_PRINTLN("session armed, free=%lu kB, blk=%u", (unsigned long) free_kb, (unsigned int) flushBlockBytes());
   } else {
-    sprintf(reply, "OK - OTA ready (blk=%u)", (unsigned int) flushBlockBytes());
+    sprintf(reply, "OK - OTA ready (blk=%u, nack=miss)", (unsigned int) flushBlockBytes());
     OTA_DEBUG_PRINTLN("session armed, fs info unavailable");
   }
   return true;
@@ -205,7 +271,10 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
 
   if (strncmp(sub, "status", 6) == 0 && (sub[6] == 0 || sub[6] == ' ')) {
     if (_active) {
-      sprintf(reply, "OTA active %lu/%lu", (unsigned long) _received_size, (unsigned long) _expected_size);
+      sprintf(reply, "OTA active %lu/%lu nack=miss blk=%u",
+              (unsigned long) _received_size, (unsigned long) _expected_size,
+              (unsigned int) flushBlockBytes());
+      appendMissList(reply, 140);
     } else if (_armed) {
       strcpy(reply, "OTA armed");
     } else {
@@ -344,6 +413,8 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
     _active = true;
     _expected_size = (size_t) size_ul;
     _received_size = 0;
+    _stage_base = 0;
+    _stage_range_count = 0;
     _next_progress_log = OTA_PROGRESS_LOG_STEP_BYTES;
     _ack_every_chunks = ack_every;
     _chunks_since_ack = 0;
@@ -455,45 +526,94 @@ bool RP2040OTAController::writeChunk(size_t offset, const uint8_t *chunk, size_t
     strcpy(reply, "Err - empty OTA chunk");
     return true;
   }
-  if (offset != _received_size) {
-    OTA_DEBUG_PRINTLN("write rejected: bad offset %lu expected %lu",
-                      (unsigned long) offset,
-                      (unsigned long) _received_size);
-    sprintf(reply, "Err - offset %lu expected %lu", (unsigned long) offset, (unsigned long) _received_size);
-    return true;
-  }
-  if (_received_size + chunk_len > _expected_size) {
+  if (offset + chunk_len > _expected_size) {
     OTA_DEBUG_PRINTLN("write rejected: overflow");
     strcpy(reply, "Err - OTA overflow");
     return true;
   }
 
+  bool was_contiguous = (offset == _received_size);
+
   if (_stage_size > 0) {
     const uint8_t *src = chunk;
+    size_t off = offset;
     size_t remaining = chunk_len;
+    bool consumed_any = false;
     while (remaining > 0) {
-      size_t space = _stage_size - _stage_fill;
-      size_t n = remaining < space ? remaining : space;
-      memcpy(_stage + _stage_fill, src, n);
-      _stage_fill += n;
+      if (off < _stage_base) {
+        size_t skip = _stage_base - off;
+        if (skip > remaining) skip = remaining;
+        off += skip;
+        src += skip;
+        remaining -= skip;
+        consumed_any = true;
+        continue;
+      }
+
+      size_t extent = stageExtent();
+      size_t win_end = _stage_base + extent;
+      if (extent == 0 || off >= win_end) {
+        if (!consumed_any) {
+          OTA_DEBUG_PRINTLN("write rejected: bad offset %lu expected %lu",
+                            (unsigned long) off, (unsigned long) _received_size);
+          sprintf(reply, "Err - offset %lu expected %lu",
+                  (unsigned long) off, (unsigned long) _received_size);
+          return true;
+        }
+        OTA_DEBUG_PRINTLN("write tail dropped at %lu (window end %lu)",
+                          (unsigned long) off, (unsigned long) win_end);
+        break;
+      }
+
+      size_t n = win_end - off;
+      if (n > remaining) n = remaining;
+      size_t rel = off - _stage_base;
+      if (!insertStageRange(rel, rel + n)) {
+        if (!consumed_any) {
+          OTA_DEBUG_PRINTLN("write rejected: range table full at %lu (done %lu)",
+                            (unsigned long) off, (unsigned long) _received_size);
+          sprintf(reply, "Err - offset %lu expected %lu",
+                  (unsigned long) off, (unsigned long) _received_size);
+          return true;
+        }
+        break;
+      }
+      memcpy(_stage + rel, src, n);
+      off += n;
       src += n;
       remaining -= n;
-      if (_stage_fill == _stage_size && !flushStage(reply)) {
+      consumed_any = true;
+      _received_size = _stage_base + stagePrefix();
+      if (stagePrefix() == extent && !flushStage(reply)) {
         return true;  // reply set by the failed flush
       }
     }
-  } else if (!writeToUpdater(chunk, chunk_len, reply)) {
-    return true;
+  } else {
+    if (!was_contiguous) {
+      OTA_DEBUG_PRINTLN("write rejected: bad offset %lu expected %lu",
+                        (unsigned long) offset, (unsigned long) _received_size);
+      sprintf(reply, "Err - offset %lu expected %lu",
+              (unsigned long) offset, (unsigned long) _received_size);
+      return true;
+    }
+    if (!writeToUpdater(chunk, chunk_len, reply)) return true;
+    _received_size += chunk_len;
   }
 
-  _received_size += chunk_len;
-  _chunks_since_ack++;
   if (_received_size >= _next_progress_log || _received_size == _expected_size) {
     OTA_DEBUG_PRINTLN("progress %lu/%lu",
                       (unsigned long) _received_size,
                       (unsigned long) _expected_size);
     _next_progress_log = _received_size + OTA_PROGRESS_LOG_STEP_BYTES;
   }
+
+  if (!was_contiguous) {
+    sprintf(reply, "Err - offset %lu expected %lu",
+            (unsigned long) offset, (unsigned long) _received_size);
+    return true;
+  }
+
+  _chunks_since_ack++;
 
   bool should_ack_now = (_ack_every_chunks <= 1)
                      || (_chunks_since_ack >= _ack_every_chunks)
@@ -521,12 +641,13 @@ bool RP2040OTAController::writeToUpdater(const uint8_t *data, size_t len, char r
 }
 
 bool RP2040OTAController::flushStage(char reply[]) {
-  if (_stage_fill == 0) {
-    return true;
-  }
-  size_t n = _stage_fill;
-  _stage_fill = 0;
-  return writeToUpdater(_stage, n, reply);
+  size_t extent = stageExtent();
+  if (extent == 0 || stagePrefix() < extent) return true;
+  if (!writeToUpdater(_stage, extent, reply)) return false;
+  _stage_base += extent;
+  _stage_range_count = 0;
+  _received_size = _stage_base;
+  return true;
 }
 
 bool RP2040OTAController::handleBinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) {

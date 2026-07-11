@@ -36,20 +36,32 @@ public:
   bool isSleepInhibited() const;
 
 private:
+  // Received segments inside the current staging block, sorted and disjoint
+  // (block-relative offsets, end exclusive). Out-of-order chunks land here so
+  // one lost chunk no longer invalidates the rest of its batch: the holes are
+  // advertised via 'miss=' in the status reply and only they get resent.
+  struct StageRange {
+    uint16_t start;
+    uint16_t end;
+  };
+  static const int MAX_STAGE_RANGES = 24;
+
   bool _armed;
   bool _active;
   bool _update_started;   // Update.begin() done (deferred to the first write, see beginUpdater)
   bool _gz_mode;
   char _md5[33];          // expected MD5 of the received byte stream ("" = none)
   size_t _expected_size;
-  size_t _received_size;
+  size_t _received_size;  // contiguous prefix received (the 'done' of status replies)
   size_t _next_progress_log;
   uint16_t _ack_every_chunks;
   uint16_t _chunks_since_ack;
   uint32_t _last_activity_millis;
   uint8_t *_stage;
   size_t _stage_size;
-  size_t _stage_fill;
+  size_t _stage_base;     // absolute stream offset of _stage[0] (== bytes already flushed)
+  StageRange _stage_ranges[MAX_STAGE_RANGES];
+  uint8_t _stage_range_count;
   ESP32OTAGzInflater *_gz;
 
   static const char *skipSpaces(const char *p);
@@ -60,6 +72,10 @@ private:
   bool writePayload(const uint8_t *data, size_t len, char reply[]);
   bool flushStage(char reply[]);
   size_t flushBlockBytes() const;
+  size_t stageExtent() const;
+  size_t stagePrefix() const;
+  bool insertStageRange(size_t start, size_t end);
+  void appendMissList(char reply[], size_t max_len) const;
   void abortUpdate();
   bool sessionExpired() const;
   void expireIfIdle();
