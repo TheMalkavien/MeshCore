@@ -2721,7 +2721,18 @@ async function runBinaryOta(params) {
       let writeOk = false;
       let failure = "write failed";
 
-      for (let attempt = 1; attempt <= writeMaxRetries; attempt += 1) {
+      // ERR_CODE_TABLE_FULL (code=3) : la file TX du companion est pleine —
+      // contrôle de flux purement local, elle se draine à ~48 ms/paquet émis.
+      // Ces attentes ne consomment PAS de tentative radio : elles sont bornées
+      // par une échéance murale, sinon un lot long (ack adaptatif élevé) fait
+      // échouer le transfert alors que ni la radio ni la cible ne sont en
+      // cause (vu sur le terrain : abort à ack=48 avec cible parfaitement en
+      // phase).
+      const busyDeadlineMs = writeStartMs + Math.max(8000, (Number(checkpointTimeoutMs) || 1500) * 4);
+      let busyWaits = 0;
+      let attempt = 0;
+
+      while (!otaCancelRequested) {
         chunkWriteAttempts += 1;
         const attemptStartMs = performance.now();
         const writeRes = await client.sendOtaBinaryCmd(
@@ -2745,19 +2756,17 @@ async function runBinaryOta(params) {
         failure = writeRes.error || failure;
         updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
 
-        // ERR_CODE_TABLE_FULL (code=3) : la file TX du companion est pleine —
-        // condition purement locale. Un aller-retour STATUS radio ne servirait
-        // à rien : on laisse la radio drainer puis on retente directement.
-        // Le STATUS ne part que si l'erreur persiste au dernier essai.
         const isLocalBusy = String(writeRes.error || "").includes("code=3");
-        if (isLocalBusy && attempt < writeMaxRetries) {
-          const busySleep = Math.max(40, noAckGapMs * 2) * attempt;
+        if (isLocalBusy && performance.now() < busyDeadlineMs) {
+          busyWaits += 1;
+          const busySleep = Math.min(400, Math.max(80, noAckGapMs * 2) + 60 * Math.min(busyWaits, 5));
           otaBusyStats.events += 1;
           otaBusyStats.sleepMs += busySleep;
           await sleep(busySleep);
           continue;
         }
 
+        attempt += 1;
         const st = await getOtaStatusBinary(targetFullKeyHex, 1, quickStatusTimeout);
         if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
           const srvOffset = st.status.done;
@@ -2774,6 +2783,9 @@ async function runBinaryOta(params) {
             writeOk = true;
             break;
           }
+          // Serveur en phase à notre offset : le chunk n'est jamais parti
+          // (busy prolongé) ou s'est perdu en l'air — rejouable tel quel.
+          // Le RTT du STATUS (~850 ms) a en plus laissé la file se drainer.
         }
 
         if (attempt < writeMaxRetries) {
@@ -2785,9 +2797,15 @@ async function runBinaryOta(params) {
         if (!st.error && st.reply) {
           failure = `${failure}; status=${st.reply}`;
         }
+        break;
       }
 
       if (!writeOk) {
+        if (otaCancelRequested) {
+          await abortTargetOtaSession(targetHex, targetFullKeyHex, "annulation");
+          shouldCleanupTargetOta = false;
+          throw new Error("OTA annulée.");
+        }
         throw new Error(`OTA write failed (binary) at offset ${offset}: ${failure}`);
       }
 
@@ -3179,7 +3197,24 @@ async function runTextOta(params) {
 
       if (!checkpointDue) {
         chunkWriteAttempts += 1;
-        const sendErr = await client.sendRepeaterCmdNoReply(targetHex, chunkCmd);
+        let sendErr = await client.sendRepeaterCmdNoReply(targetHex, chunkCmd);
+        // code=3 : file TX du companion pleine — backpressure locale, on
+        // laisse drainer (~48 ms/paquet) et on resoumet le même chunk, borné
+        // par une échéance murale. Voir le même traitement en binaire.
+        if (sendErr && String(sendErr).includes("code=3")) {
+          const busyDeadlineMs = performance.now() + Math.max(8000, (Number(checkpointTimeoutMs) || 1500) * 4);
+          let busyWaits = 0;
+          while (sendErr && String(sendErr).includes("code=3")
+                 && performance.now() < busyDeadlineMs && !otaCancelRequested) {
+            busyWaits += 1;
+            const busySleep = Math.min(400, Math.max(80, noAckGapMs * 2) + 60 * Math.min(busyWaits, 5));
+            otaBusyStats.events += 1;
+            otaBusyStats.sleepMs += busySleep;
+            await sleep(busySleep);
+            chunkWriteAttempts += 1;
+            sendErr = await client.sendRepeaterCmdNoReply(targetHex, chunkCmd);
+          }
+        }
         if (sendErr) {
           chunkWriteFailures += 1;
           updateLiveMetrics("text_cmd", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
