@@ -22,12 +22,16 @@ void ESPNowBridge::send_cb(const uint8_t *mac, esp_now_send_status_t status) {
 }
 
 ESPNowBridge::ESPNowBridge(NodePrefs *prefs, mesh::PacketManager *mgr, mesh::RTCClock *rtc)
-    : BridgeBase(prefs, mgr, rtc), _rx_buffer_pos(0) {
+    : BridgeBase(prefs, mgr, rtc), _rx_ring_head(0), _rx_ring_tail(0),
+      _rx_dropped(0), _rx_dropped_reported(0) {
   _instance = this;
 }
 
 void ESPNowBridge::begin() {
   BRIDGE_DEBUG_PRINTLN("Initializing...\n");
+
+  // Reset the RX ring before the receive callback can fire
+  _rx_ring_head = _rx_ring_tail = 0;
 
   // Initialize WiFi in station mode
   WiFi.mode(WIFI_STA);
@@ -103,7 +107,26 @@ void ESPNowBridge::end() {
 }
 
 void ESPNowBridge::loop() {
-  // Nothing to do here - ESP-NOW is callback based
+  // Decode the frames stashed by the ESP-NOW receive callback. The callback
+  // runs in the WiFi task, where the packet pool and seen-packets table must
+  // not be touched — all of that work happens here, on the main loop.
+  while (true) {
+    portENTER_CRITICAL(&_rx_ring_mux);
+    if (_rx_ring_tail == _rx_ring_head) {
+      portEXIT_CRITICAL(&_rx_ring_mux);
+      break;
+    }
+    RxFrame frame = _rx_ring[_rx_ring_tail];
+    _rx_ring_tail = (_rx_ring_tail + 1) % RX_RING_SIZE;
+    portEXIT_CRITICAL(&_rx_ring_mux);
+
+    processRxFrame(frame.data, frame.len);
+  }
+
+  if (_rx_dropped != _rx_dropped_reported) {
+    BRIDGE_DEBUG_PRINTLN("RX ring full, total dropped=%u\n", (unsigned)_rx_dropped);
+    _rx_dropped_reported = _rx_dropped;
+  }
 }
 
 void ESPNowBridge::xorCrypt(uint8_t *data, size_t len) {
@@ -114,18 +137,29 @@ void ESPNowBridge::xorCrypt(uint8_t *data, size_t len) {
 }
 
 void ESPNowBridge::onDataRecv(const uint8_t *mac, const uint8_t *data, int32_t len) {
-  // Ignore packets that are too small to contain header + checksum
-  if (len < (BRIDGE_MAGIC_SIZE + BRIDGE_CHECKSUM_SIZE)) {
-    BRIDGE_DEBUG_PRINTLN("RX packet too small, len=%d\n", len);
-    return;
+  // Runs in the WiFi task: do not touch the packet pool, the seen-packets
+  // table or Serial here. Just stash the raw frame; loop() decodes it on the
+  // main loop.
+  if (len < (int32_t)(BRIDGE_MAGIC_SIZE + BRIDGE_CHECKSUM_SIZE) ||
+      len > (int32_t)MAX_ESPNOW_PACKET_SIZE) {
+    return;   // can't be one of our frames
   }
 
-  // Validate total packet size
-  if (len > MAX_ESPNOW_PACKET_SIZE) {
-    BRIDGE_DEBUG_PRINTLN("RX packet too large, len=%d\n", len);
+  portENTER_CRITICAL(&_rx_ring_mux);
+  int next = (_rx_ring_head + 1) % RX_RING_SIZE;
+  if (next == _rx_ring_tail) {   // ring full, drop the frame (reported in loop())
+    _rx_dropped++;
+    portEXIT_CRITICAL(&_rx_ring_mux);
     return;
   }
+  RxFrame *slot = &_rx_ring[_rx_ring_head];
+  slot->len = (uint8_t)len;
+  memcpy(slot->data, data, len);
+  _rx_ring_head = next;
+  portEXIT_CRITICAL(&_rx_ring_mux);
+}
 
+void ESPNowBridge::processRxFrame(const uint8_t *data, int len) {
   // Check packet header magic
   uint16_t received_magic = (data[0] << 8) | data[1];
   if (received_magic != BRIDGE_PACKET_MAGIC) {
@@ -154,13 +188,13 @@ void ESPNowBridge::onDataRecv(const uint8_t *mac, const uint8_t *data, int32_t l
   BRIDGE_DEBUG_PRINTLN("RX, payload_len=%d\n", payloadLen);
 
   // Create mesh packet
-  mesh::Packet *pkt = _instance->_mgr->allocNew();
+  mesh::Packet *pkt = _mgr->allocNew();
   if (!pkt) return;
 
   if (pkt->readFrom(decrypted + BRIDGE_CHECKSUM_SIZE, payloadLen)) {
-    _instance->onPacketReceived(pkt);
+    onPacketReceived(pkt);
   } else {
-    _instance->_mgr->free(pkt);
+    _mgr->free(pkt);
   }
 }
 
