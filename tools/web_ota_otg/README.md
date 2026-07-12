@@ -1,6 +1,6 @@
 # MeshCore Web OTA OTG Prototype
 
-Prototype web (single-page app) pour lancer une OTA RP2040 via un **client MeshCore connecté en USB ou BLE**.
+Prototype web (single-page app) pour lancer une OTA **RP2040 ou ESP32** (Heltec V4/V3, Xiao S3/C3, ...) via un **client MeshCore connecté en USB ou BLE**.
 
 Le prototype utilise le protocole companion MeshCore et exécute la séquence OTA distante :
 
@@ -21,7 +21,7 @@ En mode `USB`, il tente :
 - Handshake `APP_START` puis `DEVICE_QUERY`.
 - Envoi OTA en **transport binaire** (si support cible), sinon fallback texte.
 - **MD5 de bout en bout** dans les deux transports (binaire : payload `BEGIN` de 21 octets ; texte : `ota begin <size> <md5> [ack_every]`). La cible vérifie le MD5 au `ota end`.
-- **Compression gzip automatique** des `.bin` bruts (le bootloader OTA arduino-pico décompresse nativement) — ~40-50 % de données en moins et moins de pression sur la partition LittleFS de staging.
+- **Compression gzip automatique** des `.bin` bruts — ~40-50 % de données en moins. Les deux formes (brute et gzip) sont préparées au lancement et la forme réellement envoyée est choisie d'après la capacité annoncée par la cible dans la réponse START (`gz=1`/`gz=0` ; absence du jeton = cible RP2040 historique qui décompresse nativement via le bootloader arduino-pico). Les cibles ESP32 décompressent en streaming via le tinfl du ROM ; celles qui ne le peuvent pas (`gz=0`) reçoivent le `.bin` brut automatiquement.
 - Affiche le `Plan OTA` sous la barre de progression, ainsi que le débit (ko/s) et une estimation du temps restant.
 - **`ack_every` adaptatif** en mode binaire : les checkpoints `STATUS` s'espacent automatiquement (jusqu'à 32 chunks) quand le lien est propre, et se resserrent au premier rejet. Note : en transport binaire, le firmware supprime tous les ACK d'écriture ; la valeur `ack_every` envoyée dans le `BEGIN` ne sert que de cadence initiale côté client (et de compat avec le mode texte).
 - Option `Preset OTA temporaire` :
@@ -33,9 +33,15 @@ En mode `USB`, il tente :
 - Détection de stagnation : l'OTA s'arrête avec un message clair après plusieurs resynchronisations sans progression (lien asymétrique).
 - Statistiques en fin d'OTA : durée et ratio d'échecs chunks.
 
+## Cibles supportées
+
+- **RP2040** (Waveshare RP2040-LoRa, Xiao RP2040, Pico W, RAK11310) : staging LittleFS, image appliquée au reboot par le bootloader arduino-pico (gzip natif).
+- **ESP32/S2/S3/C3** (Heltec V4/V3, Xiao S3/C3, ...) : écriture directe dans la partition OTA inactive (`Update.h`), bascule de partition de boot après vérification complète au `ota end`, décompression gzip en streaming via le ROM. Nécessite un schéma de partitions à deux slots OTA (cas des variants MeshCore ESP32 standard) et un firmware de cette branche déjà en place sur la cible.
+- Sur ESP32, `start ota` arme la session OTA mesh (l'ancien portail WiFi ElegantOTA reste disponible en compilant avec `-D WIFI_OTA_ON_START`).
+
 ## Limitations connues
 
-- Si tu charges un `.uf2`, l'interface web reconstruit le `.bin` puis le recompresse en `.gz` avant l'envoi OTA quand le navigateur le supporte, sinon elle envoie le `.bin` extrait.
+- Si tu charges un `.uf2`, l'interface web reconstruit le `.bin` puis prépare aussi sa forme gzip ; pour une cible ESP32, utilise directement le `firmware.bin` produit par PlatformIO.
 - Web Serial dépend du support navigateur/OS. Sur Android, le prototype force plutôt WebUSB.
 - Le fallback WebUSB dépend des interfaces USB exposées par le firmware companion (CDC-ACM bulk IN/OUT requis).
 - Si erreur `Unable to claim interface` : Android peut déjà attacher le driver CDC système sur l'interface série USB. Dans ce cas, WebUSB navigateur ne peut pas toujours la prendre.

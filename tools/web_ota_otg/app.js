@@ -259,6 +259,46 @@ async function gzipBytes(bytes) {
   return out;
 }
 
+async function gunzipBytes(bytes) {
+  const sourceStream = new Blob([bytes]).stream();
+  const decompressed = await new Response(
+    sourceStream.pipeThrough(new DecompressionStream("gzip"))
+  ).arrayBuffer();
+  const out = new Uint8Array(decompressed);
+  appendLog(`GZIP: décompression ${formatByteCount(bytes.length)} -> ${formatByteCount(out.length)}`);
+  return out;
+}
+
+// La cible annonce sa capacité gzip dans la réponse START via 'gz=' : gz=1 →
+// décompression embarquée, gz=0 → image brute exigée (ESP32 sans inflater).
+// Les firmwares RP2040 antérieurs à ce jeton décompressent nativement via le
+// bootloader arduino-pico, d'où le défaut à true en son absence.
+function targetSupportsGzip(startReply) {
+  const m = /gz=([01])/.exec(String(startReply || ""));
+  return m ? m[1] === "1" : true;
+}
+
+function chooseFirmwareVariant(startReply, variants) {
+  if (!variants) return null;
+  if (targetSupportsGzip(startReply)) {
+    return variants.gz || variants.raw || null;
+  }
+  if (variants.raw) return variants.raw;
+  throw new Error(
+    "La cible exige un .bin brut (gz=0) mais seule la forme gzip est disponible "
+    + "(source .gz non décompressable dans ce navigateur)."
+  );
+}
+
+// En reprise de session, la capacité gzip n'est pas re-annoncée : on identifie
+// la forme (gzip ou brute) déjà en cours par la taille totale de la session.
+function matchFirmwareVariantBySize(variants, total) {
+  if (!variants || !Number.isFinite(total)) return null;
+  if (variants.gz && variants.gz.bytes.length === total) return variants.gz;
+  if (variants.raw && variants.raw.bytes.length === total) return variants.raw;
+  return null;
+}
+
 function isWebSerialPortLike(port) {
   return Boolean(
     port
@@ -433,7 +473,27 @@ function estimateOtaChunkIndex(offset, preferredChunk) {
 function parseOtaStatus(text) {
   const m = /(\d+)\s*\/\s*(\d+)/.exec(text || "");
   if (!m) return null;
-  return { done: Number.parseInt(m[1], 10), total: Number.parseInt(m[2], 10) };
+  const status = {
+    done: Number.parseInt(m[1], 10),
+    total: Number.parseInt(m[2], 10),
+    missing: [],
+    selectiveNack: /\bnack=miss\b/.test(text || ""),
+  };
+  // NACK sélectif (cibles récentes) : 'miss=<off>+<len>,...' liste les trous
+  // du bloc de staging courant — seuls ces octets sont à réémettre, au lieu
+  // de rembobiner tout le lot à 'done'. Absent sur les cibles anciennes.
+  const missM = /miss=([0-9+,]+)/.exec(text || "");
+  if (missM) {
+    for (const tok of missM[1].split(",")) {
+      const mm = /^(\d+)\+(\d+)$/.exec(tok);
+      if (mm) {
+        const off = Number.parseInt(mm[1], 10);
+        const len = Number.parseInt(mm[2], 10);
+        if (len > 0) status.missing.push({ off, len });
+      }
+    }
+  }
+  return status;
 }
 
 function parseOtaOffsetError(text) {
@@ -611,6 +671,14 @@ function estimateRejectedChunks(localOffset, serverOffset, chunkSize) {
   return Math.max(1, Math.ceil((localOffset - serverOffset) / step));
 }
 
+// A full companion TX slot becomes available roughly every 48 ms on the
+// measured SF5/BW250 path. The producer deliberately uses the companion queue
+// for overlap; when it fills, wait slightly beyond one dispatcher slot.
+function otaBusyRetryDelay(noAckGapMs, busyOrdinal = 1) {
+  const base = Math.max(55, Number(noAckGapMs) || 0);
+  return Math.min(180, base + (20 * Math.max(0, busyOrdinal - 1)));
+}
+
 function estimateOtaRadioProfile(radioBwKhz, radioSf, radioCr) {
   const bw = Number(radioBwKhz);
   const sfRaw = Number(radioSf);
@@ -655,6 +723,10 @@ function estimateOtaRadioProfile(radioBwKhz, radioSf, radioCr) {
   else if (airFactor <= 5.0) ackEvery = 5;
   else if (airFactor <= 10.0) ackEvery = 4;
 
+  // Feed the companion queue in short bursts. Its dispatcher drains more
+  // slowly, but pacing every producer write at the radio rate (~50 ms) throws
+  // away the queue's useful overlap. Actual saturation is handled by the
+  // code=3 flow-control retry, slightly beyond one dispatcher slot.
   const noAckGapSec = clamp(0.015 + (0.025 * airFactor), 0.015, 0.45);
   const checkpointTimeoutSec = clamp(0.9 + (0.9 * airFactor), 1.5, 12.0);
   const statusTimeoutSec = clamp(1.4 + (1.2 * airFactor), 2.0, 12.0);
@@ -1863,6 +1935,7 @@ let otaCompleted = false;
 // getOtaStatusBinary, remis à zéro à chaque transfert.
 const otaBusyStats = { events: 0, sleepMs: 0 };
 let lastSelfInfo = null;
+let lastDeviceInfo = null;
 let lastPlanSummary = "";
 
 const LOG_MAX_CHARS = 200000;
@@ -2199,69 +2272,77 @@ function recalcAutoFromCurrentSelection(logReason = null) {
   return applyAutoOtaSettings(logReason);
 }
 
+// Prépare les DEUX formes du firmware (brute et gzip) sans en choisir une :
+// le choix dépend de la capacité de la cible ('gz=' dans la réponse START,
+// connue seulement après la sonde) — voir chooseFirmwareVariant(). Le gzip
+// réduit le volume transmis de ~40-50% quand la cible sait décompresser
+// (bootloader arduino-pico, inflater ROM des ESP32).
 async function getFirmwareBytes(file) {
   const sourceBytes = new Uint8Array(await file.arrayBuffer());
   const fileName = lowerFileName(file);
   appendLog(`Lecture firmware: ${file.name} (${formatByteCount(sourceBytes.length)})`);
 
+  const canGzip = typeof CompressionStream === "function";
+  const canGunzip = typeof DecompressionStream === "function";
+
+  const buildGzCandidate = async (rawBytes) => {
+    if (!canGzip) {
+      appendLog("Firmware: CompressionStream indisponible, forme gzip non préparée");
+      return null;
+    }
+    const gzipPayload = await gzipBytes(rawBytes);
+    if (gzipPayload.length >= rawBytes.length) {
+      appendLog("Firmware: gzip sans gain, forme gzip écartée");
+      return null;
+    }
+    appendLog(
+      `Firmware: forme gzip prête ${formatByteCount(rawBytes.length)} -> ${formatByteCount(gzipPayload.length)} `
+      + `(${Math.round((1 - (gzipPayload.length / rawBytes.length)) * 100)}% de moins si la cible décompresse)`
+    );
+    return gzipPayload;
+  };
+
   if (fileName.endsWith(".uf2")) {
     appendLog("Firmware: format source détecté = uf2");
     const binBytes = convertUf2ToBin(sourceBytes);
-    if (typeof CompressionStream === "function") {
-      appendLog("Firmware: CompressionStream disponible, conversion uf2 -> bin.gz");
-      const gzipPayload = await gzipBytes(binBytes);
-      return {
-        firmware: gzipPayload,
-        sourceFormat: "uf2",
-        uploadFormat: "bin.gz",
-        originalSize: sourceBytes.length,
-        extractedSize: binBytes.length,
-        uploadSize: gzipPayload.length,
-      };
-    }
-    appendLog("Firmware: CompressionStream indisponible, envoi du bin extrait sans gzip");
     return {
-      firmware: binBytes,
       sourceFormat: "uf2",
-      uploadFormat: "bin",
       originalSize: sourceBytes.length,
       extractedSize: binBytes.length,
-      uploadSize: binBytes.length,
+      rawBytes: binBytes,
+      gzBytes: await buildGzCandidate(binBytes),
     };
   }
 
   const isGzip = fileName.endsWith(".gz");
   appendLog(`Firmware: format source détecté = ${isGzip ? "bin.gz" : "bin"}`);
 
-  // Le bootloader OTA arduino-pico détecte l'en-tête gzip et décompresse
-  // nativement : compresser un .bin brut réduit le volume transmis (~40-50%)
-  // et évite de saturer la partition LittleFS de staging.
-  if (!isGzip && typeof CompressionStream === "function") {
-    const gzipPayload = await gzipBytes(sourceBytes);
-    if (gzipPayload.length < sourceBytes.length) {
-      appendLog(
-        `Firmware: compression auto ${formatByteCount(sourceBytes.length)} -> ${formatByteCount(gzipPayload.length)} `
-        + `(${Math.round((1 - (gzipPayload.length / sourceBytes.length)) * 100)}% de moins à transmettre)`
-      );
-      return {
-        firmware: gzipPayload,
-        sourceFormat: "bin",
-        uploadFormat: "bin.gz",
-        originalSize: sourceBytes.length,
-        extractedSize: sourceBytes.length,
-        uploadSize: gzipPayload.length,
-      };
+  if (isGzip) {
+    let rawBytes = null;
+    if (canGunzip) {
+      try {
+        rawBytes = await gunzipBytes(sourceBytes);
+      } catch (e) {
+        appendLog(`Firmware: décompression du .gz impossible (${e.message}), forme brute non préparée`);
+      }
+    } else {
+      appendLog("Firmware: DecompressionStream indisponible, forme brute non préparée");
     }
-    appendLog("Firmware: gzip sans gain, envoi du bin brut");
+    return {
+      sourceFormat: "bin.gz",
+      originalSize: sourceBytes.length,
+      extractedSize: rawBytes ? rawBytes.length : null,
+      rawBytes,
+      gzBytes: sourceBytes,
+    };
   }
 
   return {
-    firmware: sourceBytes,
-    sourceFormat: isGzip ? "bin.gz" : "bin",
-    uploadFormat: isGzip ? "bin.gz" : "bin",
+    sourceFormat: "bin",
     originalSize: sourceBytes.length,
     extractedSize: sourceBytes.length,
-    uploadSize: sourceBytes.length,
+    rawBytes: sourceBytes,
+    gzBytes: await buildGzCandidate(sourceBytes),
   };
 }
 
@@ -2407,8 +2488,7 @@ async function runBinaryOta(params) {
   const {
     targetHex,
     targetFullKeyHex,
-    firmware,
-    firmwareMd5,
+    firmwareVariants,
     chunkSizeInput,
     ackEveryInput,
     noAckGapMs,
@@ -2416,6 +2496,8 @@ async function runBinaryOta(params) {
     statusTimeoutMs,
     radioProfile,
   } = params;
+  let firmware = params.firmware;
+  let firmwareMd5 = params.firmwareMd5;
 
   if (chunkSizeInput < 16 || chunkSizeInput > OTA_BINARY_MAX_CHUNK) {
     throw new Error(`chunk_size doit être entre 16 et ${OTA_BINARY_MAX_CHUNK} en mode binaire`);
@@ -2430,7 +2512,7 @@ async function runBinaryOta(params) {
     throw new Error("md5 firmware invalide");
   }
 
-  const fwSize = firmware.length;
+  let fwSize = firmware.length;
   let chunkSize = Math.min(chunkSizeInput, OTA_BINARY_MAX_CHUNK);
   // En binaire, le firmware supprime tous les ACK d'écriture : la cadence des
   // checkpoints STATUS est purement côté client, donc adaptable en cours de
@@ -2443,7 +2525,20 @@ async function runBinaryOta(params) {
   let ackEvery = Math.max(ACK_EVERY_MIN, ackEveryInput);
   let ackEveryCeiling = ACK_EVERY_MAX;
   let cleanCheckpoints = 0;
-  const totalChunks = Math.ceil(fwSize / chunkSize);
+  let totalChunks = Math.ceil(fwSize / chunkSize);
+
+  // Bascule sur la forme (gzip ou brute) que la cible sait consommer, connue
+  // après la réponse START ('gz=') ou déduite de la taille en reprise.
+  const applyFirmwareVariant = (variant, why) => {
+    if (!variant) return;
+    if (firmware !== variant.bytes) {
+      firmware = variant.bytes;
+      firmwareMd5 = variant.md5;
+      fwSize = firmware.length;
+      totalChunks = Math.ceil(fwSize / chunkSize);
+    }
+    appendLog(`Firmware retenu: ${variant.format} ${fwSize} bytes (md5=${firmwareMd5}) [${why}]`);
+  };
 
   appendLog(`Transport: binary req`);
   appendLog(`Firmware: ${fwSize} bytes (md5=${firmwareMd5})`);
@@ -2488,18 +2583,95 @@ async function runBinaryOta(params) {
   let writeRttMaxMs = 0;
   let checkpointSumMs = 0;
   let checkpointCount = 0;
+  let feedGapSleepMs = 0;
+  let repairedChunks = 0;
+  let repairedBytes = 0;
+  let repairSendFailures = 0;
+  let classicReplayChunks = 0;
+  let classicReplayBytes = 0;
+  let resyncEvents = 0;
+  let selectiveNackCapability = null;
   otaBusyStats.events = 0;
   otaBusyStats.sleepMs = 0;
+
+  // Réémission ciblée des trous annoncés par la cible via 'miss=' (NACK
+  // sélectif) : envois no-reply comme le flux principal, la confirmation
+  // passe par le STATUS suivant. Backpressure code=3 gérée comme dans la
+  // boucle principale.
+  const resendMissingRanges = async (missing) => {
+    for (const range of missing) {
+      let missOff = range.off;
+      let left = range.len;
+      const rangeChunks = Math.ceil(range.len / chunkSize);
+      appendLog(
+        `NACK: renvoi ${range.off}..${range.off + range.len - 1} `
+        + `(${range.len} octets, ${rangeChunks} chunk(s))`
+      );
+      while (left > 0 && !otaCancelRequested) {
+        const n = Math.min(chunkSize, left);
+        const payload = concatBytes(
+          u32ToBytesLE(missOff),
+          Uint8Array.of(n & 0xff),
+          firmware.subarray(missOff, missOff + n)
+        );
+        const busyDeadlineMs = performance.now() + Math.max(8000, (Number(checkpointTimeoutMs) || 1500) * 4);
+        let busyWaits = 0;
+        for (;;) {
+          chunkWriteAttempts += 1;
+          const res = await client.sendOtaBinaryCmd(
+            targetFullKeyHex,
+            OTA_BIN_OP.WRITE,
+            payload,
+            false,
+            250,
+            100
+          );
+          if (!res.error) {
+            repairedChunks += 1;
+            repairedBytes += n;
+            break;
+          }
+          const isLocalBusy = String(res.error || "").includes("code=3");
+          if (isLocalBusy && performance.now() < busyDeadlineMs) {
+            busyWaits += 1;
+            const busySleep = otaBusyRetryDelay(noAckGapMs, busyWaits);
+            otaBusyStats.events += 1;
+            otaBusyStats.sleepMs += busySleep;
+            await sleep(busySleep);
+            continue;
+          }
+          chunkWriteFailures += 1;
+          repairSendFailures += 1;
+          appendLog(`NACK: échec du renvoi à ${missOff} (${n} octets): ${res.error}`);
+          break; // perte locale non-busy : le STATUS suivant re-listera ce trou
+        }
+        missOff += n;
+        left -= n;
+        if (noAckGapMs > 0) await sleep(noAckGapMs);
+      }
+    }
+    return !otaCancelRequested;
+  };
 
   // Détection de stagnation : si les checkpoints resynchronisent en boucle sans
   // que le serveur avance (lien asymétrique), on abandonne au lieu de tourner
   // indéfiniment.
   let lastResyncOffset = -1;
   let resyncStalls = 0;
-  const noteResync = (newOffset) => {
+  const noteResync = (localOffset, newOffset, source, statusReply = "") => {
+    const replayBytes = Math.max(0, localOffset - newOffset);
+    const replayChunks = estimateRejectedChunks(localOffset, newOffset, chunkSize);
+    resyncEvents += 1;
+    classicReplayBytes += replayBytes;
+    classicReplayChunks += replayChunks;
     resyncStalls = newOffset <= lastResyncOffset ? resyncStalls + 1 : 0;
     lastResyncOffset = newOffset;
-    appendLog(`Resync offset -> ${newOffset}/${fwSize}`);
+    appendLog(
+      `Rejeu classique (${source}): client=${localOffset}, cible=${newOffset}, `
+      + `recul=${replayBytes} octets (~${replayChunks} chunk(s)); `
+      + `cumul=${classicReplayChunks} chunk(s) sur ${resyncEvents} resync`
+    );
+    if (statusReply) appendLog(`Status brut (${source}): ${statusReply}`);
     if (resyncStalls >= 5) {
       throw new Error(`OTA bloquée: resynchronisations répétées sans progression à l'offset ${newOffset}`);
     }
@@ -2530,10 +2702,29 @@ async function runBinaryOta(params) {
       const low = startReply.toLowerCase();
       if (low.includes("already running")) {
         const st = await getOtaStatusBinary(targetFullKeyHex, 2, statusTimeout);
-        if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
+        let resumeVariant = (st.status && st.status.done <= st.status.total)
+          ? matchFirmwareVariantBySize(firmwareVariants, st.status.total)
+          : null;
+        if (!resumeVariant && st.status && st.status.total === fwSize && st.status.done <= fwSize) {
+          resumeVariant = { bytes: firmware, md5: firmwareMd5, format: "forme courante" };
+        }
+        if (resumeVariant) {
+          applyFirmwareVariant(resumeVariant, "reprise de session");
           offset = st.status.done;
           chunkIndex = Math.floor(offset / chunkSize);
           resuming = true;
+          const statusBlk = /blk=(\d+)/.exec(String(st.reply || ""));
+          if (statusBlk) {
+            targetFlushBlock = Math.max(1024, Number.parseInt(statusBlk[1], 10) || 4096);
+          }
+          if (st.status.selectiveNack) {
+            selectiveNackCapability = true;
+            ackEveryCeiling = ACK_EVERY_MAX;
+            appendLog(
+              `NACK sélectif: session reprise, checkpoints limités aux frontières `
+              + `de ${targetFlushBlock} octets.`
+            );
+          }
           appendLog(`Reprise de session OTA à l'offset ${offset}/${fwSize}`);
         } else {
           appendLog(
@@ -2582,6 +2773,16 @@ async function runBinaryOta(params) {
           + `(checkpoint obligatoire ~tous les ${Math.floor(targetFlushBlock / chunkSize)} chunks)`
         );
       }
+
+      if (/\bnack=miss\b/.test(startReply)) {
+        selectiveNackCapability = true;
+        ackEveryCeiling = ACK_EVERY_MAX;
+        cleanCheckpoints = 0;
+        appendLog(
+          `NACK sélectif: support annoncé dès START; checkpoints limités aux frontières `
+          + `de ${targetFlushBlock} octets.`
+        );
+      }
     }
 
     if (startRes.routeFlood !== undefined) {
@@ -2590,6 +2791,13 @@ async function runBinaryOta(params) {
           ? "FLOOD (chemin direct inconnu — les réponses de la cible gardent le délai standard de 300ms !)"
           : "directe"}`
       );
+    }
+
+    if (!resuming) {
+      const chosen = chooseFirmwareVariant(startReply, firmwareVariants);
+      if (chosen) {
+        applyFirmwareVariant(chosen, targetSupportsGzip(startReply) ? "cible avec décompression" : "cible gz=0, bin brut");
+      }
     }
 
     // En reprise, le BEGIN a déjà été accepté par la session en cours : le
@@ -2627,6 +2835,31 @@ async function runBinaryOta(params) {
       }
     }
 
+    // Pacing adaptatif de l'alimentation, par recherche de la frontière code=3.
+    //
+    // La file TX du companion se draine à un débit fixe (~48 ms/paquet, mécanique
+    // interne invariante). Le plancher (airtime pur) ne s'atteint QUE si la file
+    // n'est jamais vide — donc si le client alimente au moins aussi vite que le
+    // drain, ce qui implique de toucher code=3 de temps en temps. code=3 n'est
+    // PAS l'ennemi : un companion inactif l'est (airtime perdu, jamais rattrapé).
+    //
+    // La courbe est asymétrique : sous le drain, la file reste pleine et code=3
+    // cadence (léger surcoût de RTT ratés) ; AU-DESSUS du drain, la file se vide
+    // et l'idle explose (falaise). Comme code=3 tombe à zéro *à la fois* au drain
+    // exact et au-dessus, on ne peut pas distinguer les deux — on vise donc juste
+    // EN DESSOUS : toute fenêtre sans aucun code=3 = risque d'idle -> on raccourcit
+    // le gap ; une fenêtre trop congestionnée -> on l'allonge ; entre les deux, on
+    // tient. Converge juste sous le débit de drain, quel que soit le preset.
+    //
+    // (Le NACK sélectif a supprimé les checkpoints fréquents qui servaient de
+    // purge implicite de la file, d'où ce pacing explicite.)
+    const GAP_MIN_MS = 4;
+    const GAP_MAX_MS = 120;
+    const PACE_WINDOW = 24;
+    let dynamicGapMs = noAckGapMs;
+    let paceWindowCount = 0;
+    let paceWindowCongested = 0;
+
     while (offset < fwSize) {
       if (otaCancelRequested) {
         // Abort confirmé (avec retry et fallback texte) : un ABORT perdu
@@ -2636,12 +2869,19 @@ async function runBinaryOta(params) {
         throw new Error("OTA annulée.");
       }
 
-      const chunkLen = Math.min(chunkSize, fwSize - offset);
+      // Never straddle a staging boundary. If the preceding block has a hole,
+      // the target cannot flush it yet and would otherwise have to discard the
+      // tail of this chunk in the following block, causing a small classic
+      // rewind even after a successful selective repair.
+      const bytesToFlushBoundary = targetFlushBlock - (offset % targetFlushBlock);
+      const chunkLen = Math.min(chunkSize, fwSize - offset, bytesToFlushBoundary);
       const chunk = firmware.subarray(offset, offset + chunkLen);
       const isLastChunk = offset + chunkLen >= fwSize;
       const crossesFlushBoundary =
         Math.floor((offset + chunkLen) / targetFlushBlock) !== Math.floor(offset / targetFlushBlock);
-      const checkpointDue = crossesFlushBoundary || (chunksSinceAck + 1 >= ackEvery) || isLastChunk;
+      const checkpointDue = crossesFlushBoundary
+        || (selectiveNackCapability !== true && chunksSinceAck + 1 >= ackEvery)
+        || isLastChunk;
       const writePayload = concatBytes(
         u32ToBytesLE(offset),
         Uint8Array.of(chunkLen & 0xff),
@@ -2653,7 +2893,18 @@ async function runBinaryOta(params) {
       let writeOk = false;
       let failure = "write failed";
 
-      for (let attempt = 1; attempt <= writeMaxRetries; attempt += 1) {
+      // ERR_CODE_TABLE_FULL (code=3) : la file TX du companion est pleine —
+      // contrôle de flux purement local, elle se draine à ~48 ms/paquet émis.
+      // Ces attentes ne consomment PAS de tentative radio : elles sont bornées
+      // par une échéance murale, sinon un lot long (ack adaptatif élevé) fait
+      // échouer le transfert alors que ni la radio ni la cible ne sont en
+      // cause (vu sur le terrain : abort à ack=48 avec cible parfaitement en
+      // phase).
+      const busyDeadlineMs = writeStartMs + Math.max(8000, (Number(checkpointTimeoutMs) || 1500) * 4);
+      let busyWaits = 0;
+      let attempt = 0;
+
+      while (!otaCancelRequested) {
         chunkWriteAttempts += 1;
         const attemptStartMs = performance.now();
         const writeRes = await client.sendOtaBinaryCmd(
@@ -2673,30 +2924,29 @@ async function runBinaryOta(params) {
           break;
         }
 
-        chunkWriteFailures += 1;
         failure = writeRes.error || failure;
-        updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
 
-        // ERR_CODE_TABLE_FULL (code=3) : la file TX du companion est pleine —
-        // condition purement locale. Un aller-retour STATUS radio ne servirait
-        // à rien : on laisse la radio drainer puis on retente directement.
-        // Le STATUS ne part que si l'erreur persiste au dernier essai.
         const isLocalBusy = String(writeRes.error || "").includes("code=3");
-        if (isLocalBusy && attempt < writeMaxRetries) {
-          const busySleep = Math.max(40, noAckGapMs * 2) * attempt;
+        if (isLocalBusy && performance.now() < busyDeadlineMs) {
+          busyWaits += 1;
+          const busySleep = otaBusyRetryDelay(noAckGapMs, busyWaits);
           otaBusyStats.events += 1;
           otaBusyStats.sleepMs += busySleep;
           await sleep(busySleep);
           continue;
         }
 
+        chunkWriteFailures += 1;
+        updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
+
+        attempt += 1;
         const st = await getOtaStatusBinary(targetFullKeyHex, 1, quickStatusTimeout);
         if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
           const srvOffset = st.status.done;
           if (srvOffset !== offset) {
             if (srvOffset < offset) {
               chunkServerRejects += estimateRejectedChunks(offset, srvOffset, chunkSize);
-              noteResync(srvOffset);
+              noteResync(offset, srvOffset, "échec write", st.reply);
             } else {
               appendLog(`Serveur en avance (${srvOffset}/${fwSize}), rattrapage sans pénalité`);
             }
@@ -2706,6 +2956,9 @@ async function runBinaryOta(params) {
             writeOk = true;
             break;
           }
+          // Serveur en phase à notre offset : le chunk n'est jamais parti
+          // (busy prolongé) ou s'est perdu en l'air — rejouable tel quel.
+          // Le RTT du STATUS (~850 ms) a en plus laissé la file se drainer.
         }
 
         if (attempt < writeMaxRetries) {
@@ -2717,9 +2970,15 @@ async function runBinaryOta(params) {
         if (!st.error && st.reply) {
           failure = `${failure}; status=${st.reply}`;
         }
+        break;
       }
 
       if (!writeOk) {
+        if (otaCancelRequested) {
+          await abortTargetOtaSession(targetHex, targetFullKeyHex, "annulation");
+          shouldCleanupTargetOta = false;
+          throw new Error("OTA annulée.");
+        }
         throw new Error(`OTA write failed (binary) at offset ${offset}: ${failure}`);
       }
 
@@ -2727,12 +2986,31 @@ async function runBinaryOta(params) {
         offset += chunkLen;
         chunkIndex += 1;
         chunksSinceAck += 1;
-        if (!checkpointDue && noAckGapMs > 0) {
-          // Le round-trip série (attente du msg_sent) fait déjà partie de
-          // l'espacement entre chunks : on ne dort que le reliquat du gap au
-          // lieu de l'additionner (~20 ms/chunk économisés).
-          const gapLeft = noAckGapMs - (performance.now() - writeStartMs);
-          if (gapLeft > 0) await sleep(gapLeft);
+
+        // Recherche de la frontière code=3 sur une fenêtre glissante. Zéro
+        // congestion sur toute la fenêtre = on est au drain ou au-dessus (idle
+        // possible) -> on raccourcit ; congestion majoritaire = on sature trop
+        // -> on allonge ; entre les deux = point de fonctionnement, on tient.
+        if (busyWaits > 0) paceWindowCongested += 1;
+        if (++paceWindowCount >= PACE_WINDOW) {
+          if (paceWindowCongested === 0) {
+            dynamicGapMs = Math.max(GAP_MIN_MS, dynamicGapMs - 4);
+          } else if (paceWindowCongested >= PACE_WINDOW * 0.5) {
+            dynamicGapMs = Math.min(GAP_MAX_MS, dynamicGapMs + 3);
+          }
+          paceWindowCount = 0;
+          paceWindowCongested = 0;
+        }
+
+        if (!checkpointDue && dynamicGapMs > 0) {
+          // Le round-trip série (attente du msg_sent) et les attentes code=3
+          // font déjà partie de l'intervalle : on ne dort que le reliquat, pas
+          // en plus. Un chunk qui a busy-waité au-delà du gap ne dort donc pas.
+          const gapLeft = dynamicGapMs - (performance.now() - writeStartMs);
+          if (gapLeft > 0) {
+            feedGapSleepMs += gapLeft;
+            await sleep(gapLeft);
+          }
         }
       } else {
         continue;
@@ -2750,7 +3028,43 @@ async function runBinaryOta(params) {
             Math.max(1500, checkpointTimeoutMs, statusTimeout)
           );
           if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
-            const srvDone = st.status.done;
+            let srvDone = st.status.done;
+
+            if (selectiveNackCapability === null) {
+              selectiveNackCapability = st.status.selectiveNack;
+              appendLog(selectiveNackCapability
+                ? "NACK sélectif: support annoncé par la cible (nack=miss)."
+                : "NACK sélectif: non annoncé par la cible; les pertes utiliseront le rejeu classique.");
+            }
+
+            // NACK sélectif : la cible a gardé les chunks arrivés après le(s)
+            // trou(s) et nous liste les octets manquants — on ne réémet que
+            // ça. Si la liste est vide ou absente (cible ancienne), on
+            // retombe sur le rembobinage classique à 'done' ci-dessous.
+            let missing = (st.status.missing || [])
+              .filter((r) => r.off >= 0 && r.len > 0 && r.off + r.len <= fwSize);
+            let repairRounds = 0;
+            while (missing.length > 0 && repairRounds < 6 && !otaCancelRequested) {
+              repairRounds += 1;
+              const holeBytes = missing.reduce((a, r) => a + r.len, 0);
+              appendLog(
+                `Réparation ciblée: ${missing.length} trou(s), ${holeBytes} octets `
+                + `(round ${repairRounds}, done ${srvDone}/${fwSize}) | status=${st.reply}`
+              );
+              await resendMissingRanges(missing);
+              const st2 = await getOtaStatusBinary(targetFullKeyHex, 1, quickStatusTimeout);
+              if (!(st2.status && st2.status.total === fwSize && st2.status.done <= fwSize)) {
+                break;
+              }
+              const newMissing = (st2.status.missing || [])
+                .filter((r) => r.off >= 0 && r.len > 0 && r.off + r.len <= fwSize);
+              const newHoleBytes = newMissing.reduce((a, r) => a + r.len, 0);
+              const progressed = st2.status.done > srvDone || newHoleBytes < holeBytes;
+              srvDone = st2.status.done;
+              missing = newMissing;
+              if (!progressed) break;  // le rembobinage classique prendra le relais
+            }
+
             // behind = des chunks ont réellement été perdus en l'air.
             // ahead  = le serveur avait déjà reçu ce qu'on croyait perdu (course
             //          entre chunks en vol et resync arrière) : c'est du progrès,
@@ -2759,7 +3073,7 @@ async function runBinaryOta(params) {
             const ahead = srvDone > offset;
             if (behind) {
               chunkServerRejects += estimateRejectedChunks(offset, srvDone, chunkSize);
-              noteResync(srvDone);
+              noteResync(offset, srvDone, "checkpoint", st.reply);
             } else if (ahead) {
               appendLog(`Serveur en avance (${srvDone}/${fwSize}), rattrapage sans pénalité`);
             }
@@ -2774,26 +3088,28 @@ async function runBinaryOta(params) {
             // checkpoints propres consécutifs au plafond. Une perte RF sporadique
             // ne condamne donc plus la session (l'ancien plafond irréversible
             // faisait s'effondrer ack jusqu'à 1).
-            if (behind) {
-              cleanCheckpoints = 0;
-              if (ackEvery > ACK_EVERY_MIN) {
-                ackEvery = Math.max(ACK_EVERY_MIN, Math.floor(ackEvery / 2));
-                ackEveryCeiling = Math.max(ACK_EVERY_MIN, Math.min(ackEveryCeiling, ackEvery * 2));
-                appendLog(`Ack adaptatif: réduit à ${ackEvery} (pertes, plafond ${ackEveryCeiling})`);
-              }
-            } else {
-              cleanCheckpoints += 1;
-              if (ackEvery < ackEveryCeiling) {
-                if (cleanCheckpoints >= 3) {
+            if (selectiveNackCapability !== true) {
+              if (behind) {
+                cleanCheckpoints = 0;
+                if (ackEvery > ACK_EVERY_MIN) {
+                  ackEvery = Math.max(ACK_EVERY_MIN, Math.floor(ackEvery / 2));
+                  ackEveryCeiling = Math.max(ACK_EVERY_MIN, Math.min(ackEveryCeiling, ackEvery * 2));
+                  appendLog(`Ack adaptatif: réduit à ${ackEvery} (pertes, plafond ${ackEveryCeiling})`);
+                }
+              } else {
+                cleanCheckpoints += 1;
+                if (ackEvery < ackEveryCeiling) {
+                  if (cleanCheckpoints >= 3) {
+                    ackEvery = Math.min(ackEveryCeiling, ackEvery * 2);
+                    cleanCheckpoints = 0;
+                    appendLog(`Ack adaptatif: augmenté à ${ackEvery} (lien propre)`);
+                  }
+                } else if (ackEveryCeiling < ACK_EVERY_MAX && cleanCheckpoints >= 5) {
+                  ackEveryCeiling = Math.min(ACK_EVERY_MAX, ackEveryCeiling * 2);
                   ackEvery = Math.min(ackEveryCeiling, ackEvery * 2);
                   cleanCheckpoints = 0;
-                  appendLog(`Ack adaptatif: augmenté à ${ackEvery} (lien propre)`);
+                  appendLog(`Ack adaptatif: plafond relevé à ${ackEveryCeiling}, ack ${ackEvery}`);
                 }
-              } else if (ackEveryCeiling < ACK_EVERY_MAX && cleanCheckpoints >= 5) {
-                ackEveryCeiling = Math.min(ACK_EVERY_MAX, ackEveryCeiling * 2);
-                ackEvery = Math.min(ackEveryCeiling, ackEvery * 2);
-                cleanCheckpoints = 0;
-                appendLog(`Ack adaptatif: plafond relevé à ${ackEveryCeiling}, ack ${ackEvery}`);
               }
             }
             break;
@@ -2853,7 +3169,11 @@ async function runBinaryOta(params) {
         + `(max ${writeRttMaxMs.toFixed(0)}ms, ${writeRttCount} mesures) | `
         + `checkpoints ${checkpointCount} x ${checkpointCount > 0 ? (checkpointSumMs / checkpointCount).toFixed(0) : 0}ms `
         + `(total ${(checkpointSumMs / 1000).toFixed(1)}s) | `
-        + `backpressure code=3: ${otaBusyStats.events} attentes, ${(otaBusyStats.sleepMs / 1000).toFixed(1)}s`
+        + `pacing ${(feedGapSleepMs / 1000).toFixed(1)}s (gap final ${dynamicGapMs}ms) | `
+        + `backpressure code=3: ${otaBusyStats.events} attentes, ${(otaBusyStats.sleepMs / 1000).toFixed(1)}s | `
+        + `NACK ciblé: ${repairedChunks} chunk(s)/${repairedBytes} octets`
+        + `${repairSendFailures ? ` (${repairSendFailures} échec(s))` : ""} | `
+        + `rejeu classique: ${classicReplayChunks} chunk(s)/${classicReplayBytes} octets, ${resyncEvents} resync`
       );
     }
 
@@ -2898,8 +3218,7 @@ async function runBinaryOta(params) {
 async function runTextOta(params) {
   const {
     targetHex,
-    firmware,
-    firmwareMd5,
+    firmwareVariants,
     chunkSizeInput,
     ackEveryInput,
     noAckGapMs,
@@ -2908,6 +3227,8 @@ async function runTextOta(params) {
     ackSettleGapMs,
     radioProfile,
   } = params;
+  let firmware = params.firmware;
+  let firmwareMd5 = params.firmwareMd5;
 
   if (chunkSizeInput < 16 || chunkSizeInput > 80) {
     throw new Error("chunk_size doit être entre 16 et 80 en mode texte");
@@ -2923,23 +3244,39 @@ async function runTextOta(params) {
   }
 
   const targetPrefix = client.normalizeTargetPrefix(targetHex);
-  const fwSize = firmware.length;
+  let fwSize = firmware.length;
   let chunkSize = chunkSizeInput;
   let ackEvery = ackEveryInput;
 
-  const safeChunkLimit = maxOtaChunkForOffset(Math.max(0, fwSize - 1));
-  if (safeChunkLimit < 16) {
-    throw new Error(`transport texte trop limité pour OTA (chunk max sécurisé ${safeChunkLimit})`);
-  }
-  if (chunkSize > safeChunkLimit) {
-    appendLog(`Chunk size ajusté de ${chunkSize} à ${safeChunkLimit} (limite transport texte).`);
-    chunkSize = safeChunkLimit;
-  }
+  const computeSafeChunkLimit = () => {
+    const limit = maxOtaChunkForOffset(Math.max(0, fwSize - 1));
+    if (limit < 16) {
+      throw new Error(`transport texte trop limité pour OTA (chunk max sécurisé ${limit})`);
+    }
+    if (chunkSize > limit) {
+      appendLog(`Chunk size ajusté de ${chunkSize} à ${limit} (limite transport texte).`);
+      chunkSize = limit;
+    }
+  };
+  computeSafeChunkLimit();
 
-  const totalChunks = estimateOtaChunkCount(fwSize, chunkSize);
+  let totalChunks = estimateOtaChunkCount(fwSize, chunkSize);
   if (totalChunks <= 0) {
     throw new Error("impossible de calculer le plan de chunks");
   }
+
+  // Voir runBinaryOta : la forme (gzip ou brute) est choisie après la sonde.
+  const applyFirmwareVariant = (variant, why) => {
+    if (!variant) return;
+    if (firmware !== variant.bytes) {
+      firmware = variant.bytes;
+      firmwareMd5 = variant.md5;
+      fwSize = firmware.length;
+      computeSafeChunkLimit();
+      totalChunks = estimateOtaChunkCount(fwSize, chunkSize);
+    }
+    appendLog(`Firmware retenu: ${variant.format} ${fwSize} bytes (md5=${firmwareMd5}) [${why}]`);
+  };
 
   appendLog(`OTA target prefix: ${targetPrefix}`);
   appendLog(`Firmware: ${fwSize} bytes (md5=${firmwareMd5})`);
@@ -2993,7 +3330,14 @@ async function runTextOta(params) {
     if (!isOkOtaReply(startReply)) {
       if (startReply.toLowerCase().includes("already running")) {
         const st = await getOtaStatus(targetHex, statusTimeoutSec);
-        if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
+        let resumeVariant = (st.status && st.status.done <= st.status.total)
+          ? matchFirmwareVariantBySize(firmwareVariants, st.status.total)
+          : null;
+        if (!resumeVariant && st.status && st.status.total === fwSize && st.status.done <= fwSize) {
+          resumeVariant = { bytes: firmware, md5: firmwareMd5, format: "forme courante" };
+        }
+        if (resumeVariant) {
+          applyFirmwareVariant(resumeVariant, "reprise de session");
           offset = st.status.done;
           chunkIndex = estimateOtaChunkIndex(offset, chunkSize);
           resuming = true;
@@ -3025,6 +3369,13 @@ async function runTextOta(params) {
     }
 
     shouldCleanupTargetOta = true;
+
+    if (!resuming) {
+      const chosen = chooseFirmwareVariant(startReply, firmwareVariants);
+      if (chosen) {
+        applyFirmwareVariant(chosen, targetSupportsGzip(startReply) ? "cible avec décompression" : "cible gz=0, bin brut");
+      }
+    }
 
     // En reprise, la session a déjà accepté son BEGIN : le renvoyer ferait
     // échouer l'OTA ("already running"), y compris à offset 0.
@@ -3080,7 +3431,24 @@ async function runTextOta(params) {
 
       if (!checkpointDue) {
         chunkWriteAttempts += 1;
-        const sendErr = await client.sendRepeaterCmdNoReply(targetHex, chunkCmd);
+        let sendErr = await client.sendRepeaterCmdNoReply(targetHex, chunkCmd);
+        // code=3 : file TX du companion pleine — backpressure locale, on
+        // laisse drainer (~48 ms/paquet) et on resoumet le même chunk, borné
+        // par une échéance murale. Voir le même traitement en binaire.
+        if (sendErr && String(sendErr).includes("code=3")) {
+          const busyDeadlineMs = performance.now() + Math.max(8000, (Number(checkpointTimeoutMs) || 1500) * 4);
+          let busyWaits = 0;
+          while (sendErr && String(sendErr).includes("code=3")
+                 && performance.now() < busyDeadlineMs && !otaCancelRequested) {
+            busyWaits += 1;
+            const busySleep = otaBusyRetryDelay(noAckGapMs, busyWaits);
+            otaBusyStats.events += 1;
+            otaBusyStats.sleepMs += busySleep;
+            await sleep(busySleep);
+            chunkWriteAttempts += 1;
+            sendErr = await client.sendRepeaterCmdNoReply(targetHex, chunkCmd);
+          }
+        }
         if (sendErr) {
           chunkWriteFailures += 1;
           updateLiveMetrics("text_cmd", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
@@ -3503,6 +3871,26 @@ async function restoreLocalRadioPresetAfterOta(previousPreset) {
   appendLog("Preset radio client restauré.");
 }
 
+async function restoreTargetRadioPresetAfterFailedOta(targetHex, previousPreset) {
+  if (!targetHex || !previousPreset) return;
+  const cmd = `tempradio ${formatRadioValue(previousPreset.freq)},${formatRadioValue(previousPreset.bw)},`
+    + `${previousPreset.sf},${previousPreset.cr},1`;
+  appendLog("Échec OTA: restauration du preset radio de la cible avant celle du client…");
+  const sentEvt = await client.sendMeshCmd(targetHex, cmd, true);
+  if (!sentEvt || sentEvt.type === "error") {
+    const code = sentEvt?.payload?.error_code;
+    throw new Error(`commande cible non envoyée${code !== undefined ? ` (code=${code})` : ""}`);
+  }
+  const suggested = Number(sentEvt.payload?.suggested_timeout || 0);
+  const dispatchGuardMs = clamp(
+    (Number.isFinite(suggested) && suggested > 0 ? Math.round(suggested + 2200) : 3000),
+    2200,
+    5000
+  );
+  await sleep(dispatchGuardMs);
+  appendLog("Preset radio cible restauré après échec OTA.");
+}
+
 function attachClientDebugHooks(c) {
   c.onEvent = (type, payload) => {
     if (type === "contact_msg_recv" && payload?.txt_type === 1) {
@@ -3753,24 +4141,37 @@ ui.startOtaBtn.addEventListener("click", async () => {
   }
   appendLog(`Lancer OTA: préparation du fichier ${file.name}.`);
 
-  let firmware;
   let firmwareInfo;
-  try {
-    firmwareInfo = await getFirmwareBytes(file);
-    firmware = firmwareInfo.firmware;
-    appendLog(`Lancer OTA: payload prêt (${formatByteCount(firmware.length)}, ${firmwareInfo.uploadFormat}).`);
-  } catch (e) {
-    appendLog(`Lecture firmware échouée: ${e.message}`);
-    return;
-  }
-
+  let firmwareVariants;
+  let firmware;
   let firmwareMd5;
   try {
-    appendLog("Lancer OTA: calcul MD5...");
-    firmwareMd5 = md5Hex(firmware);
-    appendLog("Lancer OTA: MD5 calculé.");
+    firmwareInfo = await getFirmwareBytes(file);
+    appendLog("Lancer OTA: calcul MD5 des formes disponibles...");
+    firmwareVariants = {
+      raw: firmwareInfo.rawBytes
+        ? { bytes: firmwareInfo.rawBytes, md5: md5Hex(firmwareInfo.rawBytes), format: "bin" }
+        : null,
+      gz: firmwareInfo.gzBytes
+        ? { bytes: firmwareInfo.gzBytes, md5: md5Hex(firmwareInfo.gzBytes), format: "bin.gz" }
+        : null,
+    };
+    // Forme par défaut (métriques initiales) : gzip si disponible, comme les
+    // cibles historiques ; le choix définitif se fait sur la réponse START.
+    const preferred = firmwareVariants.gz || firmwareVariants.raw;
+    if (!preferred) {
+      throw new Error("aucune forme de firmware exploitable");
+    }
+    firmware = preferred.bytes;
+    firmwareMd5 = preferred.md5;
+    appendLog(
+      "Lancer OTA: payload prêt ("
+      + (firmwareVariants.raw ? `bin ${formatByteCount(firmwareVariants.raw.bytes.length)}` : "bin indisponible")
+      + (firmwareVariants.gz ? `, bin.gz ${formatByteCount(firmwareVariants.gz.bytes.length)}` : ", gzip indisponible")
+      + ") — choix final après sonde de la cible."
+    );
   } catch (e) {
-    appendLog(`Calcul MD5 échoué: ${e.message}`);
+    appendLog(`Préparation firmware échouée: ${e.message}`);
     return;
   }
 
@@ -3785,12 +4186,14 @@ ui.startOtaBtn.addEventListener("click", async () => {
 
   let restoreClientPreset = null;
   let restoreTuningParams = null;
+  let activeTargetHex = "";
 
   try {
     const selectedTargetHex = getSelectedTargetHex();
     if (selectedTargetHex.length < 12) {
       throw new Error("Sélectionne un répéteur cible ou renseigne une pubkey manuelle (>=12 hex).");
     }
+    activeTargetHex = selectedTargetHex;
 
     const autoSettings = ui.autoTune?.checked ? recalcAutoFromCurrentSelection("ota-start") : null;
     const manualChunk = Number.parseInt(ui.chunkSize.value, 10) || 64;
@@ -3803,6 +4206,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
       targetHex: selectedTargetHex,
       firmware,
       firmwareMd5,
+      firmwareVariants,
       chunkSizeInput: autoSettings ? autoSettings.chunkSize : manualChunk,
       ackEveryInput: autoSettings ? autoSettings.ackEvery : manualAck,
       noAckGapMs: autoSettings ? autoSettings.noAckGapMs : manualNoAckGap,
@@ -3816,13 +4220,12 @@ ui.startOtaBtn.addEventListener("click", async () => {
     if (firmwareInfo?.sourceFormat === "uf2") {
       appendLog(
         `Firmware: ${file.name} (${formatByteCount(firmwareInfo.originalSize)}) `
-        + `-> bin ${formatByteCount(firmwareInfo.extractedSize)} `
-        + `-> ${firmwareInfo.uploadFormat} ${formatByteCount(firmwareInfo.uploadSize)}`
+        + `-> bin ${formatByteCount(firmwareInfo.extractedSize)}`
+        + (firmwareVariants.gz ? ` (+ forme gzip ${formatByteCount(firmwareVariants.gz.bytes.length)})` : "")
       );
     } else {
-      appendLog(`Firmware: ${file.name} (${firmware.length} bytes, ${firmwareInfo?.uploadFormat || "bin"})`);
+      appendLog(`Firmware: ${file.name} (source ${firmwareInfo?.sourceFormat || "bin"} ${formatByteCount(firmwareInfo?.originalSize || firmware.length)})`);
     }
-    appendLog(`MD5: ${firmwareMd5}`);
     updatePlanLine(true);
 
     const password = String(ui.targetPassword.value || "").trim();
@@ -3939,6 +4342,16 @@ ui.startOtaBtn.addEventListener("click", async () => {
     ui.metricsLine.textContent = `Erreur: ${e.message}`;
   } finally {
     ui.progressBar.classList.remove("indeterminate");
+    if (restoreClientPreset && !otaCompleted && activeTargetHex) {
+      try {
+        await restoreTargetRadioPresetAfterFailedOta(activeTargetHex, restoreClientPreset);
+      } catch (targetRestoreErr) {
+        appendLog(
+          `Warning: restauration preset cible échouée (${targetRestoreErr.message}); `
+          + "elle reviendra automatiquement à son preset permanent à l'expiration du tempradio."
+        );
+      }
+    }
     if (restoreTuningParams) {
       try {
         const r = await client.setTuningParams(restoreTuningParams.rx_delay_base, restoreTuningParams.airtime_factor);
