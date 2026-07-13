@@ -799,6 +799,9 @@ class MeshCoreSerialClient {
     this.bleTxCharacteristic = null;
     this.bleNotificationHandler = null;
     this.bleDisconnectHandler = null;
+    this.ws = null;
+    this._tcpResolve = null;
+    this._tcpReject = null;
     this.transport = null;
     this.connected = false;
     this.rxPending = [];
@@ -1021,6 +1024,66 @@ class MeshCoreSerialClient {
     this.rxPending = [];
   }
 
+  // TCP companion (WiFi) via a local WebSocket<->TCP bridge.
+  // The companion speaks the exact same framing as the serial interface
+  // ('>'/'<' + LE16 length), so on-wire this transport behaves like serial:
+  // the bridge is a dumb byte pipe and we reuse parseFrames() untouched.
+  async connectTcp(companionHost, companionPort) {
+    if (!companionHost) throw new Error("adresse companion manquante");
+    const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+    const url = `${scheme}${location.host}/tcp`
+      + `?host=${encodeURIComponent(companionHost)}`
+      + `&port=${encodeURIComponent(companionPort)}`;
+    this.log(`Connexion au pont TCP: ${url}`);
+
+    const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    this.ws = ws;
+    this.rxPending = [];
+
+    const ready = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("timeout de connexion au pont")), 8000);
+      this._tcpResolve = () => { clearTimeout(timer); resolve(); };
+      this._tcpReject = (msg) => { clearTimeout(timer); reject(new Error(msg)); };
+    });
+    const settleReady = () => { this._tcpResolve?.(); this._tcpResolve = null; this._tcpReject = null; };
+    const settleFail = (msg) => { this._tcpReject?.(msg); this._tcpResolve = null; this._tcpReject = null; };
+
+    ws.addEventListener("message", (ev) => {
+      if (typeof ev.data === "string") {
+        // Control channel from the bridge: "ready" once the TCP dial to the
+        // companion succeeds, or "error <msg>" if it fails.
+        if (ev.data.startsWith("ready")) settleReady();
+        else if (ev.data.startsWith("error")) settleFail(ev.data.slice(6).trim() || "erreur pont");
+        return;
+      }
+      // Any binary frame implies the tunnel is live.
+      if (this._tcpResolve) settleReady();
+      this.handleTcpChunk(ev.data);
+    });
+    ws.addEventListener("error", () => {
+      if (this._tcpReject) settleFail("connexion au pont échouée");
+    });
+    ws.addEventListener("close", (ev) => {
+      if (this._tcpReject) { settleFail(ev.reason || "pont fermé avant établissement"); return; }
+      if (!this.connected) return;
+      this.log("Connexion TCP interrompue.");
+      this.disconnect();
+    });
+
+    await ready;
+
+    this.transport = "web_tcp";
+    this.connected = true;
+  }
+
+  handleTcpChunk(arrayBuffer) {
+    const chunk = new Uint8Array(arrayBuffer);
+    if (chunk.length === 0) return;
+    this.pushRxChunk(chunk);
+    this.parseFrames();
+  }
+
   async disconnect() {
     const wasConnected = this.connected;
     this.connected = false;
@@ -1093,6 +1156,12 @@ class MeshCoreSerialClient {
       try { this.bleDevice.gatt.disconnect(); } catch {}
     }
     this.bleDevice = null;
+    if (this.ws) {
+      try { this.ws.close(); } catch {}
+      this.ws = null;
+    }
+    this._tcpResolve = null;
+    this._tcpReject = null;
     this.transport = null;
     this.writeChain = Promise.resolve();
   }
@@ -1469,6 +1538,11 @@ class MeshCoreSerialClient {
         }
         offset = end;
       }
+      return;
+    }
+    if (this.ws) {
+      if (this.ws.readyState !== WebSocket.OPEN) throw new Error("pont TCP non ouvert");
+      this.ws.send(bytes);
       return;
     }
     throw new Error("transport écriture indisponible");
@@ -1889,6 +1963,8 @@ const ui = {
   refreshTargetsBtn: document.querySelector("#refreshTargetsBtn"),
   connectionMode: document.querySelector("#connectionMode"),
   baudrate: document.querySelector("#baudrate"),
+  tcpTarget: document.querySelector("#tcpTarget"),
+  tcpTargetField: document.querySelector("#tcpTargetField"),
   targetSelect: document.querySelector("#targetSelect"),
   targetKey: document.querySelector("#targetKey"),
   targetPassword: document.querySelector("#targetPassword"),
@@ -2014,14 +2090,19 @@ function setProgressIndeterminate() {
 function getTransportLabel(transport) {
   if (transport === "web_usb") return "WebUSB";
   if (transport === "web_ble") return "Web Bluetooth";
+  if (transport === "web_tcp") return "TCP (pont)";
   return "Web Serial";
 }
 
 function updateConnectionModeUi() {
   const mode = String(ui.connectionMode?.value || "usb");
   const isBle = mode === "ble";
-  if (ui.baudrate) ui.baudrate.disabled = isBle;
-  if (ui.connectBtn) ui.connectBtn.textContent = isBle ? "Connecter BLE" : "Connecter USB";
+  const isTcp = mode === "tcp";
+  if (ui.baudrate) ui.baudrate.disabled = isBle || isTcp;
+  if (ui.tcpTargetField) ui.tcpTargetField.style.display = isTcp ? "" : "none";
+  if (ui.connectBtn) {
+    ui.connectBtn.textContent = isBle ? "Connecter BLE" : (isTcp ? "Connecter TCP" : "Connecter USB");
+  }
 }
 
 function formatRadioPresetText(presetLike) {
@@ -2130,7 +2211,9 @@ function updateLiveMetrics(transport, doneBytes, totalBytes, startTs, attempts, 
 
 function updateButtons() {
   const connected = Boolean(client && client.connected);
-  const isBle = String(ui.connectionMode?.value || "usb") === "ble";
+  const mode = String(ui.connectionMode?.value || "usb");
+  const isBle = mode === "ble";
+  const isTcp = mode === "tcp";
   ui.connectBtn.disabled = connected || otaRunning;
   ui.disconnectBtn.disabled = !connected || otaRunning;
   ui.startOtaBtn.disabled = !connected || otaRunning;
@@ -2141,7 +2224,8 @@ function updateButtons() {
   if (ui.targetPassword) ui.targetPassword.disabled = otaRunning;
   if (ui.firmwareFile) ui.firmwareFile.disabled = otaRunning;
   if (ui.connectionMode) ui.connectionMode.disabled = otaRunning;
-  if (ui.baudrate) ui.baudrate.disabled = otaRunning || isBle;
+  if (ui.baudrate) ui.baudrate.disabled = otaRunning || isBle || isTcp;
+  if (ui.tcpTarget) ui.tcpTarget.disabled = otaRunning || connected;
   if (ui.rebootBtn) ui.rebootBtn.disabled = otaRunning;
   if (ui.useTempRadio) {
     ui.useTempRadio.disabled = otaRunning;
@@ -3777,7 +3861,8 @@ async function initClientSession(baudrate) {
   if (ui.autoTune?.checked) recalcAutoFromCurrentSelection("connect");
 
   const mode = getTransportLabel(client.transport);
-  const speedSuffix = client.transport === "web_ble" ? "" : ` (${baudrate} bps)`;
+  const usesBaud = client.transport !== "web_ble" && client.transport !== "web_tcp";
+  const speedSuffix = usesBaud ? ` (${baudrate} bps)` : "";
   setConnectionStatus(`Connecté ${mode}${speedSuffix}`, "ok");
 }
 
@@ -3807,6 +3892,43 @@ function applySelfRadioPresetToCache(preset) {
   lastSelfInfo.radio_cr = preset.cr;
 }
 
+// --- Coordination robuste du basculement de preset radio temporaire (OTA) ---
+// L'ancien schéma basculait le companion local sur des sleep fixes en devinant
+// l'instant de bascule de la cible (réception variable + délai firmware de
+// 2000ms, futureMillis(2000) dans MyMesh.cpp). Sur un nœud lointain, tout écart
+// laissait les deux radios sur des presets différents : l'OTA ne démarrait
+// jamais et la cible restait bloquée sur le preset court jusqu'au timeout du
+// tempradio. On attend désormais l'ACK CLI de la cible (émis sur l'ANCIEN
+// preset avant la bascule) puis on sonde la cible EN BOUCLE sur le nouveau
+// preset jusqu'à réponse effective, plutôt que de deviner le timing.
+const TEMP_RADIO_ACK_TIMEOUT_SEC = 6;     // attente bornée de l'ACK "OK - temp params"
+const TEMP_RADIO_SWITCH_SETTLE_MS = 2600; // délai firmware futureMillis(2000) + marge
+const TEMP_RADIO_PROBE_WINDOW_MS = 14000; // fenêtre de sonde par tentative
+const TEMP_RADIO_MAX_ATTEMPTS = 3;        // renvois tempradio avant abandon propre
+
+// Sonde la cible SUR LE PRESET TEMPORAIRE en boucle jusqu'à obtenir une réponse
+// (n'importe laquelle — "OK", "Err - admin required", un statut… — toute
+// réponse prouve la joignabilité, seul but ici) ou l'expiration de la fenêtre.
+// STATUS binaire d'abord (rapide, si la clé complète est résolue), puis repli
+// sur "ota status" texte (cibles sans OTA binaire). Ne modifie aucun état cible.
+async function probeTargetReachableOnTemp(targetHex, probeKey, windowMs) {
+  const tEnd = performance.now() + windowMs;
+  let lastErr = "aucune sonde";
+  while (performance.now() < tEnd) {
+    if (probeKey) {
+      const b = await getOtaStatusBinary(probeKey, 1, 3000);
+      if (!b.error) return { ok: true, via: "binaire", reply: b.reply };
+      lastErr = b.error;
+      if (performance.now() >= tEnd) break;
+    }
+    const t = await client.sendRepeaterCmdAndWaitReply(targetHex, "ota status", 4);
+    if (!t.error) return { ok: true, via: "texte", reply: t.reply };
+    lastErr = t.error;
+    if (performance.now() < tEnd) await sleep(300);
+  }
+  return { ok: false, error: lastErr };
+}
+
 async function applyTempRadioPresetForOta(targetHex, preset) {
   const oldSelfInfo = await syncSelfInfoFromNode(false);
   const previousLocalPreset = extractRadioPresetFromSelfInfo(oldSelfInfo || lastSelfInfo);
@@ -3819,23 +3941,31 @@ async function applyTempRadioPresetForOta(targetHex, preset) {
     `Applying OTA temp preset: target=${formatRadioValue(preset.freq)}MHz/${formatRadioValue(preset.bw)}kHz/SF${preset.sf}/CR${preset.cr} `
     + `(${preset.timeoutMins} min)`
   );
-  const sentEvt = await client.sendMeshCmd(targetHex, cmd, true);
-  if (!sentEvt || sentEvt.type === "error") {
-    const code = sentEvt?.payload?.error_code;
-    throw new Error(`tempradio cible échoué: send error${code !== undefined ? ` (code=${code})` : ""}`);
-  }
-  appendLog("Target tempradio: commande envoyée (pas d'ACK attendu).");
 
-  const suggested = Number(sentEvt.payload?.suggested_timeout || 0);
-  // The firmware delays the actual radio switch by 2000ms (futureMillis(2000) in MyMesh.cpp)
-  // to let the CLI reply be sent back on the old frequency first.
-  // Guard must exceed: airTime(tempradio_packet) + 2000ms firmware delay + margin.
-  const computedGuard = Number.isFinite(suggested) && suggested > 0
-    ? Math.round(suggested + 2200)
-    : 0;
-  const dispatchGuardMs = clamp(computedGuard || 2400, 2200, 4000);
-  appendLog(`Attente ${dispatchGuardMs}ms pour laisser partir la commande tempradio...`);
-  await sleep(dispatchGuardMs);
+  // Attendre la réponse CLI "OK - temp params" de la cible. Le firmware l'émet
+  // sur l'ANCIEN preset AVANT de basculer (délai futureMillis(2000)), donc le
+  // client — encore sur l'ancien preset — la reçoit. Deux bénéfices vs l'ancien
+  // fire-and-forget qui devinait un temps de vol variable :
+  //   1. confirmation POSITIVE que la cible a reçu la commande ;
+  //   2. au retour de cet appel, msg_sent est déjà passé -> le paquet tempradio
+  //      a quitté le companion, donc basculer le local ensuite ne peut plus le
+  //      tronquer (plus besoin de l'ancien guard plafonné à 4s, trop court pour
+  //      un nœud lointain).
+  const ackRes = await client.sendRepeaterCmdAndWaitReply(targetHex, cmd, TEMP_RADIO_ACK_TIMEOUT_SEC);
+  if (!ackRes.error) {
+    appendLog(`Cible a confirmé le tempradio ("${String(ackRes.reply || "").trim() || "réponse reçue"}").`);
+  } else {
+    appendLog(
+      `Pas d'ACK tempradio (${ackRes.error}) — commande possiblement perdue ; `
+      + "bascule locale puis sonde de joignabilité pour trancher."
+    );
+  }
+
+  // Laisser la cible exécuter sa bascule différée (~2000ms après sa réponse)
+  // avant de basculer le local. La sonde en boucle du caller absorbe tout écart
+  // de timing résiduel.
+  appendLog(`Attente ${TEMP_RADIO_SWITCH_SETTLE_MS}ms (bascule différée de la cible)...`);
+  await sleep(TEMP_RADIO_SWITCH_SETTLE_MS);
 
   const localRes = await client.setLocalRadioParams(preset.freq, preset.bw, preset.sf, preset.cr, 0);
   if (!localRes.ok) {
@@ -3843,10 +3973,6 @@ async function applyTempRadioPresetForOta(targetHex, preset) {
   }
   applySelfRadioPresetToCache(preset);
   appendLog("Client radio preset basculé pour OTA.");
-
-  const settleMs = 2400;
-  appendLog(`Attente ${settleMs}ms pour synchroniser le changement radio...`);
-  await sleep(settleMs);
 
   return previousLocalPreset;
 }
@@ -3920,6 +4046,41 @@ async function connectClientViaBle() {
   await c.connectBle(device);
   client = c;
   appendLog(`BLE connecté (${device.name || "MeshCore"}).`);
+}
+
+function parseTcpTarget(raw) {
+  const s = String(raw || "").trim();
+  if (!s) throw new Error("Renseigne l'adresse du companion (host:port)");
+  let host = s;
+  let port = 5000;
+  const v6 = s.match(/^\[([^\]]+)\]:(\d+)$/); // [ipv6]:port
+  if (v6) {
+    host = v6[1];
+    port = Number(v6[2]);
+  } else {
+    const idx = s.lastIndexOf(":");
+    // Only treat the trailing part as a port if there is a single ':'.
+    if (idx > 0 && s.indexOf(":") === idx) {
+      host = s.slice(0, idx);
+      port = Number(s.slice(idx + 1)) || 5000;
+    }
+  }
+  if (!host) throw new Error("hôte companion invalide");
+  if (!(port > 0 && port < 65536)) throw new Error("port companion invalide");
+  return { host, port };
+}
+
+async function connectClientViaTcp() {
+  if (!("WebSocket" in window)) {
+    throw new Error("WebSocket non supporté par ce navigateur");
+  }
+  const { host, port } = parseTcpTarget(ui.tcpTarget?.value);
+  appendLog(`Tentative de connexion TCP via pont local (${host}:${port})...`);
+  const c = new MeshCoreSerialClient(appendLog);
+  attachClientDebugHooks(c);
+  await c.connectTcp(host, port);
+  client = c;
+  appendLog(`Companion TCP connecté (${host}:${port}).`);
 }
 
 async function connectClientWithBestUsbTransport(baudrate) {
@@ -3998,6 +4159,10 @@ async function connectClientSelectedTransport(mode, baudrate) {
     await connectClientViaBle();
     return;
   }
+  if (mode === "tcp") {
+    await connectClientViaTcp();
+    return;
+  }
   await connectClientWithBestUsbTransport(baudrate);
 }
 
@@ -4009,6 +4174,11 @@ ui.connectBtn.addEventListener("click", async () => {
     if (mode === "ble") {
       if (!("bluetooth" in navigator)) {
         appendLog("Web Bluetooth non supporté par ce navigateur.");
+        return;
+      }
+    } else if (mode === "tcp") {
+      if (!("WebSocket" in window)) {
+        appendLog("WebSocket non supporté par ce navigateur.");
         return;
       }
     } else if (!("serial" in navigator) && !("usb" in navigator)) {
@@ -4268,34 +4438,52 @@ ui.startOtaBtn.addEventListener("click", async () => {
 
     if (ui.useTempRadio?.checked) {
       const tempPreset = readTempRadioPresetFromUi();
+      const probeKey = await client.resolveTargetFullKeyForBinary(params.targetHex);
+
+      // Bascule + vérification EN BOUCLE sur le preset temporaire. On ne devine
+      // plus l'instant de bascule de la cible : on la sonde jusqu'à réponse, et
+      // si elle reste muette on rejoue toute la séquence tempradio. Après
+      // épuisement des tentatives on abandonne PROPREMENT (le finally restaure
+      // les presets) au lieu de lancer l'OTA à l'aveugle sur un lien désynchro
+      // et de laisser la cible bloquée sur le preset court jusqu'au timeout.
+      setOtaStatus("Bascule radio de la cible…");
       restoreClientPreset = await applyTempRadioPresetForOta(params.targetHex, tempPreset);
 
-      // Sonde de joignabilité : si la commande tempradio s'est perdue, la cible
-      // est restée sur le preset principal et tout le déroulé échouerait en
-      // cascade (START binaire 8s + fallback texte 8s+) avec un diagnostic
-      // trompeur. Un STATUS court le détecte tout de suite ; on rejoue la
-      // séquence tempradio une fois avant d'abandonner proprement.
-      const probeKey = await client.resolveTargetFullKeyForBinary(params.targetHex);
-      if (probeKey) {
-        setOtaStatus("Vérification de la cible…");
-        let probe = await getOtaStatusBinary(probeKey, 1, 3500);
-        if (probe.error) {
-          appendLog("Cible silencieuse sur le preset temporaire, renvoi de tempradio…");
+      setOtaStatus("Vérification de la cible…");
+      let reached = null;
+      for (let attempt = 1; attempt <= TEMP_RADIO_MAX_ATTEMPTS; attempt += 1) {
+        const probe = await probeTargetReachableOnTemp(
+          params.targetHex,
+          probeKey,
+          TEMP_RADIO_PROBE_WINDOW_MS
+        );
+        if (probe.ok) {
+          appendLog(
+            `Cible joignable sur le preset temporaire (tentative ${attempt}/${TEMP_RADIO_MAX_ATTEMPTS}, via ${probe.via}`
+            + `${probe.reply ? ` : ${String(probe.reply).trim()}` : ""}).`
+          );
+          reached = probe;
+          break;
+        }
+        if (attempt < TEMP_RADIO_MAX_ATTEMPTS) {
+          appendLog(
+            `Cible muette sur le preset temporaire (tentative ${attempt}/${TEMP_RADIO_MAX_ATTEMPTS}, ${probe.error}) : `
+            + "repli du client puis renvoi de tempradio…"
+          );
+          setOtaStatus("Nouvelle bascule radio de la cible…");
+          // Repli du local sur l'ancien preset pour que le renvoi parte là où la
+          // cible écoute encore si elle n'a pas (ou pas encore) basculé.
           await restoreLocalRadioPresetAfterOta(restoreClientPreset);
           restoreClientPreset = await applyTempRadioPresetForOta(params.targetHex, tempPreset);
-          probe = await getOtaStatusBinary(probeKey, 1, 4500);
+          setOtaStatus("Vérification de la cible…");
         }
-        if (probe.error) {
-          // Une cible sans support OTA binaire (ex. room server, OTA texte
-          // uniquement) ne répond jamais au STATUS : ne pas abandonner ici,
-          // le déroulé normal (START binaire puis fallback texte) tranchera.
-          appendLog(
-            "Warning: cible silencieuse en binaire après renvoi de tempradio — "
-            + "hors de portée, ou cible sans OTA binaire (le fallback texte reste possible)."
-          );
-        } else {
-          appendLog(`Cible joignable sur le preset temporaire (${String(probe.reply || "").trim() || "réponse reçue"}).`);
-        }
+      }
+      if (!reached) {
+        throw new Error(
+          `Cible injoignable sur le preset temporaire après ${TEMP_RADIO_MAX_ATTEMPTS} tentatives — `
+          + "OTA annulée (preset restauré ; si la cible avait basculé, elle reviendra "
+          + "à l'expiration du tempradio)."
+        );
       }
 
       if (ui.autoTune?.checked) {
@@ -4317,6 +4505,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
       updatePlanLine(true);
     }
 
+    setOtaStatus("Démarrage du transfert OTA…");
     const result = await runOtaWithAutoTransport(params);
     appendLog("OTA staged successfully, reboot command sent.");
     appendLog(`Transport utilisé: ${result.transport === "binary_req" ? "binary req" : "text cmd"}`);
