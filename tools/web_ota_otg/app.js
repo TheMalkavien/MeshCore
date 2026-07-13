@@ -799,6 +799,9 @@ class MeshCoreSerialClient {
     this.bleTxCharacteristic = null;
     this.bleNotificationHandler = null;
     this.bleDisconnectHandler = null;
+    this.ws = null;
+    this._tcpResolve = null;
+    this._tcpReject = null;
     this.transport = null;
     this.connected = false;
     this.rxPending = [];
@@ -1021,6 +1024,66 @@ class MeshCoreSerialClient {
     this.rxPending = [];
   }
 
+  // TCP companion (WiFi) via a local WebSocket<->TCP bridge.
+  // The companion speaks the exact same framing as the serial interface
+  // ('>'/'<' + LE16 length), so on-wire this transport behaves like serial:
+  // the bridge is a dumb byte pipe and we reuse parseFrames() untouched.
+  async connectTcp(companionHost, companionPort) {
+    if (!companionHost) throw new Error("adresse companion manquante");
+    const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+    const url = `${scheme}${location.host}/tcp`
+      + `?host=${encodeURIComponent(companionHost)}`
+      + `&port=${encodeURIComponent(companionPort)}`;
+    this.log(`Connexion au pont TCP: ${url}`);
+
+    const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    this.ws = ws;
+    this.rxPending = [];
+
+    const ready = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("timeout de connexion au pont")), 8000);
+      this._tcpResolve = () => { clearTimeout(timer); resolve(); };
+      this._tcpReject = (msg) => { clearTimeout(timer); reject(new Error(msg)); };
+    });
+    const settleReady = () => { this._tcpResolve?.(); this._tcpResolve = null; this._tcpReject = null; };
+    const settleFail = (msg) => { this._tcpReject?.(msg); this._tcpResolve = null; this._tcpReject = null; };
+
+    ws.addEventListener("message", (ev) => {
+      if (typeof ev.data === "string") {
+        // Control channel from the bridge: "ready" once the TCP dial to the
+        // companion succeeds, or "error <msg>" if it fails.
+        if (ev.data.startsWith("ready")) settleReady();
+        else if (ev.data.startsWith("error")) settleFail(ev.data.slice(6).trim() || "erreur pont");
+        return;
+      }
+      // Any binary frame implies the tunnel is live.
+      if (this._tcpResolve) settleReady();
+      this.handleTcpChunk(ev.data);
+    });
+    ws.addEventListener("error", () => {
+      if (this._tcpReject) settleFail("connexion au pont échouée");
+    });
+    ws.addEventListener("close", (ev) => {
+      if (this._tcpReject) { settleFail(ev.reason || "pont fermé avant établissement"); return; }
+      if (!this.connected) return;
+      this.log("Connexion TCP interrompue.");
+      this.disconnect();
+    });
+
+    await ready;
+
+    this.transport = "web_tcp";
+    this.connected = true;
+  }
+
+  handleTcpChunk(arrayBuffer) {
+    const chunk = new Uint8Array(arrayBuffer);
+    if (chunk.length === 0) return;
+    this.pushRxChunk(chunk);
+    this.parseFrames();
+  }
+
   async disconnect() {
     const wasConnected = this.connected;
     this.connected = false;
@@ -1093,6 +1156,12 @@ class MeshCoreSerialClient {
       try { this.bleDevice.gatt.disconnect(); } catch {}
     }
     this.bleDevice = null;
+    if (this.ws) {
+      try { this.ws.close(); } catch {}
+      this.ws = null;
+    }
+    this._tcpResolve = null;
+    this._tcpReject = null;
     this.transport = null;
     this.writeChain = Promise.resolve();
   }
@@ -1469,6 +1538,11 @@ class MeshCoreSerialClient {
         }
         offset = end;
       }
+      return;
+    }
+    if (this.ws) {
+      if (this.ws.readyState !== WebSocket.OPEN) throw new Error("pont TCP non ouvert");
+      this.ws.send(bytes);
       return;
     }
     throw new Error("transport écriture indisponible");
@@ -1881,6 +1955,8 @@ const ui = {
   refreshTargetsBtn: document.querySelector("#refreshTargetsBtn"),
   connectionMode: document.querySelector("#connectionMode"),
   baudrate: document.querySelector("#baudrate"),
+  tcpTarget: document.querySelector("#tcpTarget"),
+  tcpTargetField: document.querySelector("#tcpTargetField"),
   targetSelect: document.querySelector("#targetSelect"),
   targetKey: document.querySelector("#targetKey"),
   targetPassword: document.querySelector("#targetPassword"),
@@ -2006,14 +2082,19 @@ function setProgressIndeterminate() {
 function getTransportLabel(transport) {
   if (transport === "web_usb") return "WebUSB";
   if (transport === "web_ble") return "Web Bluetooth";
+  if (transport === "web_tcp") return "TCP (pont)";
   return "Web Serial";
 }
 
 function updateConnectionModeUi() {
   const mode = String(ui.connectionMode?.value || "usb");
   const isBle = mode === "ble";
-  if (ui.baudrate) ui.baudrate.disabled = isBle;
-  if (ui.connectBtn) ui.connectBtn.textContent = isBle ? "Connecter BLE" : "Connecter USB";
+  const isTcp = mode === "tcp";
+  if (ui.baudrate) ui.baudrate.disabled = isBle || isTcp;
+  if (ui.tcpTargetField) ui.tcpTargetField.style.display = isTcp ? "" : "none";
+  if (ui.connectBtn) {
+    ui.connectBtn.textContent = isBle ? "Connecter BLE" : (isTcp ? "Connecter TCP" : "Connecter USB");
+  }
 }
 
 function formatRadioPresetText(presetLike) {
@@ -2122,7 +2203,9 @@ function updateLiveMetrics(transport, doneBytes, totalBytes, startTs, attempts, 
 
 function updateButtons() {
   const connected = Boolean(client && client.connected);
-  const isBle = String(ui.connectionMode?.value || "usb") === "ble";
+  const mode = String(ui.connectionMode?.value || "usb");
+  const isBle = mode === "ble";
+  const isTcp = mode === "tcp";
   ui.connectBtn.disabled = connected || otaRunning;
   ui.disconnectBtn.disabled = !connected || otaRunning;
   ui.startOtaBtn.disabled = !connected || otaRunning;
@@ -2133,7 +2216,8 @@ function updateButtons() {
   if (ui.targetPassword) ui.targetPassword.disabled = otaRunning;
   if (ui.firmwareFile) ui.firmwareFile.disabled = otaRunning;
   if (ui.connectionMode) ui.connectionMode.disabled = otaRunning;
-  if (ui.baudrate) ui.baudrate.disabled = otaRunning || isBle;
+  if (ui.baudrate) ui.baudrate.disabled = otaRunning || isBle || isTcp;
+  if (ui.tcpTarget) ui.tcpTarget.disabled = otaRunning || connected;
   if (ui.rebootBtn) ui.rebootBtn.disabled = otaRunning;
   if (ui.useTempRadio) {
     ui.useTempRadio.disabled = otaRunning;
@@ -3769,7 +3853,8 @@ async function initClientSession(baudrate) {
   if (ui.autoTune?.checked) recalcAutoFromCurrentSelection("connect");
 
   const mode = getTransportLabel(client.transport);
-  const speedSuffix = client.transport === "web_ble" ? "" : ` (${baudrate} bps)`;
+  const usesBaud = client.transport !== "web_ble" && client.transport !== "web_tcp";
+  const speedSuffix = usesBaud ? ` (${baudrate} bps)` : "";
   setConnectionStatus(`Connecté ${mode}${speedSuffix}`, "ok");
 }
 
@@ -3914,6 +3999,41 @@ async function connectClientViaBle() {
   appendLog(`BLE connecté (${device.name || "MeshCore"}).`);
 }
 
+function parseTcpTarget(raw) {
+  const s = String(raw || "").trim();
+  if (!s) throw new Error("Renseigne l'adresse du companion (host:port)");
+  let host = s;
+  let port = 5000;
+  const v6 = s.match(/^\[([^\]]+)\]:(\d+)$/); // [ipv6]:port
+  if (v6) {
+    host = v6[1];
+    port = Number(v6[2]);
+  } else {
+    const idx = s.lastIndexOf(":");
+    // Only treat the trailing part as a port if there is a single ':'.
+    if (idx > 0 && s.indexOf(":") === idx) {
+      host = s.slice(0, idx);
+      port = Number(s.slice(idx + 1)) || 5000;
+    }
+  }
+  if (!host) throw new Error("hôte companion invalide");
+  if (!(port > 0 && port < 65536)) throw new Error("port companion invalide");
+  return { host, port };
+}
+
+async function connectClientViaTcp() {
+  if (!("WebSocket" in window)) {
+    throw new Error("WebSocket non supporté par ce navigateur");
+  }
+  const { host, port } = parseTcpTarget(ui.tcpTarget?.value);
+  appendLog(`Tentative de connexion TCP via pont local (${host}:${port})...`);
+  const c = new MeshCoreSerialClient(appendLog);
+  attachClientDebugHooks(c);
+  await c.connectTcp(host, port);
+  client = c;
+  appendLog(`Companion TCP connecté (${host}:${port}).`);
+}
+
 async function connectClientWithBestUsbTransport(baudrate) {
   const preference = getUsbBrowserPreference();
   let serialErr = null;
@@ -3990,6 +4110,10 @@ async function connectClientSelectedTransport(mode, baudrate) {
     await connectClientViaBle();
     return;
   }
+  if (mode === "tcp") {
+    await connectClientViaTcp();
+    return;
+  }
   await connectClientWithBestUsbTransport(baudrate);
 }
 
@@ -4001,6 +4125,11 @@ ui.connectBtn.addEventListener("click", async () => {
     if (mode === "ble") {
       if (!("bluetooth" in navigator)) {
         appendLog("Web Bluetooth non supporté par ce navigateur.");
+        return;
+      }
+    } else if (mode === "tcp") {
+      if (!("WebSocket" in window)) {
+        appendLog("WebSocket non supporté par ce navigateur.");
         return;
       }
     } else if (!("serial" in navigator) && !("usb" in navigator)) {

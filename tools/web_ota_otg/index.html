@@ -497,12 +497,17 @@
             <select id="connectionMode">
               <option value="usb" selected>USB série</option>
               <option value="ble">BLE</option>
+              <option value="tcp">TCP (companion WiFi)</option>
             </select>
           </div>
           <div class="field">
             <label for="baudrate">Baudrate</label>
             <input id="baudrate" type="number" min="9600" step="100" value="115200">
           </div>
+        </div>
+        <div class="field" id="tcpTargetField" style="display:none">
+          <label for="tcpTarget">Companion TCP (host:port)</label>
+          <input id="tcpTarget" type="text" placeholder="192.168.4.1:5000" value="" autocomplete="off" spellcheck="false">
         </div>
         <div class="btn-row">
           <button id="connectBtn" class="btn-primary">

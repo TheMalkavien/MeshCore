@@ -1,11 +1,12 @@
 # MeshCore Web OTA OTG Prototype
 
-Prototype web (single-page app) pour lancer une OTA **RP2040 ou ESP32** (Heltec V4/V3, Xiao S3/C3, ...) via un **client MeshCore connecté en USB ou BLE**.
+Prototype web (single-page app) pour lancer une OTA **RP2040 ou ESP32** (Heltec V4/V3, Xiao S3/C3, ...) via un **client MeshCore connecté en USB, BLE ou TCP (companion WiFi)**.
 
 Le prototype utilise le protocole companion MeshCore et exécute la séquence OTA distante :
 
 - **USB** : framing série companion (`<len + payload` / `>len + payload`)
 - **BLE** : frames companion **brutes** sur le service UART MeshCore/Nordic (`6E400001...`)
+- **TCP** : même framing que l'USB (`<`/`>` + LE16), relayé par un **pont local** (voir *Mode TCP*). Les navigateurs n'ouvrent pas de socket TCP brute ; le pont fournit ce chaînon manquant **sans modifier le firmware companion**.
 
 En mode `USB`, il tente :
 
@@ -61,10 +62,87 @@ Puis ouvrir :
 - `http://127.0.0.1:8080` (desktop)
 - ou l'URL locale équivalente depuis ton appareil (si même réseau).
 
+## Mode TCP (companion WiFi) — pont local
+
+Le companion WiFi expose son interface série sur une socket TCP brute (port `5000`
+par défaut, cf. `SerialWifiInterface`). Un navigateur ne peut pas ouvrir de socket
+TCP brute (et le mode TCP des companions n'expose pas de WebSocket). Le petit pont
+`meshcore-ota-bridge` comble ce trou :
+
+- il **sert cette même page** en local (`http://127.0.0.1:8080`) ;
+- il expose `ws://127.0.0.1:8080/tcp?host=<ip>&port=<port>` et **relaie les octets**
+  bruts ↔ la socket TCP du companion (aucun parsing, aucune modif firmware).
+
+C'est un binaire Go **autonome, sans dépendance** (un seul `.exe` sous Windows,
+équivalents macOS/Linux), buildé depuis ce dossier.
+
+### Build
+
+```bash
+cd tools/web_ota_otg
+go build -trimpath -ldflags "-s -w" -o meshcore-ota-bridge.exe .   # Windows natif
+# cross-compile depuis n'importe quel OS :
+GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o meshcore-ota-bridge.exe .
+GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o meshcore-ota-bridge-macos .
+GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o meshcore-ota-bridge-linux .
+```
+
+`-trimpath` retire les chemins absolus de build (ex. `C:\Users\...`) du binaire ;
+`-ldflags "-s -w"` retire la table de symboles. Les deux réduisent la surface
+suspecte pour les antivirus (voir ci-dessous).
+
+La page (`index.html` + `app.js`) est **embarquée** dans le binaire via `//go:embed` :
+un seul fichier à distribuer. (En développement, `--web .` sert la page depuis le
+disque pour itérer sans rebuild.)
+
+### Antivirus : faux positif (`Trojan:Win32/*.A!ml`, etc.)
+
+Windows Defender peut mettre le `.exe` en quarantaine avec un nom du type
+`Trojan:Win32/Bearfoos.A!ml`. **C'est un faux positif connu**, pas une vraie
+détection : le suffixe `!ml` signale une heuristique machine-learning (pas une
+signature), et les petits binaires Go **non signés** qui ouvrent des sockets sont
+un cas d'école de ce type d'alerte. Le code source est ici, entièrement auditable.
+
+Ce qui est déjà fait côté code pour limiter le déclenchement :
+
+- ouverture du navigateur via `explorer` (et non `rundll32`/`cmd`, des « LOLBins »
+  massivement abusés par les vrais malwares et fortement pénalisés par l'heuristique) ;
+- build recommandé avec `-trimpath -ldflags "-s -w"`.
+
+Options pour l'utilisateur, de la plus simple à la plus robuste :
+
+1. **Exclusion Defender** du dossier de build (vous compilez vous-même, vous faites
+   confiance à la source) — PowerShell admin :
+   `Add-MpPreference -ExclusionPath "C:\chemin\vers\tools\web_ota_otg"`
+2. **Métadonnées de version** (signal de légitimité) : `versioninfo.json` est fourni.
+   `go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest`,
+   puis `go generate` (émet `resource.syso`) avant `go build`.
+3. **Signaler le faux positif** à Microsoft : <https://www.microsoft.com/wdsi/filesubmission>
+   (améliore la réputation du fichier pour tout le monde).
+4. **Signature Authenticode** : seule solution qui *garantit* l'absence d'alerte ML,
+   mais nécessite un certificat — surdimensionné pour cet usage.
+
+### Lancer
+
+```bash
+./meshcore-ota-bridge.exe              # sert 127.0.0.1:8080 et ouvre le navigateur
+./meshcore-ota-bridge.exe --lan        # aussi joignable depuis le LAN (ex. un téléphone)
+./meshcore-ota-bridge.exe --addr 127.0.0.1:9000 --no-browser
+```
+
+- **Windows / macOS / Linux** : double-clic (ou lancement CLI) → le navigateur
+  s'ouvre sur la page → choisir `TCP (companion WiFi)`, saisir `ip:port` du
+  companion (ex. `192.168.4.1:5000`) → `Connecter TCP`.
+- **Android sans PC dédié** : lancez le pont sur un PC du même WiFi avec `--lan`,
+  puis ouvrez l'URL réseau affichée (`http://<ip_pc>:8080/`) depuis Chrome Android.
+  Servie en `http://` sur le LAN, la page utilise `ws://` sans blocage
+  *mixed-content*. (Un APK embarquant ce même pont pour un fonctionnement 100 %
+  autonome sur téléphone est la suite logique, cf. le cœur Go partagé.)
+
 ## Usage
 
-1. Choisir `USB` ou `BLE`.
-2. Connecter le client MeshCore.
+1. Choisir `USB`, `BLE` ou `TCP`.
+2. Connecter le client MeshCore (en TCP : renseigner `ip:port` du companion).
 3. Cliquer `Connecter`.
 4. Renseigner la cible OTA (pubkey hex, min 12 chars = préfixe 6 octets).
 5. (Optionnel) renseigner `Mot de passe` pour faire un login avant OTA.

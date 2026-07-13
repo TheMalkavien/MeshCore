@@ -1,0 +1,7 @@
+# Built bridge binaries (rebuild with `go build`)
+meshcore-ota-bridge
+meshcore-ota-bridge.exe
+meshcore-ota-bridge-*
+
+# Generated Windows version-info resource (`go generate`)
+resource.syso
