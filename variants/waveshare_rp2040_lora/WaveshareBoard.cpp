@@ -102,19 +102,10 @@ void WaveshareBoard::sleep(uint32_t secs) {
 }
 
 bool WaveshareBoard::startOTAUpdate(const char *id, char reply[]) {
-  #ifdef MLK_ESP32_FLASHER_PIN
-    pinMode(MLK_ESP32_FLASHER_PIN, OUTPUT);
-    digitalWrite(MLK_ESP32_FLASHER_PIN, HIGH); // wake up esp32flasher
-    delay(500);
-    digitalWrite(MLK_ESP32_FLASHER_PIN, LOW); // stay low to avoid another wake up
-    sprintf(reply, "Waking UP ESP32Flasher to flash the firmware.");
-    return true;
-  #else
 #if defined(ARDUINO_ARCH_RP2040)
     rp2040_enter_ota_profile();
 #endif
     return ota.startSession(id, reply);
-  #endif
 }
 
 bool WaveshareBoard::handleOTACommand(const char *command, char reply[]) {

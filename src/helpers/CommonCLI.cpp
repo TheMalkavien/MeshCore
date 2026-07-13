@@ -252,7 +252,20 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       } else {
         strcpy(reply, "ERR: clock cannot go backwards");
       }
-    } else if (memcmp(command, "start ota", 9) == 0) {
+    }
+    #ifdef MLK_ESP32_FLASHER_PIN
+    else if (memcmp(command, "start esp32ota", 14) == 0) {
+      #if OTA_CLI_DEBUG_LOGGING
+            Serial.println("[OTA] CLI start ota");
+      #endif
+      pinMode(MLK_ESP32_FLASHER_PIN, OUTPUT);
+      digitalWrite(MLK_ESP32_FLASHER_PIN, HIGH); // wake up esp32flasher
+      delay(500);
+      digitalWrite(MLK_ESP32_FLASHER_PIN, LOW); // stay low to avoid another wake up
+      strcpy(reply, "Waking UP ESP32Flasher to flash the firmware.");
+    }
+    #endif
+    else if (memcmp(command, "start ota", 9) == 0) {
 #if OTA_CLI_DEBUG_LOGGING
       Serial.println("[OTA] CLI start ota");
 #endif
