@@ -4002,19 +4002,19 @@ async function restoreTargetRadioPresetAfterFailedOta(targetHex, previousPreset)
   const cmd = `tempradio ${formatRadioValue(previousPreset.freq)},${formatRadioValue(previousPreset.bw)},`
     + `${previousPreset.sf},${previousPreset.cr},1`;
   appendLog("Échec OTA: restauration du preset radio de la cible avant celle du client…");
-  const sentEvt = await client.sendMeshCmd(targetHex, cmd, true);
-  if (!sentEvt || sentEvt.type === "error") {
-    const code = sentEvt?.payload?.error_code;
-    throw new Error(`commande cible non envoyée${code !== undefined ? ` (code=${code})` : ""}`);
+  // Confirmé (plus fire-and-forget) : on attend l'ACK CLI de la cible. Sans ça,
+  // le paquet tempradio de restauration peut traîner sur le mesh et arriver
+  // PENDANT la tentative d'OTA suivante, refaisant basculer la cible sur le
+  // preset standard en plein établissement de lien. Attendre l'ACK garantit
+  // qu'il est délivré (et non ré-émis) avant qu'on rende la main.
+  const ackRes = await client.sendRepeaterCmdAndWaitReply(targetHex, cmd, TEMP_RADIO_ACK_TIMEOUT_SEC);
+  if (ackRes.error) {
+    throw new Error(`restauration cible non confirmée (${ackRes.error})`);
   }
-  const suggested = Number(sentEvt.payload?.suggested_timeout || 0);
-  const dispatchGuardMs = clamp(
-    (Number.isFinite(suggested) && suggested > 0 ? Math.round(suggested + 2200) : 3000),
-    2200,
-    5000
-  );
-  await sleep(dispatchGuardMs);
-  appendLog("Preset radio cible restauré après échec OTA.");
+  // Laisser la bascule différée (~2000ms) s'appliquer avant que le finally
+  // n'enchaîne sur la restauration du client.
+  await sleep(TEMP_RADIO_SWITCH_SETTLE_MS);
+  appendLog(`Preset radio cible restauré après échec OTA ("${String(ackRes.reply || "").trim() || "OK"}").`);
 }
 
 function attachClientDebugHooks(c) {
@@ -4357,6 +4357,12 @@ ui.startOtaBtn.addEventListener("click", async () => {
   let restoreClientPreset = null;
   let restoreTuningParams = null;
   let activeTargetHex = "";
+  // Vrai seulement si la cible a été effectivement jointe sur le preset
+  // temporaire. Conditionne la restauration cible du finally : si on ne l'a
+  // jamais jointe, envoyer une commande de restauration est futile (elle
+  // n'arrivera pas) ET dangereux (le paquet peut traîner et percuter une
+  // tentative ultérieure en la refaisant basculer sur standard).
+  let targetReachedOnTemp = false;
 
   try {
     const selectedTargetHex = getSelectedTargetHex();
@@ -4463,6 +4469,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
             + `${probe.reply ? ` : ${String(probe.reply).trim()}` : ""}).`
           );
           reached = probe;
+          targetReachedOnTemp = true;
           break;
         }
         if (attempt < TEMP_RADIO_MAX_ATTEMPTS) {
@@ -4532,12 +4539,20 @@ ui.startOtaBtn.addEventListener("click", async () => {
   } finally {
     ui.progressBar.classList.remove("indeterminate");
     if (restoreClientPreset && !otaCompleted && activeTargetHex) {
-      try {
-        await restoreTargetRadioPresetAfterFailedOta(activeTargetHex, restoreClientPreset);
-      } catch (targetRestoreErr) {
+      if (targetReachedOnTemp) {
+        try {
+          await restoreTargetRadioPresetAfterFailedOta(activeTargetHex, restoreClientPreset);
+        } catch (targetRestoreErr) {
+          appendLog(
+            `Warning: restauration preset cible échouée (${targetRestoreErr.message}); `
+            + "elle reviendra automatiquement à son preset permanent à l'expiration du tempradio."
+          );
+        }
+      } else {
         appendLog(
-          `Warning: restauration preset cible échouée (${targetRestoreErr.message}); `
-          + "elle reviendra automatiquement à son preset permanent à l'expiration du tempradio."
+          "Cible jamais jointe sur le preset temporaire : aucune commande de restauration "
+          + "envoyée (elle n'arriverait pas et risquerait de percuter une tentative ultérieure). "
+          + "La cible reviendra à son preset permanent à l'expiration du tempradio."
         );
       }
     }
