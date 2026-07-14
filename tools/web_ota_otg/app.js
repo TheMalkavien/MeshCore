@@ -1987,6 +1987,9 @@ const ui = {
   baudrate: document.querySelector("#baudrate"),
   tcpTarget: document.querySelector("#tcpTarget"),
   tcpTargetField: document.querySelector("#tcpTargetField"),
+  targetFilter: document.querySelector("#targetFilter"),
+  clearTargetFilterBtn: document.querySelector("#clearTargetFilterBtn"),
+  targetFilterStatus: document.querySelector("#targetFilterStatus"),
   targetSelect: document.querySelector("#targetSelect"),
   targetKey: document.querySelector("#targetKey"),
   targetPassword: document.querySelector("#targetPassword"),
@@ -2033,6 +2036,7 @@ let otaCompleted = false;
 // getOtaStatusBinary, remis à zéro à chaque transfert.
 const otaBusyStats = { events: 0, sleepMs: 0 };
 let lastSelfInfo = null;
+let knownRepeaterTargets = [];
 let lastDeviceInfo = null;
 let lastPlanSummary = "";
 
@@ -2147,16 +2151,6 @@ function getSelectedTargetHex() {
   return "";
 }
 
-function resetTargetRepeaterSelect() {
-  if (!ui.targetSelect) return;
-  ui.targetSelect.innerHTML = "";
-  const option = document.createElement("option");
-  option.value = "";
-  option.textContent = "Sélectionner un répéteur…";
-  ui.targetSelect.appendChild(option);
-  ui.targetSelect.value = "";
-}
-
 function isRepeaterContact(contact) {
   return Number(contact?.type) === CONTACT_TYPE.REPEATER;
 }
@@ -2166,6 +2160,93 @@ function buildRepeaterOptionLabel(contact) {
   const key = normalizeHex(contact?.public_key || "");
   const suffix = key.length >= 12 ? key.slice(0, 12) : key;
   return `${name} (${suffix})`;
+}
+
+function normalizeTargetFilterText(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function getTargetFilterTerms() {
+  return normalizeTargetFilterText(ui.targetFilter?.value || "")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function getFilteredRepeaterTargets() {
+  const terms = getTargetFilterTerms();
+  if (terms.length === 0) return [...knownRepeaterTargets];
+  return knownRepeaterTargets.filter((target) => (
+    terms.every((term) => target.searchText.includes(term))
+  ));
+}
+
+function findKnownRepeaterTarget(value) {
+  const clean = normalizeHex(value || "");
+  if (clean.length < 12) return null;
+  return knownRepeaterTargets.find((target) => (
+    target.key === clean || target.key.startsWith(clean) || clean.startsWith(target.key)
+  )) || null;
+}
+
+function renderTargetRepeaterSelect(preferredValue = "") {
+  if (!ui.targetSelect) return;
+
+  const current = normalizeHex(
+    preferredValue || ui.targetSelect.value || ui.targetKey?.value || ""
+  );
+  const selectedTarget = findKnownRepeaterTarget(current);
+  const matches = getFilteredRepeaterTargets();
+  const visibleTargets = [...matches];
+  const selectionPinned = Boolean(
+    selectedTarget && !visibleTargets.some((target) => target.key === selectedTarget.key)
+  );
+  if (selectionPinned) visibleTargets.unshift(selectedTarget);
+
+  ui.targetSelect.innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  if (knownRepeaterTargets.length === 0) {
+    placeholder.textContent = "Aucun répéteur disponible";
+  } else if (getTargetFilterTerms().length > 0 && matches.length === 0) {
+    placeholder.textContent = "Aucun répéteur ne correspond";
+  } else {
+    placeholder.textContent = "Sélectionner un répéteur…";
+  }
+  ui.targetSelect.appendChild(placeholder);
+
+  for (const target of visibleTargets) {
+    const option = document.createElement("option");
+    option.value = target.key;
+    option.textContent = target.label;
+    ui.targetSelect.appendChild(option);
+  }
+  ui.targetSelect.value = selectedTarget?.key || "";
+
+  const queryActive = getTargetFilterTerms().length > 0;
+  if (ui.targetFilterStatus) {
+    if (knownRepeaterTargets.length === 0) {
+      ui.targetFilterStatus.textContent = "Aucun répéteur chargé";
+    } else if (!queryActive) {
+      ui.targetFilterStatus.textContent = `${knownRepeaterTargets.length} répéteur${knownRepeaterTargets.length > 1 ? "s" : ""}`;
+    } else {
+      ui.targetFilterStatus.textContent =
+        `${matches.length} résultat${matches.length > 1 ? "s" : ""} sur ${knownRepeaterTargets.length}`
+        + (selectionPinned ? " · sélection actuelle conservée" : "");
+    }
+  }
+  if (ui.clearTargetFilterBtn) {
+    ui.clearTargetFilterBtn.disabled = !client?.connected || otaRunning || !String(ui.targetFilter?.value || "");
+  }
+}
+
+function resetTargetRepeaterSelect(clearFilter = true) {
+  knownRepeaterTargets = [];
+  if (clearFilter && ui.targetFilter) ui.targetFilter.value = "";
+  renderTargetRepeaterSelect("");
 }
 
 function updateTargetRepeaterSelect(contacts, keepCurrent = true) {
@@ -2186,21 +2267,18 @@ function updateTargetRepeaterSelect(contacts, keepCurrent = true) {
       return na.localeCompare(nb);
     });
 
-  resetTargetRepeaterSelect();
-  for (const contact of repeaters) {
+  knownRepeaterTargets = repeaters.map((contact) => {
     const key = normalizeHex(contact.public_key || "");
-    if (key.length < 12) continue;
-    const option = document.createElement("option");
-    option.value = key;
-    option.textContent = buildRepeaterOptionLabel(contact);
-    ui.targetSelect.appendChild(option);
-  }
+    const label = buildRepeaterOptionLabel(contact);
+    return {
+      key,
+      label,
+      searchText: normalizeTargetFilterText(`${contact.adv_name || ""} ${label} ${key}`),
+    };
+  });
 
-  const allOptionValues = Array.from(ui.targetSelect.options).map((opt) => normalizeHex(opt.value || ""));
-  const selected =
-    allOptionValues.find((k) => previous.length >= 12 && (k === previous || k.startsWith(previous) || previous.startsWith(k)))
-    || "";
-  ui.targetSelect.value = selected;
+  renderTargetRepeaterSelect(previous);
+  const selected = normalizeHex(ui.targetSelect.value || "");
   if (!manual && selected && ui.targetKey) {
     ui.targetKey.value = selected;
   }
@@ -2242,6 +2320,10 @@ function updateButtons() {
   ui.cancelOtaBtn.disabled = !otaRunning;
   if (ui.refreshTargetsBtn) ui.refreshTargetsBtn.disabled = !connected || otaRunning;
   if (ui.targetSelect) ui.targetSelect.disabled = !connected || otaRunning;
+  if (ui.targetFilter) ui.targetFilter.disabled = !connected || otaRunning;
+  if (ui.clearTargetFilterBtn) {
+    ui.clearTargetFilterBtn.disabled = !connected || otaRunning || !String(ui.targetFilter?.value || "");
+  }
   if (ui.targetKey) ui.targetKey.disabled = otaRunning;
   if (ui.targetPassword) ui.targetPassword.disabled = otaRunning;
   if (ui.firmwareFile) ui.firmwareFile.disabled = otaRunning;
@@ -4278,6 +4360,30 @@ ui.cancelOtaBtn.addEventListener("click", () => {
   appendLog("Annulation OTA demandée.");
 });
 
+if (ui.targetFilter) {
+  ui.targetFilter.addEventListener("input", () => {
+    renderTargetRepeaterSelect();
+  });
+  ui.targetFilter.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    const matches = getFilteredRepeaterTargets();
+    if (matches.length !== 1) return;
+    event.preventDefault();
+    renderTargetRepeaterSelect(matches[0].key);
+    ui.targetSelect?.dispatchEvent(new Event("change"));
+  });
+}
+
+if (ui.clearTargetFilterBtn) {
+  ui.clearTargetFilterBtn.addEventListener("click", () => {
+    if (ui.targetFilter) {
+      ui.targetFilter.value = "";
+      renderTargetRepeaterSelect();
+      ui.targetFilter.focus();
+    }
+  });
+}
+
 if (ui.targetSelect) {
   ui.targetSelect.addEventListener("change", () => {
     const selected = normalizeHex(ui.targetSelect.value || "");
@@ -4704,12 +4810,9 @@ if (ui.targetKey) {
       updateStepBadges();
       return;
     }
-    const match = Array.from(ui.targetSelect.options).find((opt) => {
-      const key = normalizeHex(opt.value || "");
-      return key.length >= 12 && (key === manual || key.startsWith(manual) || manual.startsWith(key));
-    });
+    const match = findKnownRepeaterTarget(manual);
     if (match) {
-      ui.targetSelect.value = match.value;
+      renderTargetRepeaterSelect(match.key);
     } else {
       ui.targetSelect.value = "";
     }

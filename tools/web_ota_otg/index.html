@@ -205,6 +205,26 @@
 
     select { cursor: pointer; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%237d8590' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 12px center; padding-right: 32px; }
 
+    .target-filter-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 44px;
+      gap: 8px;
+      align-items: center;
+    }
+    .target-filter-row .target-filter-clear {
+      width: 44px;
+      min-height: 42px;
+      padding: 8px;
+      font-size: 1.2rem;
+      line-height: 1;
+    }
+    .target-filter-row .target-filter-clear:disabled { visibility: hidden; }
+    .target-filter-status {
+      min-height: 1.2em;
+      color: var(--muted);
+      font-size: 0.72rem;
+    }
+
     /* ── Grid helpers ── */
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
@@ -534,6 +554,14 @@
         <div class="card-title">Cible &amp; Firmware</div>
       </div>
       <div class="card-body">
+        <div class="field">
+          <label for="targetFilter">Rechercher un répéteur</label>
+          <div class="target-filter-row">
+            <input id="targetFilter" type="search" placeholder="Nom ou clé publique…" autocomplete="off" autocorrect="off" spellcheck="false">
+            <button id="clearTargetFilterBtn" type="button" class="btn-secondary target-filter-clear" aria-label="Effacer la recherche" title="Effacer la recherche" disabled>×</button>
+          </div>
+          <div id="targetFilterStatus" class="target-filter-status" aria-live="polite">Aucun répéteur chargé</div>
+        </div>
         <div class="field">
           <label for="targetSelect">Répéteur cible</label>
           <select id="targetSelect">
