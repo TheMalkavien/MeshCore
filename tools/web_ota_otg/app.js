@@ -1724,7 +1724,10 @@ class MeshCoreSerialClient {
     const tag = String(sentEvt.payload?.expected_ack || "");
     const suggested = Number(sentEvt.payload?.suggested_timeout || 4000);
     const computed = Math.max(minTimeoutMs, Math.round((suggested / 800) * 1000));
-    const waitMs = timeoutMs > 0 ? timeoutMs : computed;
+    // Un timeout explicite est un plancher fonctionnel, pas un remplacement de
+    // l'estimation de route du companion. Sur un chemin flood/multihop, cette
+    // estimation peut légitimement dépasser les 8 s historiques.
+    const waitMs = timeoutMs > 0 ? Math.max(timeoutMs, computed) : computed;
 
     const queued = this.popQueuedBinary(tag);
     if (queued) {
@@ -1743,10 +1746,22 @@ class MeshCoreSerialClient {
       responseEvt = null;
     }
     if (!responseEvt) {
-      return { replyText: null, error: `timeout waiting binary reply` };
+      return {
+        replyText: null,
+        error: `timeout waiting binary reply`,
+        routeFlood,
+        suggestedTimeoutMs: suggested,
+        waitMs,
+      };
     }
     const text = String(responseEvt.payload?.text || "").replace(/\0+$/g, "");
-    return { replyText: text, error: null, routeFlood };
+    return {
+      replyText: text,
+      error: null,
+      routeFlood,
+      suggestedTimeoutMs: suggested,
+      waitMs,
+    };
   }
 
   async sendOtaBinaryCmd(targetFullKeyHex, opcode, payload = new Uint8Array(), waitReply = true, timeoutMs = 0, minTimeoutMs = 200) {
@@ -1935,12 +1950,27 @@ class MeshCoreSerialClient {
 
     const suggested = Number(sent.payload?.suggested_timeout || 8000);
     const defaultTimeoutMs = Math.max(8000, Math.round(((suggested / 800) * 1.5) * 1000));
-    const replyTimeoutMs = timeoutSec > 0 ? Math.round(timeoutSec * 1000) : defaultTimeoutMs;
+    // Comme pour les requêtes binaires, la valeur fournie par l'appelant est
+    // un minimum. Ne jamais raccourcir l'estimation calculée par le companion.
+    const requestedTimeoutMs = timeoutSec > 0 ? Math.round(timeoutSec * 1000) : 0;
+    const replyTimeoutMs = Math.max(requestedTimeoutMs, defaultTimeoutMs);
     const reply = await this.waitRepeaterReply(targetHex, token, replyTimeoutMs);
     if (reply === null) {
-      return { reply: null, error: `timeout waiting reply to '${cmd}'` };
+      return {
+        reply: null,
+        error: `timeout waiting reply to '${cmd}'`,
+        routeFlood: Number(sent.payload?.type) === 1,
+        suggestedTimeoutMs: suggested,
+        waitMs: replyTimeoutMs,
+      };
     }
-    return { reply, error: null };
+    return {
+      reply,
+      error: null,
+      routeFlood: Number(sent.payload?.type) === 1,
+      suggestedTimeoutMs: suggested,
+      waitMs: replyTimeoutMs,
+    };
   }
 
   async sendRepeaterCmdNoReply(targetHex, cmd) {
@@ -1965,6 +1995,9 @@ const ui = {
   baudrate: document.querySelector("#baudrate"),
   tcpTarget: document.querySelector("#tcpTarget"),
   tcpTargetField: document.querySelector("#tcpTargetField"),
+  targetFilter: document.querySelector("#targetFilter"),
+  clearTargetFilterBtn: document.querySelector("#clearTargetFilterBtn"),
+  targetFilterStatus: document.querySelector("#targetFilterStatus"),
   targetSelect: document.querySelector("#targetSelect"),
   targetKey: document.querySelector("#targetKey"),
   targetPassword: document.querySelector("#targetPassword"),
@@ -2011,6 +2044,7 @@ let otaCompleted = false;
 // getOtaStatusBinary, remis à zéro à chaque transfert.
 const otaBusyStats = { events: 0, sleepMs: 0 };
 let lastSelfInfo = null;
+let knownRepeaterTargets = [];
 let lastDeviceInfo = null;
 let lastPlanSummary = "";
 
@@ -2125,16 +2159,6 @@ function getSelectedTargetHex() {
   return "";
 }
 
-function resetTargetRepeaterSelect() {
-  if (!ui.targetSelect) return;
-  ui.targetSelect.innerHTML = "";
-  const option = document.createElement("option");
-  option.value = "";
-  option.textContent = "Sélectionner un répéteur…";
-  ui.targetSelect.appendChild(option);
-  ui.targetSelect.value = "";
-}
-
 function isRepeaterContact(contact) {
   return Number(contact?.type) === CONTACT_TYPE.REPEATER;
 }
@@ -2144,6 +2168,93 @@ function buildRepeaterOptionLabel(contact) {
   const key = normalizeHex(contact?.public_key || "");
   const suffix = key.length >= 12 ? key.slice(0, 12) : key;
   return `${name} (${suffix})`;
+}
+
+function normalizeTargetFilterText(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function getTargetFilterTerms() {
+  return normalizeTargetFilterText(ui.targetFilter?.value || "")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function getFilteredRepeaterTargets() {
+  const terms = getTargetFilterTerms();
+  if (terms.length === 0) return [...knownRepeaterTargets];
+  return knownRepeaterTargets.filter((target) => (
+    terms.every((term) => target.searchText.includes(term))
+  ));
+}
+
+function findKnownRepeaterTarget(value) {
+  const clean = normalizeHex(value || "");
+  if (clean.length < 12) return null;
+  return knownRepeaterTargets.find((target) => (
+    target.key === clean || target.key.startsWith(clean) || clean.startsWith(target.key)
+  )) || null;
+}
+
+function renderTargetRepeaterSelect(preferredValue = "") {
+  if (!ui.targetSelect) return;
+
+  const current = normalizeHex(
+    preferredValue || ui.targetSelect.value || ui.targetKey?.value || ""
+  );
+  const selectedTarget = findKnownRepeaterTarget(current);
+  const matches = getFilteredRepeaterTargets();
+  const visibleTargets = [...matches];
+  const selectionPinned = Boolean(
+    selectedTarget && !visibleTargets.some((target) => target.key === selectedTarget.key)
+  );
+  if (selectionPinned) visibleTargets.unshift(selectedTarget);
+
+  ui.targetSelect.innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  if (knownRepeaterTargets.length === 0) {
+    placeholder.textContent = "Aucun répéteur disponible";
+  } else if (getTargetFilterTerms().length > 0 && matches.length === 0) {
+    placeholder.textContent = "Aucun répéteur ne correspond";
+  } else {
+    placeholder.textContent = "Sélectionner un répéteur…";
+  }
+  ui.targetSelect.appendChild(placeholder);
+
+  for (const target of visibleTargets) {
+    const option = document.createElement("option");
+    option.value = target.key;
+    option.textContent = target.label;
+    ui.targetSelect.appendChild(option);
+  }
+  ui.targetSelect.value = selectedTarget?.key || "";
+
+  const queryActive = getTargetFilterTerms().length > 0;
+  if (ui.targetFilterStatus) {
+    if (knownRepeaterTargets.length === 0) {
+      ui.targetFilterStatus.textContent = "Aucun répéteur chargé";
+    } else if (!queryActive) {
+      ui.targetFilterStatus.textContent = `${knownRepeaterTargets.length} répéteur${knownRepeaterTargets.length > 1 ? "s" : ""}`;
+    } else {
+      ui.targetFilterStatus.textContent =
+        `${matches.length} résultat${matches.length > 1 ? "s" : ""} sur ${knownRepeaterTargets.length}`
+        + (selectionPinned ? " · sélection actuelle conservée" : "");
+    }
+  }
+  if (ui.clearTargetFilterBtn) {
+    ui.clearTargetFilterBtn.disabled = !client?.connected || otaRunning || !String(ui.targetFilter?.value || "");
+  }
+}
+
+function resetTargetRepeaterSelect(clearFilter = true) {
+  knownRepeaterTargets = [];
+  if (clearFilter && ui.targetFilter) ui.targetFilter.value = "";
+  renderTargetRepeaterSelect("");
 }
 
 function updateTargetRepeaterSelect(contacts, keepCurrent = true) {
@@ -2164,21 +2275,18 @@ function updateTargetRepeaterSelect(contacts, keepCurrent = true) {
       return na.localeCompare(nb);
     });
 
-  resetTargetRepeaterSelect();
-  for (const contact of repeaters) {
+  knownRepeaterTargets = repeaters.map((contact) => {
     const key = normalizeHex(contact.public_key || "");
-    if (key.length < 12) continue;
-    const option = document.createElement("option");
-    option.value = key;
-    option.textContent = buildRepeaterOptionLabel(contact);
-    ui.targetSelect.appendChild(option);
-  }
+    const label = buildRepeaterOptionLabel(contact);
+    return {
+      key,
+      label,
+      searchText: normalizeTargetFilterText(`${contact.adv_name || ""} ${label} ${key}`),
+    };
+  });
 
-  const allOptionValues = Array.from(ui.targetSelect.options).map((opt) => normalizeHex(opt.value || ""));
-  const selected =
-    allOptionValues.find((k) => previous.length >= 12 && (k === previous || k.startsWith(previous) || previous.startsWith(k)))
-    || "";
-  ui.targetSelect.value = selected;
+  renderTargetRepeaterSelect(previous);
+  const selected = normalizeHex(ui.targetSelect.value || "");
   if (!manual && selected && ui.targetKey) {
     ui.targetKey.value = selected;
   }
@@ -2220,6 +2328,10 @@ function updateButtons() {
   ui.cancelOtaBtn.disabled = !otaRunning;
   if (ui.refreshTargetsBtn) ui.refreshTargetsBtn.disabled = !connected || otaRunning;
   if (ui.targetSelect) ui.targetSelect.disabled = !connected || otaRunning;
+  if (ui.targetFilter) ui.targetFilter.disabled = !connected || otaRunning;
+  if (ui.clearTargetFilterBtn) {
+    ui.clearTargetFilterBtn.disabled = !connected || otaRunning || !String(ui.targetFilter?.value || "");
+  }
   if (ui.targetKey) ui.targetKey.disabled = otaRunning;
   if (ui.targetPassword) ui.targetPassword.disabled = otaRunning;
   if (ui.firmwareFile) ui.firmwareFile.disabled = otaRunning;
@@ -2639,6 +2751,18 @@ async function runBinaryOta(params) {
   const tStart = performance.now();
   const statusTimeout = Math.max(500, Number(statusTimeoutMs) || 4000);
   const quickStatusTimeout = Math.max(450, Math.min(2000, Math.round(statusTimeout * 0.55)));
+  // START change l'état de la cible. Une absence de réponse est donc ambiguë :
+  // la requête peut avoir été appliquée alors que seul le retour radio a été
+  // perdu. Sa fenêtre suit le profil radio et reste assez longue pour un flood.
+  const startTimeout = clamp(Math.max(12000, Math.round(statusTimeout * 2.5)), 12000, 30000);
+  const sendStart = () => client.sendOtaBinaryCmd(
+    targetFullKeyHex,
+    OTA_BIN_OP.START,
+    new Uint8Array(),
+    true,
+    startTimeout,
+    750
+  );
 
   // La cible gèle sa flash à chaque flush de son tampon de staging : les chunks
   // arrivant pendant ce gel sont perdus. Une pause côté client ne suffit pas
@@ -2764,18 +2888,30 @@ async function runBinaryOta(params) {
   updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
 
   try {
-    let startRes = await client.sendOtaBinaryCmd(
-      targetFullKeyHex,
-      OTA_BIN_OP.START,
-      new Uint8Array(),
-      true,
-      8000,
-      500
-    );
+    let startRes = await sendStart();
+
+    // Ne pas conclure « binaire non supporté » sur la première réponse perdue.
+    // Rejouer START est sûr : une cible déjà armée répond "already running",
+    // puis le chemin de réconciliation ci-dessous reprend ou réinitialise la
+    // session. Cela transforme le classique « ça marche au deuxième clic » en
+    // récupération automatique dans le même lancement.
+    if (startRes.error?.startsWith("timeout waiting binary reply")) {
+      const waitedMs = Number(startRes.waitMs) || startTimeout;
+      appendLog(
+        `START binaire sans réponse après ${(waitedMs / 1000).toFixed(1)}s `
+        + `(route ${startRes.routeFlood ? "flood" : "directe"}) — nouvelle tentative…`
+      );
+      await sleep(1500);
+      startRes = await sendStart();
+    }
 
     if (startRes.error) {
       if (startRes.error.startsWith("timeout waiting binary reply")) {
-        appendLog("Binary OTA non disponible (pas de réponse binaire).");
+        const waitedMs = Number(startRes.waitMs) || startTimeout;
+        appendLog(
+          `Binary OTA non disponible après deux START sans réponse `
+          + `(dernière attente ${(waitedMs / 1000).toFixed(1)}s).`
+        );
         return null;
       }
       throw new Error(`Start OTA failed (binary): ${startRes.error}`);
@@ -2822,14 +2958,7 @@ async function runBinaryOta(params) {
               + `${st.error ? `; ${st.error}` : st.reply ? `; status=${st.reply}` : ""}`
             );
           }
-          startRes = await client.sendOtaBinaryCmd(
-            targetFullKeyHex,
-            OTA_BIN_OP.START,
-            new Uint8Array(),
-            true,
-            8000,
-            500
-          );
+          startRes = await sendStart();
           if (startRes.error) {
             throw new Error(`Start OTA failed after abort (binary): ${startRes.error}`);
           }
@@ -3406,6 +3535,15 @@ async function runTextOta(params) {
 
   try {
     let startRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "start ota", startTimeoutSec);
+    if (startRes.error?.includes("timeout waiting reply")) {
+      const waitedMs = Number(startRes.waitMs) || (startTimeoutSec * 1000);
+      appendLog(
+        `START texte sans réponse après ${(waitedMs / 1000).toFixed(1)}s `
+        + `(route ${startRes.routeFlood ? "flood" : "directe"}) — nouvelle tentative…`
+      );
+      await sleep(1500);
+      startRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "start ota", startTimeoutSec);
+    }
     if (startRes.error) {
       throw new Error(`Start OTA failed: ${startRes.error}`);
     }
@@ -3898,11 +4036,12 @@ function applySelfRadioPresetToCache(preset) {
 // 2000ms, futureMillis(2000) dans MyMesh.cpp). Sur un nœud lointain, tout écart
 // laissait les deux radios sur des presets différents : l'OTA ne démarrait
 // jamais et la cible restait bloquée sur le preset court jusqu'au timeout du
-// tempradio. On attend désormais l'ACK CLI de la cible (émis sur l'ANCIEN
-// preset avant la bascule) puis on sonde la cible EN BOUCLE sur le nouveau
-// preset jusqu'à réponse effective, plutôt que de deviner le timing.
-const TEMP_RADIO_ACK_TIMEOUT_SEC = 6;     // attente bornée de l'ACK "OK - temp params"
-const TEMP_RADIO_SWITCH_SETTLE_MS = 2600; // délai firmware futureMillis(2000) + marge
+// tempradio. On attend désormais l'ACK CLI de la cible (préparé avant sa
+// bascule, mais potentiellement encore en vol) puis on sonde la cible EN BOUCLE
+// sur le nouveau preset jusqu'à réponse effective, plutôt que de deviner le
+// timing.
+const TEMP_RADIO_ACK_TIMEOUT_SEC = 10;    // minimum ; l'estimation de route peut l'allonger
+const TEMP_RADIO_SWITCH_SETTLE_MS = 3500; // délai firmware futureMillis(2000) + marge radio/loop
 const TEMP_RADIO_PROBE_WINDOW_MS = 14000; // fenêtre de sonde par tentative
 const TEMP_RADIO_MAX_ATTEMPTS = 3;        // renvois tempradio avant abandon propre
 
@@ -3942,21 +4081,24 @@ async function applyTempRadioPresetForOta(targetHex, preset) {
     + `(${preset.timeoutMins} min)`
   );
 
-  // Attendre la réponse CLI "OK - temp params" de la cible. Le firmware l'émet
-  // sur l'ANCIEN preset AVANT de basculer (délai futureMillis(2000)), donc le
-  // client — encore sur l'ancien preset — la reçoit. Deux bénéfices vs l'ancien
-  // fire-and-forget qui devinait un temps de vol variable :
-  //   1. confirmation POSITIVE que la cible a reçu la commande ;
-  //   2. au retour de cet appel, msg_sent est déjà passé -> le paquet tempradio
-  //      a quitté le companion, donc basculer le local ensuite ne peut plus le
-  //      tronquer (plus besoin de l'ancien guard plafonné à 4s, trop court pour
-  //      un nœud lointain).
+  // Attendre la réponse CLI "OK - temp params" de la cible. C'est la seule
+  // confirmation de bout en bout : le RESP_CODE_SENT du companion confirme la
+  // mise en file de la commande, pas sa réception par la cible. Le firmware
+  // programme sa bascule à futureMillis(2000) lors du traitement de la commande,
+  // mais une réponse multihop peut encore être en vol après cette échéance.
+  const ackStartedAt = performance.now();
   const ackRes = await client.sendRepeaterCmdAndWaitReply(targetHex, cmd, TEMP_RADIO_ACK_TIMEOUT_SEC);
+  const ackElapsedMs = performance.now() - ackStartedAt;
   if (!ackRes.error) {
-    appendLog(`Cible a confirmé le tempradio ("${String(ackRes.reply || "").trim() || "réponse reçue"}").`);
+    appendLog(
+      `Cible a confirmé le tempradio en ${(ackElapsedMs / 1000).toFixed(1)}s `
+      + `(route ${ackRes.routeFlood ? "flood" : "directe"}, `
+      + `"${String(ackRes.reply || "").trim() || "réponse reçue"}").`
+    );
   } else {
     appendLog(
-      `Pas d'ACK tempradio (${ackRes.error}) — commande possiblement perdue ; `
+      `Pas d'ACK tempradio après ${(ackElapsedMs / 1000).toFixed(1)}s (${ackRes.error}) — `
+      + `commande possiblement encore en file ou perdue ; `
       + "bascule locale puis sonde de joignabilité pour trancher."
     );
   }
@@ -4225,6 +4367,30 @@ ui.cancelOtaBtn.addEventListener("click", () => {
   setOtaStatus("Annulation demandée...");
   appendLog("Annulation OTA demandée.");
 });
+
+if (ui.targetFilter) {
+  ui.targetFilter.addEventListener("input", () => {
+    renderTargetRepeaterSelect();
+  });
+  ui.targetFilter.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    const matches = getFilteredRepeaterTargets();
+    if (matches.length !== 1) return;
+    event.preventDefault();
+    renderTargetRepeaterSelect(matches[0].key);
+    ui.targetSelect?.dispatchEvent(new Event("change"));
+  });
+}
+
+if (ui.clearTargetFilterBtn) {
+  ui.clearTargetFilterBtn.addEventListener("click", () => {
+    if (ui.targetFilter) {
+      ui.targetFilter.value = "";
+      renderTargetRepeaterSelect();
+      ui.targetFilter.focus();
+    }
+  });
+}
 
 if (ui.targetSelect) {
   ui.targetSelect.addEventListener("change", () => {
@@ -4652,12 +4818,9 @@ if (ui.targetKey) {
       updateStepBadges();
       return;
     }
-    const match = Array.from(ui.targetSelect.options).find((opt) => {
-      const key = normalizeHex(opt.value || "");
-      return key.length >= 12 && (key === manual || key.startsWith(manual) || manual.startsWith(key));
-    });
+    const match = findKnownRepeaterTarget(manual);
     if (match) {
-      ui.targetSelect.value = match.value;
+      renderTargetRepeaterSelect(match.key);
     } else {
       ui.targetSelect.value = "";
     }
