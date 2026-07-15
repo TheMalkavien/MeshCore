@@ -3,7 +3,7 @@
 MeshCore → Telegram relay bot
 
 Subscribes to a MeshCore MQTT bridge (mode packets) and forwards decoded
-channel text messages to a Telegram chat.
+channel text messages to one or more Telegram chats.
 
 The MeshCore device/repeater must have WITH_MQTT_BRIDGE firmware and
 packets mode enabled (set mqtt.packets on).
@@ -18,6 +18,8 @@ Features:
   - Automatic MQTT reconnection with exponential backoff
   - Telegram retry on transient errors (rate-limit aware)
   - Deduplication by packet hash (same packet heard by multiple nodes)
+  - Unlimited MeshCore channel PSK -> Telegram chat mappings
+  - JSON configuration file plus repeatable command-line mappings
   - Per-sender throttling (configurable cooldown between messages from same sender)
   - Global throttling (configurable minimum interval between any two forwarded messages)
   - Periodic stats logging
@@ -26,9 +28,11 @@ Usage:
     pip install -r requirements.txt
     python meshcore_mqtt_telegram.py \\
         --mqtt-host broker.local \\
-        --channel-psk izOH6cXN6mrJ5e26oRXNcg== \\
         --telegram-token 123456:AAABBBCCC \\
-        --telegram-chat -100123456789
+        --channel-map 'izOH6cXN6mrJ5e26oRXNcg==:-100123456789' \\
+        --channel-map '00112233445566778899aabbccddeeff:@another_channel'
+
+The legacy --channel-psk/--telegram-chat pair remains supported.
 
 Channel PSK: base64 (from MeshCore app export) or hex (16 bytes).
 """
@@ -43,7 +47,8 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from typing import Dict, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import paho.mqtt.client as mqtt
 import requests
@@ -254,6 +259,8 @@ class DedupCache:
 
     def is_duplicate(self, pkt_hash: str) -> bool:
         """Return True if this hash was seen within the TTL window (and record it if new)."""
+        if self._ttl <= 0:
+            return False
         now = time.monotonic()
         with self._lock:
             self._maybe_prune(now)
@@ -435,6 +442,30 @@ class TelegramSender:
         return False
 
 
+class ChannelMapping:
+    """Validated configuration for one MeshCore channel -> Telegram target."""
+
+    def __init__(self, psk_16: bytes, telegram_chat: str, name: str):
+        self.psk_16 = psk_16
+        self.telegram_chat = telegram_chat
+        self.name = name
+
+
+class ChannelRoute:
+    """Runtime state derived from a ChannelMapping."""
+
+    def __init__(
+        self,
+        mapping: ChannelMapping,
+        telegram_token: str,
+    ):
+        self.name = mapping.name
+        self.telegram_chat = mapping.telegram_chat
+        self.secret_32 = make_secret_32(mapping.psk_16)
+        self.channel_hash = compute_channel_hash(mapping.psk_16)
+        self.telegram = TelegramSender(telegram_token, mapping.telegram_chat)
+
+
 # ─── Stats ────────────────────────────────────────────────────────────────────
 
 class Stats:
@@ -482,9 +513,8 @@ class MeshCoreMQTTBot:
         mqtt_user: Optional[str],
         mqtt_password: Optional[str],
         mqtt_topic: str,
-        psk_16: bytes,
         telegram_token: str,
-        telegram_chat: str,
+        channel_mappings: List[ChannelMapping],
         dedup_ttl: float        = 120.0,
         throttle_per_sender: float = 0.0,
         throttle_global: float  = 0.0,
@@ -496,10 +526,10 @@ class MeshCoreMQTTBot:
         self._pass  = mqtt_password
         self._topic = mqtt_topic
 
-        self._secret_32 = make_secret_32(psk_16)
-        self._ch_hash   = compute_channel_hash(psk_16)
-
-        self._tg     = TelegramSender(telegram_token, telegram_chat)
+        self._routes = [
+            ChannelRoute(mapping, telegram_token)
+            for mapping in channel_mappings
+        ]
         self._dedup  = DedupCache(ttl=dedup_ttl)
         self._throttle = Throttle(per_sender_secs=throttle_per_sender,
                                   global_secs=throttle_global)
@@ -513,11 +543,16 @@ class MeshCoreMQTTBot:
         self._tg_worker: Optional[threading.Thread] = None
 
         log.info(
-            f"Config — channel hash: 0x{self._ch_hash:02X} | "
+            f"Config — {len(self._routes)} channel mapping(s) | "
             f"dedup TTL: {dedup_ttl}s | "
             f"throttle per-sender: {throttle_per_sender}s | "
             f"throttle global: {throttle_global}s"
         )
+        for route in self._routes:
+            log.info(
+                f"[route:{route.name}] channel hash 0x{route.channel_hash:02X} "
+                f"-> Telegram {route.telegram_chat!r}"
+            )
 
     # ── Stats logging ─────────────────────────────────────────────────────────
 
@@ -584,17 +619,20 @@ class MeshCoreMQTTBot:
             item = self._tg_queue.get()
             if item is None:      # shutdown sentinel
                 break
-            sender, message, tg_text = item
+            route, sender, message, tg_text = item
             try:
-                ok = self._tg.send(tg_text)
+                ok = route.telegram.send(tg_text)
             except Exception:
-                log.exception("[telegram] unexpected error while sending")
+                log.exception(f"[telegram:{route.name}] unexpected error while sending")
                 ok = False
             if ok:
                 self._stats.inc("forwarded")
             else:
                 self._stats.inc("telegram_errors")
-                log.error(f"[telegram] failed to forward message from {sender!r}: {message!r}")
+                log.error(
+                    f"[telegram:{route.name}] failed to forward message "
+                    f"from {sender!r}: {message!r}"
+                )
 
     def _on_message(self, client, userdata, msg) -> None:
         # A malformed publish must never escape into paho's loop (which would kill
@@ -640,10 +678,26 @@ class MeshCoreMQTTBot:
         )
 
         # ── Packet decryption ─────────────────────────────────────────────────
-        result = parse_grp_txt_packet(raw_hex, self._secret_32, self._ch_hash)
+        result = None
+        matched_routes = []
+        for route in self._routes:
+            route_result = parse_grp_txt_packet(
+                raw_hex,
+                route.secret_32,
+                route.channel_hash,
+            )
+            if route_result is not None:
+                # Several mappings may intentionally use the same MeshCore PSK
+                # to fan one channel out to several Telegram destinations.
+                result = route_result
+                matched_routes.append(route)
+
         if result is None:
-            # Either different channel, wrong PSK, or malformed — all silent at DEBUG
-            log.debug(f"[mqtt] packet mqtt_hash={pkt_hash}: not our channel or decrypt failed")
+            # Either a different channel, a wrong PSK, or a malformed packet.
+            log.debug(
+                f"[mqtt] packet mqtt_hash={pkt_hash}: "
+                "no configured channel matched or decrypt failed"
+            )
             return
 
         sender, message, stable_id = result
@@ -671,16 +725,21 @@ class MeshCoreMQTTBot:
 
         # ── Forward to Telegram (async: hand off to the worker thread) ────────
         tg_text = f"[{sender}] : {message}"
+        route_names = ", ".join(route.name for route in matched_routes)
         log.info(
-            f"[forward] [{sender}] : {message!r} "
+            f"[forward:{route_names}] [{sender}] : {message!r} "
             f"(id={stable_id}, SNR={snr}, RSSI={rssi})"
         )
 
-        try:
-            self._tg_queue.put_nowait((sender, message, tg_text))
-        except queue.Full:
-            self._stats.inc("telegram_errors")
-            log.warning("[telegram] send queue full — dropping message (Telegram backlog?)")
+        for route in matched_routes:
+            try:
+                self._tg_queue.put_nowait((route, sender, message, tg_text))
+            except queue.Full:
+                self._stats.inc("telegram_errors")
+                log.warning(
+                    f"[telegram:{route.name}] send queue full — "
+                    "dropping message (Telegram backlog?)"
+                )
 
     # ── Main run loop ─────────────────────────────────────────────────────────
 
@@ -749,123 +808,248 @@ class MeshCoreMQTTBot:
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+CONFIG_DEFAULTS = {
+    "mqtt_port": 1883,
+    "mqtt_user": None,
+    "mqtt_password": None,
+    "mqtt_topic": "meshcore/+/+/packets",
+    "dedup_ttl": 120.0,
+    "throttle_per_sender": 0.0,
+    "throttle_global": 0.0,
+    "stats_interval": 600.0,
+    "debug": False,
+}
+
+CONFIG_SCALAR_KEYS = {
+    "mqtt_host", "mqtt_port", "mqtt_user", "mqtt_password", "mqtt_topic",
+    "telegram_token", "channel_psk", "telegram_chat", *CONFIG_DEFAULTS.keys(),
+}
+
+
+def load_config_file(filename: str) -> dict:
+    """Load and validate the top level of a JSON configuration file."""
+    path = Path(filename)
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"Cannot read config file {str(path)!r}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON in config file {str(path)!r} at "
+            f"line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
+    if not isinstance(config, dict):
+        raise ValueError("The config file root must be a JSON object")
+    unknown = sorted(set(config) - (CONFIG_SCALAR_KEYS | {"channel_mappings"}))
+    if unknown:
+        raise ValueError(f"Unknown config key(s): {', '.join(unknown)}")
+    return config
+
+
+def parse_channel_map(value: str) -> Tuple[str, str]:
+    """Parse the repeatable CLI PSK:TELEGRAM_CHAT mapping syntax."""
+    if ":" not in value:
+        raise ValueError(f"Invalid channel mapping {value!r}; expected PSK:TELEGRAM_CHAT")
+    psk, telegram_chat = value.rsplit(":", 1)
+    if not psk.strip() or not telegram_chat.strip():
+        raise ValueError(
+            f"Invalid channel mapping {value!r}; PSK and Telegram chat are required"
+        )
+    return psk.strip(), telegram_chat.strip()
+
+
+def make_channel_mapping(psk: object, chat: object, name: object) -> ChannelMapping:
+    if not isinstance(psk, str):
+        raise ValueError(f"Channel {name!r}: psk must be a string")
+    if not isinstance(chat, (str, int)):
+        raise ValueError(f"Channel {name!r}: telegram_chat must be a string or integer")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Each channel mapping name must be a non-empty string")
+    telegram_chat = str(chat).strip()
+    if not telegram_chat:
+        raise ValueError(f"Channel {name!r}: telegram_chat cannot be empty")
+    try:
+        psk_16 = psk_to_bytes(psk)
+    except ValueError as exc:
+        raise ValueError(f"Channel {name!r}: {exc}") from exc
+    return ChannelMapping(psk_16, telegram_chat, name.strip())
+
+
+def resolve_configuration(args: argparse.Namespace) -> dict:
+    """Merge defaults, JSON config and CLI arguments, then validate them."""
+    config = load_config_file(args.config) if args.config else {}
+    resolved = {}
+    for key, default in CONFIG_DEFAULTS.items():
+        cli_value = getattr(args, key)
+        resolved[key] = cli_value if cli_value is not None else config.get(key, default)
+    for key in ("mqtt_host", "telegram_token"):
+        cli_value = getattr(args, key)
+        resolved[key] = cli_value if cli_value is not None else config.get(key)
+
+    for required_key in ("mqtt_host", "telegram_token"):
+        if not isinstance(resolved[required_key], str) or not resolved[required_key].strip():
+            raise ValueError(
+                f"Missing required setting {required_key!r} "
+                f"(use --{required_key.replace('_', '-')} or the config file)"
+            )
+        resolved[required_key] = resolved[required_key].strip()
+    if not isinstance(resolved["mqtt_topic"], str) or not resolved["mqtt_topic"].strip():
+        raise ValueError("mqtt_topic must be a non-empty string")
+    try:
+        resolved["mqtt_port"] = int(resolved["mqtt_port"])
+        for key in ("dedup_ttl", "throttle_per_sender", "throttle_global", "stats_interval"):
+            resolved[key] = float(resolved[key])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid numeric setting in configuration: {exc}") from exc
+    if not 1 <= resolved["mqtt_port"] <= 65535:
+        raise ValueError("mqtt_port must be between 1 and 65535")
+    for key in ("dedup_ttl", "throttle_per_sender", "throttle_global", "stats_interval"):
+        if resolved[key] < 0:
+            raise ValueError(f"{key} cannot be negative")
+    if not isinstance(resolved["debug"], bool):
+        raise ValueError("debug must be true or false in the config file")
+
+    raw_config_mappings = config.get("channel_mappings", [])
+    if not isinstance(raw_config_mappings, list):
+        raise ValueError("channel_mappings must be a JSON array")
+    mappings = []
+    for index, item in enumerate(raw_config_mappings):
+        if not isinstance(item, dict):
+            raise ValueError(f"channel_mappings[{index}] must be a JSON object")
+        unknown = sorted(set(item) - {"name", "psk", "telegram_chat"})
+        if unknown:
+            raise ValueError(
+                f"channel_mappings[{index}] has unknown key(s): {', '.join(unknown)}"
+            )
+        missing = {"psk", "telegram_chat"} - set(item)
+        if missing:
+            raise ValueError(
+                f"channel_mappings[{index}] is missing: {', '.join(sorted(missing))}"
+            )
+        name = item.get("name", f"channel-{len(mappings) + 1}")
+        mappings.append(make_channel_mapping(item["psk"], item["telegram_chat"], name))
+
+    # CLI mappings add routes to those from the config file instead of replacing them.
+    for value in args.channel_map or []:
+        psk, chat = parse_channel_map(value)
+        mappings.append(make_channel_mapping(psk, chat, f"channel-{len(mappings) + 1}"))
+
+    # Backward-compatible single-channel pair, accepted in either CLI or JSON.
+    legacy_psk = args.channel_psk if args.channel_psk is not None else config.get("channel_psk")
+    legacy_chat = args.telegram_chat if args.telegram_chat is not None else config.get("telegram_chat")
+    if (legacy_psk is None) != (legacy_chat is None):
+        raise ValueError("--channel-psk and --telegram-chat must be provided together")
+    if legacy_psk is not None:
+        mappings.append(
+            make_channel_mapping(legacy_psk, legacy_chat, f"channel-{len(mappings) + 1}")
+        )
+    if not mappings:
+        raise ValueError(
+            "No channel mapping configured; use --channel-map, channel_mappings in "
+            "the config file, or the legacy --channel-psk/--telegram-chat pair"
+        )
+
+    names = [mapping.name for mapping in mappings]
+    if len(names) != len(set(names)):
+        raise ValueError("Channel mapping names must be unique")
+    pairs = [(mapping.psk_16, mapping.telegram_chat) for mapping in mappings]
+    if len(pairs) != len(set(pairs)):
+        raise ValueError("Duplicate channel PSK / Telegram chat mapping")
+    resolved["channel_mappings"] = mappings
+    return resolved
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Forward MeshCore channel messages from MQTT to Telegram",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-PREREQUISITES
-  The MeshCore device/repeater must run WITH_MQTT_BRIDGE firmware with:
-    set mqtt.server  <broker_host>
-    set mqtt.packets on
-  Published topic: meshcore/{iata}/{device_id}/packets
+CONFIG FILE
+  --config config.json loads MQTT, Telegram and channel settings from JSON.
+  Scalar command-line options override their config value. Every --channel-map
+  adds a mapping to channel_mappings from the file.
 
-CHANNEL PSK (--channel-psk)
-  Base64 (from MeshCore companion app channel export):
-    izOH6cXN6mrJ5e26oRXNcg==
-  Hex (32 hex chars = 16 bytes):
-    8b338f9e5cd27ac4...
-
-THROTTLING
-  --throttle-per-sender 30   → one message per sender per 30 s
-  --throttle-global 5        → at most one message every 5 s total
-
-DEDUPLICATION
-  --dedup-ttl 120            → ignore duplicate hashes seen within 120 s
-  (A packet heard by 3 nodes arrives 3 times with the same hash field.)
+CHANNEL MAPPINGS
+  Repeat --channel-map PSK:TELEGRAM_CHAT as many times as needed. PSK accepts
+  base64 (from a MeshCore channel export) or 32 hexadecimal characters.
 
 EXAMPLES
-  # Minimal
+  # Two mappings on one bot
+  python meshcore_mqtt_telegram.py \\
+      --mqtt-host 192.168.1.10 \\
+      --telegram-token 7123456789:AAExxxxxx \\
+      --channel-map 'izOH6cXN6mrJ5e26oRXNcg==:-100123456789' \\
+      --channel-map '00112233445566778899aabbccddeeff:@another_channel'
+
+  # All settings in a JSON file
+  python meshcore_mqtt_telegram.py --config meshcore_mqtt_telegram.json
+
+  # Legacy single-channel syntax (still supported)
   python meshcore_mqtt_telegram.py \\
       --mqtt-host 192.168.1.10 \\
       --channel-psk izOH6cXN6mrJ5e26oRXNcg== \\
       --telegram-token 7123456789:AAExxxxxx \\
       --telegram-chat -100123456789
-
-  # With auth, throttle, custom topic
-  python meshcore_mqtt_telegram.py \\
-      --mqtt-host broker.example.com --mqtt-port 8883 \\
-      --mqtt-user alice --mqtt-password s3cr3t \\
-      --mqtt-topic "meshcore/CDG/+/packets" \\
-      --channel-psk izOH6cXN6mrJ5e26oRXNcg== \\
-      --telegram-token 7123456789:AAExxxxxx \\
-      --telegram-chat @my_channel \\
-      --throttle-per-sender 30 \\
-      --throttle-global 5 \\
-      --dedup-ttl 180 \\
-      --debug
 """,
     )
-
-    # MQTT
-    p.add_argument("--mqtt-host", required=True,
-                   help="MQTT broker hostname or IP address")
-    p.add_argument("--mqtt-port", type=int, default=1883,
+    p.add_argument("--config", metavar="FILE", help="JSON configuration file")
+    p.add_argument("--mqtt-host", default=None, help="MQTT broker hostname or IP address")
+    p.add_argument("--mqtt-port", type=int, default=None,
                    help="MQTT broker port (default: 1883)")
-    p.add_argument("--mqtt-user", default=None,
-                   help="MQTT username (optional)")
-    p.add_argument("--mqtt-password", default=None,
-                   help="MQTT password (optional)")
-    p.add_argument("--mqtt-topic", default="meshcore/+/+/packets",
+    p.add_argument("--mqtt-user", default=None, help="MQTT username (optional)")
+    p.add_argument("--mqtt-password", default=None, help="MQTT password (optional)")
+    p.add_argument("--mqtt-topic", default=None,
                    help="MQTT topic pattern (default: meshcore/+/+/packets)")
-
-    # Channel
-    p.add_argument("--channel-psk", required=True,
-                   help="Channel PSK as base64 or 32-char hex (16 bytes)")
-
-    # Telegram
-    p.add_argument("--telegram-token", required=True,
+    p.add_argument("--telegram-token", default=None,
                    help="Telegram Bot API token (from @BotFather)")
-    p.add_argument("--telegram-chat", required=True,
-                   help=(
-                       "Telegram chat ID: plain group/channel (-1002252977991), "
-                       "@username, or CHAT_ID_THREAD_ID for forum topics "
-                       "(e.g. 1002252977991_239175)"
-                   ))
-
-    # Deduplication
-    p.add_argument("--dedup-ttl", type=float, default=120.0, metavar="SECONDS",
-                   help="Packet hash TTL for deduplication (default: 120s, 0 to disable)")
-
-    # Throttling
-    p.add_argument("--throttle-per-sender", type=float, default=0.0, metavar="SECONDS",
-                   help="Min seconds between messages from the same sender (default: 0 = off)")
-    p.add_argument("--throttle-global", type=float, default=0.0, metavar="SECONDS",
-                   help="Min seconds between any two forwarded messages (default: 0 = off)")
-
-    # Diagnostics
-    p.add_argument("--stats-interval", type=float, default=600.0, metavar="SECONDS",
-                   help="How often to log periodic stats (default: 600s, 0 to disable)")
-    p.add_argument("--debug", action="store_true",
+    p.add_argument("--channel-map", action="append", default=None,
+                   metavar="PSK:TELEGRAM_CHAT",
+                   help="MeshCore PSK to Telegram target mapping; repeatable")
+    p.add_argument("--channel-psk", default=None,
+                   help="Legacy single-channel PSK (use with --telegram-chat)")
+    p.add_argument("--telegram-chat", default=None,
+                   help="Legacy single Telegram target (use with --channel-psk)")
+    p.add_argument("--dedup-ttl", type=float, default=None, metavar="SECONDS",
+                   help="Duplicate TTL (default: 120s, 0 to disable)")
+    p.add_argument("--throttle-per-sender", type=float, default=None, metavar="SECONDS",
+                   help="Min seconds between messages from one sender (default: off)")
+    p.add_argument("--throttle-global", type=float, default=None, metavar="SECONDS",
+                   help="Min seconds between any two incoming messages (default: off)")
+    p.add_argument("--stats-interval", type=float, default=None, metavar="SECONDS",
+                   help="Periodic stats interval (default: 600s, 0 to disable)")
+    p.add_argument("--debug", action="store_true", default=None,
                    help="Enable DEBUG logging (very verbose)")
+    return p
+
+
+def main() -> None:
+    p = build_argument_parser()
 
     args = p.parse_args()
 
+    try:
+        config = resolve_configuration(args)
+    except ValueError as exc:
+        p.error(str(exc))
+
     logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
+        level=logging.DEBUG if config["debug"] else logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    try:
-        psk_16 = psk_to_bytes(args.channel_psk)
-    except ValueError as exc:
-        log.error(str(exc))
-        raise SystemExit(1)
-
     bot = MeshCoreMQTTBot(
-        mqtt_host           = args.mqtt_host,
-        mqtt_port           = args.mqtt_port,
-        mqtt_user           = args.mqtt_user,
-        mqtt_password       = args.mqtt_password,
-        mqtt_topic          = args.mqtt_topic,
-        psk_16              = psk_16,
-        telegram_token      = args.telegram_token,
-        telegram_chat       = args.telegram_chat,
-        dedup_ttl           = args.dedup_ttl,
-        throttle_per_sender = args.throttle_per_sender,
-        throttle_global     = args.throttle_global,
-        stats_interval      = args.stats_interval,
+        mqtt_host           = config["mqtt_host"],
+        mqtt_port           = config["mqtt_port"],
+        mqtt_user           = config["mqtt_user"],
+        mqtt_password       = config["mqtt_password"],
+        mqtt_topic          = config["mqtt_topic"],
+        telegram_token      = config["telegram_token"],
+        channel_mappings    = config["channel_mappings"],
+        dedup_ttl           = config["dedup_ttl"],
+        throttle_per_sender = config["throttle_per_sender"],
+        throttle_global     = config["throttle_global"],
+        stats_interval      = config["stats_interval"],
     )
     bot.run()
 

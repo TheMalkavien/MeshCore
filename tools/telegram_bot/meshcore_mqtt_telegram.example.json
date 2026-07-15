@@ -1,0 +1,25 @@
+{
+  "mqtt_host": "192.168.1.10",
+  "mqtt_port": 1883,
+  "mqtt_user": null,
+  "mqtt_password": null,
+  "mqtt_topic": "meshcore/+/+/packets",
+  "telegram_token": "7123456789:AAExxxxxx",
+  "channel_mappings": [
+    {
+      "name": "Public",
+      "psk": "izOH6cXN6mrJ5e26oRXNcg==",
+      "telegram_chat": "-100123456789"
+    },
+    {
+      "name": "operations",
+      "psk": "00112233445566778899aabbccddeeff",
+      "telegram_chat": "-100987654321_239175"
+    }
+  ],
+  "dedup_ttl": 120,
+  "throttle_per_sender": 0,
+  "throttle_global": 0,
+  "stats_interval": 600,
+  "debug": false
+}
