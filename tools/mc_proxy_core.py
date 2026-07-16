@@ -34,6 +34,8 @@ CMD_ADD_UPDATE_CONTACT = 0x09
 CMD_SYNC_NEXT_MESSAGE = 0x0A
 CMD_RESET_PATH = 0x0D
 CMD_REMOVE_CONTACT = 0x0F
+CMD_GET_CHANNEL = 0x1F
+CMD_SET_CHANNEL = 0x20
 RESP_CODE_SELF_INFO = 0x05
 RESP_CODE_NO_MORE_MESSAGES = 0x0A
 RESP_CODE_END_OF_CONTACTS = 0x04
@@ -643,6 +645,22 @@ class ProxyCore:
                 "[cache] evicted contact pubkey=%s… (now %d)", pubkey[:4].hex(), len(bucket)
             )
 
+    def _evict_channel_from_cache(self, channel_idx: int) -> None:
+        """Remove a channel changed by CMD_SET_CHANNEL from the state cache.
+
+        The firmware acknowledges SET_CHANNEL with OK but does not emit a fresh
+        CHANNEL_INFO frame. Evicting the old snapshot makes the app's following
+        GET_CHANNEL reach the backend and repopulate the cache with the new data.
+        """
+        bucket = self._state_cache.get(CHANNEL_INFO_TYPE)
+        key = bytes((channel_idx,))
+        if bucket and key in bucket:
+            del bucket[key]
+            self._logger.info(
+                "[cache] evicted channel index=%d after SET_CHANNEL (now %d)",
+                channel_idx, len(bucket),
+            )
+
     def _reset_contact_path_in_cache(self, pubkey: bytes) -> None:
         """Patch a cached contact's out_path_len to OUT_PATH_UNKNOWN (0xFF).
 
@@ -989,7 +1007,13 @@ class ProxyCore:
                     elif command == CMD_SYNC_NEXT_MESSAGE:
                         # Always served locally from the proxy cache.
                         await self._serve_pending_message(state)
-                    elif command == 0x1F and len(frame) >= 5:
+                    elif command == CMD_SET_CHANNEL and len(frame) >= 5:
+                        # SET_CHANNEL only yields OK/ERR; the backend does not
+                        # push the updated CHANNEL_INFO. Drop this index now so
+                        # the app's next GET_CHANNEL cannot receive stale data.
+                        forward_frames.append(frame)
+                        self._evict_channel_from_cache(frame[4])
+                    elif command == CMD_GET_CHANNEL and len(frame) >= 5:
                         # CMD_GET_CHANNEL: serve from cache if available.
                         channel_idx = frame[4]
                         cached_channels = self._state_cache.get(CHANNEL_INFO_TYPE, {})
