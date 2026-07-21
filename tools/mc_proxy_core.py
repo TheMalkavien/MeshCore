@@ -111,6 +111,12 @@ DEFAULT_BACKEND_WRITE_TIMEOUT = 10.0
 # and reset the exponential reconnect backoff. Shorter -> treated as flapping.
 DEFAULT_STABLE_CONNECTION_SECS = 5.0
 
+# Synthetic sent echoes are local proxy events, not RF receptions.  Using the
+# receive-side 0xFF "direct" sentinel here makes clients which decode the byte
+# as packed path metadata display the impossible value "63 hops / 4-byte".
+# Encode an unambiguous empty path instead (0 hops, 1-byte hash mode).
+SYNTHETIC_ECHO_PATH_LEN = 0x00
+
 # Per-client message stream, queued on the node and retrieved one-at-a-time via
 # CMD_SYNC_NEXT_MESSAGE (history + per-client cursor; missed ones replayed):
 #   RESP_CODE_CONTACT_MSG_RECV / CHANNEL_MSG_RECV       (v<3 : 0x07, 0x08)
@@ -167,6 +173,24 @@ PACKET_TYPE_NAMES: dict[int, str] = {
     0x8F: "PUSH_CONTACT_DELETED",
     0x90: "PUSH_CONTACTS_FULL",
 }
+
+
+def _build_sent_echo_frame(channel_idx: int, text_data: bytes, timestamp: int) -> bytes:
+    """Build the synthetic V3 channel-message frame shared with peer clients."""
+    payload = bytes([
+        0x11,                         # CHANNEL_MSG_RECV_V3
+        0,                            # SNR = 0 (synthetic, no RF)
+        0, 0,                         # reserved
+        channel_idx,                  # target channel
+        SYNTHETIC_ECHO_PATH_LEN,      # empty synthetic path
+        0,                            # txt_type = plain text
+    ]) + timestamp.to_bytes(4, "little") + text_data
+
+    return bytes([
+        ord(">"),
+        len(payload) & 0xFF,
+        (len(payload) >> 8) & 0xFF,
+    ]) + payload
 
 # How often (in poll iterations) to prune stale inactive client states.
 _PRUNE_EVERY_N_POLLS = 60
@@ -1193,16 +1217,7 @@ class ProxyCore:
         if node_name:
             text_data = node_name.encode("utf-8") + b": " + text_data
 
-        payload = bytes([
-            0x11,           # CHANNEL_MSG_RECV_V3
-            0,              # SNR = 0 (synthetic, no RF)
-            0, 0,           # reserved
-            channel_idx,    # target channel
-            0xFF,           # plen = 255 (flood path)
-            0,              # txt_type = plain text
-        ]) + timestamp.to_bytes(4, "little") + text_data
-
-        frame = bytes([ord(">"), len(payload) & 0xFF, (len(payload) >> 8) & 0xFF]) + payload
+        frame = _build_sent_echo_frame(channel_idx, text_data, timestamp)
         self._logger.info(
             "[echo] injecting sent msg ch=%d text=%r excluding=%s",
             channel_idx, text_data.decode("utf-8", "ignore"), exclude_client_id,
