@@ -711,7 +711,7 @@ void TrackerMesh::sendGroupText(const char* text) {
       (unsigned long)timestamp,
       (char*)&data[5]);
     trackerPeripheralsNotifyTx();
-    sendFlood(pkt);
+    sendFlood(pkt, 0, prefs ? prefs->path_hash_mode + 1 : 1);
   } else {
     TRACKER_DBG("group packet alloc failed");
   }
