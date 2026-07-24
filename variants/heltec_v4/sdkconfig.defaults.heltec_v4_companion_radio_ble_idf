@@ -1,4 +1,4 @@
-CONFIG_FREERTOS_HZ=100
+CONFIG_FREERTOS_HZ=1000
 CONFIG_AUTOSTART_ARDUINO=y
 
 # Keep boot noise and console traffic disabled for low-power firmware.
@@ -13,13 +13,15 @@ CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ=80
 # Enable automatic power management + DFS + automatic light sleep.
 CONFIG_PM_ENABLE=y
 CONFIG_PM_DFS_INIT_AUTO=y
-CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=n
-CONFIG_PM_POWER_DOWN_TAGMEM_IN_LIGHT_SLEEP=n
+# Power down CPU + tag memory in light sleep for the lowest idle current
+# (retention keeps state; wake latency stays in the microsecond range).
+CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=y
+CONFIG_PM_POWER_DOWN_TAGMEM_IN_LIGHT_SLEEP=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
-# 2 ticks at 100 Hz ~= 20 ms idle before entering light sleep.
-# Keep this aligned with the companion loop idle delay so auto light sleep
-# actually triggers while BLE is connected but otherwise idle.
-CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=2
+# 4 ticks at 1000 Hz = 4 ms idle before entering auto light sleep.
+# These MUST match the committed sdkconfig.heltec_v4_companion_radio_ble_idf
+# (which takes precedence when present) so a regen from defaults cannot regress.
+CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=4
 # NOTE:
 # On ESP32-S3, ESP-IDF enables ESP_SLEEP_GPIO_RESET_WORKAROUND by default,
 # which selects PM_SLP_DISABLE_GPIO when tickless idle is active.

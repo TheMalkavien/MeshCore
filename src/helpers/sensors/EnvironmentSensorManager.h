@@ -49,6 +49,11 @@ public:
   #if ENV_INCLUDE_GPS
   EnvironmentSensorManager(LocationProvider &location): _location(&location){};
   LocationProvider* getLocationProvider() { return _location; }
+  // True while the GPS is enabled at all.
+  bool isGPSActive() const { return gps_active; }
+  // True only while actively acquiring a fix (GPS UART is streaming NMEA and
+  // must be serviced frequently; also holds off auto light-sleep via a PM lock).
+  bool isGPSFixWindowActive() const { return gps_fix_window_active; }
   #else
   EnvironmentSensorManager(){};
   #endif
