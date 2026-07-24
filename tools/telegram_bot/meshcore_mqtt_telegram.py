@@ -2,8 +2,9 @@
 """
 MeshCore → Telegram relay bot
 
-Subscribes to a MeshCore MQTT bridge (mode packets) and forwards decoded
-channel text messages to one or more Telegram chats.
+Subscribes to a MeshCore MQTT bridge (mode packets) and to optional decoded
+Home Assistant channel-message events, then forwards channel text messages to
+one or more Telegram chats.
 
 The MeshCore device/repeater must have WITH_MQTT_BRIDGE firmware and
 packets mode enabled (set mqtt.packets on).
@@ -13,6 +14,12 @@ Payload:     JSON with fields origin, packet_type, direction, raw, hash, ...
              packet_type "5" = PAYLOAD_TYPE_GRP_TXT (group channel message)
              raw = hex-encoded raw LoRa packet (AES-128-ECB encrypted payload)
              hash = unique packet fingerprint for deduplication
+
+Fallback topic: meshcore/{iata}/{device_id}/messages
+Payload:        JSON with type "MESSAGE", direction "rx", message_type
+                "channel", channel/channel_idx, sender, message and timestamp.
+                This path keeps Telegram delivery working when the companion
+                emits the decoded message but no RX_LOG_DATA/raw packet.
 
 Features:
   - Automatic MQTT reconnection with exponential backoff
@@ -46,6 +53,7 @@ import logging
 import queue
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -150,7 +158,7 @@ def parse_grp_txt_packet(
     raw_hex: str,
     secret_32: bytes,
     expected_hash_byte: int,
-) -> Optional[Tuple[str, str, str]]:
+) -> Optional[Tuple[str, str, str, int]]:
     """
     Parse and decrypt a raw GRP_TXT LoRa packet from its hex representation.
 
@@ -168,7 +176,7 @@ def parse_grp_txt_packet(
                   [4]    txt_type  (0 = PLAIN, skip)
                   [5:]   "sender_name: message_text"  (null-padded)
 
-    Returns (sender, message, stable_id) or None.
+    Returns (sender, message, stable_id, sender_timestamp) or None.
 
     stable_id is a SHA-256 fingerprint of the MAC+ciphertext.  Unlike the
     'hash' field in the MQTT JSON (which uses Packet::calculatePacketHash and
@@ -233,14 +241,59 @@ def parse_grp_txt_packet(
     if len(plaintext) < 6:
         return None
 
-    if plaintext[4] != 0:   # txt_type: only PLAIN (0) has the "sender: msg" layout we parse
+    # The low two bits are the retry attempt. Only the upper bits identify the
+    # text type, so values 0..3 are all plain channel text.
+    if (plaintext[4] >> 2) != 0:
         return None
 
+    sender_timestamp = int.from_bytes(plaintext[:4], byteorder="little")
     text = plaintext[5:].rstrip(b"\x00").decode("utf-8", errors="replace")
     sep  = text.find(": ")
     if sep >= 0:
-        return text[:sep], text[sep + 2:], stable_id
-    return "?", text, stable_id
+        return text[:sep], text[sep + 2:], stable_id, sender_timestamp
+    return "?", text, stable_id, sender_timestamp
+
+
+def normalize_sender_timestamp(value: object) -> Optional[int]:
+    """Normalize a decoded HA event timestamp to a non-negative Unix integer."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        timestamp = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return timestamp if timestamp >= 0 else None
+
+
+def make_message_dedup_id(
+    channel_hash: int,
+    sender_timestamp: Optional[int],
+    sender: str,
+    message: str,
+) -> str:
+    """Build one ID shared by raw packets and decoded-message fallbacks."""
+    timestamp = sender_timestamp if sender_timestamp is not None else 0
+    identity = bytearray(b"meshcore-grp-txt-v1\x00")
+    identity.append(channel_hash & 0xFF)
+    identity.extend(timestamp.to_bytes(8, byteorder="little", signed=False))
+    identity.extend(sender.encode("utf-8", errors="replace"))
+    identity.append(0)
+    identity.extend(message.encode("utf-8", errors="replace"))
+    return hashlib.sha256(identity).hexdigest()[:16].upper()
+
+
+def make_message_content_id(channel_hash: int, sender: str, message: str) -> str:
+    """Build a short-lived fallback ID when producers disagree on timestamp."""
+    identity = bytearray(b"meshcore-grp-txt-content-v1\x00")
+    identity.append(channel_hash & 0xFF)
+    identity.extend(
+        unicodedata.normalize("NFC", sender).encode("utf-8", errors="replace")
+    )
+    identity.append(0)
+    identity.extend(
+        unicodedata.normalize("NFC", message).encode("utf-8", errors="replace")
+    )
+    return hashlib.sha256(identity).hexdigest()[:16].upper()
 
 
 # ─── Dedup cache ───────────────────────────────────────────────────────────────
@@ -445,10 +498,19 @@ class TelegramSender:
 class ChannelMapping:
     """Validated configuration for one MeshCore channel -> Telegram target."""
 
-    def __init__(self, psk_16: bytes, telegram_chat: str, name: str):
+    def __init__(
+        self,
+        psk_16: bytes,
+        telegram_chat: str,
+        name: str,
+        channel_name: Optional[str] = None,
+        channel_idx: Optional[int] = None,
+    ):
         self.psk_16 = psk_16
         self.telegram_chat = telegram_chat
         self.name = name
+        self.channel_name = channel_name if channel_name is not None else name
+        self.channel_idx = channel_idx
 
 
 class ChannelRoute:
@@ -463,7 +525,24 @@ class ChannelRoute:
         self.telegram_chat = mapping.telegram_chat
         self.secret_32 = make_secret_32(mapping.psk_16)
         self.channel_hash = compute_channel_hash(mapping.psk_16)
+        self.channel_name = mapping.channel_name
+        self.channel_idx = mapping.channel_idx
         self.telegram = TelegramSender(telegram_token, mapping.telegram_chat)
+
+    def matches_decoded_channel(
+        self,
+        channel_name: str,
+        channel_idx: Optional[int],
+    ) -> bool:
+        """Match a plaintext HA channel event to this configured route."""
+        if self.channel_idx is not None:
+            if channel_idx is None or channel_idx != self.channel_idx:
+                return False
+        if self.channel_name:
+            if not channel_name:
+                return self.channel_idx is not None
+            return channel_name.casefold() == self.channel_name.casefold()
+        return self.channel_idx is not None
 
 
 # ─── Stats ────────────────────────────────────────────────────────────────────
@@ -478,6 +557,7 @@ class Stats:
             self.mqtt_connects       = 0
             self.mqtt_disconnects    = 0
             self.packets_received    = 0  # GRP_TXT rx, our channel hash
+            self.decoded_fallbacks   = 0
             self.deduplicated        = 0
             self.throttled           = 0
             self.forwarded           = 0
@@ -496,6 +576,7 @@ class Stats:
                 "mqtt_connects":     self.mqtt_connects,
                 "mqtt_disconnects":  self.mqtt_disconnects,
                 "packets_received":  self.packets_received,
+                "decoded_fallbacks": self.decoded_fallbacks,
                 "deduplicated":      self.deduplicated,
                 "throttled":         self.throttled,
                 "forwarded":         self.forwarded,
@@ -515,7 +596,9 @@ class MeshCoreMQTTBot:
         mqtt_topic: str,
         telegram_token: str,
         channel_mappings: List[ChannelMapping],
+        mqtt_message_topic: str = "meshcore/+/+/messages",
         dedup_ttl: float        = 120.0,
+        content_dedup_ttl: float = 5.0,
         throttle_per_sender: float = 0.0,
         throttle_global: float  = 0.0,
         stats_interval: float   = 600.0,
@@ -525,12 +608,14 @@ class MeshCoreMQTTBot:
         self._user  = mqtt_user
         self._pass  = mqtt_password
         self._topic = mqtt_topic
+        self._message_topic = mqtt_message_topic
 
         self._routes = [
             ChannelRoute(mapping, telegram_token)
             for mapping in channel_mappings
         ]
         self._dedup  = DedupCache(ttl=dedup_ttl)
+        self._content_dedup = DedupCache(ttl=content_dedup_ttl)
         self._throttle = Throttle(per_sender_secs=throttle_per_sender,
                                   global_secs=throttle_global)
         self._stats  = Stats()
@@ -545,12 +630,15 @@ class MeshCoreMQTTBot:
         log.info(
             f"Config — {len(self._routes)} channel mapping(s) | "
             f"dedup TTL: {dedup_ttl}s | "
+            f"content dedup TTL: {content_dedup_ttl}s | "
             f"throttle per-sender: {throttle_per_sender}s | "
             f"throttle global: {throttle_global}s"
         )
         for route in self._routes:
             log.info(
                 f"[route:{route.name}] channel hash 0x{route.channel_hash:02X} "
+                f"| decoded channel={route.channel_name!r}"
+                f"{f' idx={route.channel_idx}' if route.channel_idx is not None else ''} "
                 f"-> Telegram {route.telegram_chat!r}"
             )
 
@@ -568,6 +656,7 @@ class MeshCoreMQTTBot:
         log.info(
             f"[stats] uptime={s['uptime_s']}s | "
             f"received={s['packets_received']} | "
+            f"decoded_fallbacks={s['decoded_fallbacks']} | "
             f"dedup={s['deduplicated']} | "
             f"throttled={s['throttled']} | "
             f"forwarded={s['forwarded']} | "
@@ -591,11 +680,13 @@ class MeshCoreMQTTBot:
         if rc == 0:
             self._stats.inc("mqtt_connects")
             log.info(f"[mqtt] connected to {self._host}:{self._port}")
-            result, mid = client.subscribe(self._topic)
-            if result == mqtt.MQTT_ERR_SUCCESS:
-                log.info(f"[mqtt] subscribed to {self._topic!r} (mid={mid})")
-            else:
-                log.error(f"[mqtt] subscribe failed (result={result})")
+            topics = list(dict.fromkeys((self._topic, self._message_topic)))
+            for topic in topics:
+                result, mid = client.subscribe(topic)
+                if result == mqtt.MQTT_ERR_SUCCESS:
+                    log.info(f"[mqtt] subscribed to {topic!r} (mid={mid})")
+                else:
+                    log.error(f"[mqtt] subscribe to {topic!r} failed (result={result})")
         else:
             reason = RC_NAMES.get(rc, f"code {rc}")
             log.error(f"[mqtt] connection refused: {reason}")
@@ -650,6 +741,10 @@ class MeshCoreMQTTBot:
             log.debug(f"[mqtt] non-JSON on {msg.topic}: {exc}")
             return
 
+        if data.get("type") == "MESSAGE":
+            self._handle_decoded_channel_message(data, msg.topic)
+            return
+
         # Only PACKET frames (type field discriminates from status/raw messages)
         if data.get("type") != "PACKET":
             return
@@ -700,15 +795,27 @@ class MeshCoreMQTTBot:
             )
             return
 
-        sender, message, stable_id = result
+        sender, message, _raw_stable_id, sender_timestamp = result
         self._stats.inc("packets_received")
+        stable_id = make_message_dedup_id(
+            matched_routes[0].channel_hash,
+            sender_timestamp,
+            sender,
+            message,
+        )
+        content_id = make_message_content_id(
+            matched_routes[0].channel_hash,
+            sender,
+            message,
+        )
 
         # ── Deduplication ─────────────────────────────────────────────────────
-        # Use stable_id (SHA-256 of MAC+ciphertext) instead of the MQTT 'hash'
-        # field.  The MQTT hash includes path_len which changes at every relay
-        # hop, so the same logical message arrives with different hash values
-        # from different nodes.  stable_id is hop-invariant.
-        if self._dedup.is_duplicate(stable_id):
+        # The canonical ID is independent of the reception path and can also be
+        # reproduced from the decoded Home Assistant fallback event.
+        if (
+            self._dedup.is_duplicate(stable_id)
+            or self._content_dedup.is_duplicate(content_id)
+        ):
             self._stats.inc("deduplicated")
             log.info(
                 f"[dedup] SKIP id={stable_id} from {sender!r} "
@@ -742,6 +849,91 @@ class MeshCoreMQTTBot:
                 )
 
     # ── Main run loop ─────────────────────────────────────────────────────────
+
+    def _handle_decoded_channel_message(self, data: dict, topic: str) -> None:
+        """Forward a plaintext HA meshcore_message when its raw RX_LOG is absent."""
+        if data.get("direction") != "rx" or data.get("outgoing") is True:
+            return
+        if str(data.get("message_type", "")).casefold() != "channel":
+            return
+
+        sender_value = data.get("sender", data.get("sender_name"))
+        message_value = data.get("message")
+        if not isinstance(sender_value, str) or not sender_value.strip():
+            log.debug(f"[mqtt] decoded channel message without sender on {topic}")
+            return
+        if not isinstance(message_value, str):
+            log.debug(f"[mqtt] decoded channel message without text on {topic}")
+            return
+
+        sender = sender_value.strip()
+        message = message_value
+        channel_name = str(data.get("channel", data.get("channel_name", ""))).strip()
+        channel_idx = normalize_sender_timestamp(data.get("channel_idx"))
+        matched_routes = [
+            route
+            for route in self._routes
+            if route.matches_decoded_channel(channel_name, channel_idx)
+        ]
+        if not matched_routes:
+            log.debug(
+                f"[mqtt] decoded channel {channel_name!r} idx={channel_idx!r}: "
+                "no configured route matched"
+            )
+            return
+
+        sender_timestamp = normalize_sender_timestamp(
+            data.get("sender_timestamp", data.get("timestamp"))
+        )
+        stable_id = make_message_dedup_id(
+            matched_routes[0].channel_hash,
+            sender_timestamp,
+            sender,
+            message,
+        )
+        content_id = make_message_content_id(
+            matched_routes[0].channel_hash,
+            sender,
+            message,
+        )
+        self._stats.inc("packets_received")
+        self._stats.inc("decoded_fallbacks")
+
+        if (
+            self._dedup.is_duplicate(stable_id)
+            or self._content_dedup.is_duplicate(content_id)
+        ):
+            self._stats.inc("deduplicated")
+            log.info(
+                f"[dedup] SKIP id={stable_id} from {sender!r} "
+                f"(already seen, decoded source {data.get('origin', 'Home Assistant')!r})"
+            )
+            return
+
+        allowed, reason = self._throttle.check(sender)
+        if not allowed:
+            self._stats.inc("throttled")
+            log.info(f"[throttle] SKIP message from {sender!r}: {reason}")
+            return
+
+        tg_text = f"[{sender}] : {message}"
+        route_names = ", ".join(route.name for route in matched_routes)
+        snr = data.get("SNR", data.get("snr", "?"))
+        rssi = data.get("RSSI", data.get("rssi", "?"))
+        log.info(
+            f"[forward:{route_names}] [{sender}] : {message!r} "
+            f"(id={stable_id}, source=decoded, SNR={snr}, RSSI={rssi})"
+        )
+
+        for route in matched_routes:
+            try:
+                self._tg_queue.put_nowait((route, sender, message, tg_text))
+            except queue.Full:
+                self._stats.inc("telegram_errors")
+                log.warning(
+                    f"[telegram:{route.name}] send queue full — "
+                    "dropping message (Telegram backlog?)"
+                )
 
     def run(self) -> None:
         self._schedule_stats()
@@ -813,7 +1005,9 @@ CONFIG_DEFAULTS = {
     "mqtt_user": None,
     "mqtt_password": None,
     "mqtt_topic": "meshcore/+/+/packets",
+    "mqtt_message_topic": "meshcore/+/+/messages",
     "dedup_ttl": 120.0,
+    "content_dedup_ttl": 5.0,
     "throttle_per_sender": 0.0,
     "throttle_global": 0.0,
     "stats_interval": 600.0,
@@ -822,6 +1016,7 @@ CONFIG_DEFAULTS = {
 
 CONFIG_SCALAR_KEYS = {
     "mqtt_host", "mqtt_port", "mqtt_user", "mqtt_password", "mqtt_topic",
+    "mqtt_message_topic",
     "telegram_token", "channel_psk", "telegram_chat", *CONFIG_DEFAULTS.keys(),
 }
 
@@ -858,13 +1053,32 @@ def parse_channel_map(value: str) -> Tuple[str, str]:
     return psk.strip(), telegram_chat.strip()
 
 
-def make_channel_mapping(psk: object, chat: object, name: object) -> ChannelMapping:
+def make_channel_mapping(
+    psk: object,
+    chat: object,
+    name: object,
+    channel_name: object = None,
+    channel_idx: object = None,
+) -> ChannelMapping:
     if not isinstance(psk, str):
         raise ValueError(f"Channel {name!r}: psk must be a string")
     if not isinstance(chat, (str, int)):
         raise ValueError(f"Channel {name!r}: telegram_chat must be a string or integer")
     if not isinstance(name, str) or not name.strip():
         raise ValueError("Each channel mapping name must be a non-empty string")
+    if channel_name is not None and (
+        not isinstance(channel_name, str) or not channel_name.strip()
+    ):
+        raise ValueError(f"Channel {name!r}: channel_name must be a non-empty string")
+    if channel_idx is not None:
+        if isinstance(channel_idx, bool):
+            raise ValueError(f"Channel {name!r}: channel_idx must be an integer")
+        try:
+            channel_idx = int(channel_idx)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Channel {name!r}: channel_idx must be an integer") from exc
+        if not 0 <= channel_idx <= 255:
+            raise ValueError(f"Channel {name!r}: channel_idx must be between 0 and 255")
     telegram_chat = str(chat).strip()
     if not telegram_chat:
         raise ValueError(f"Channel {name!r}: telegram_chat cannot be empty")
@@ -872,7 +1086,13 @@ def make_channel_mapping(psk: object, chat: object, name: object) -> ChannelMapp
         psk_16 = psk_to_bytes(psk)
     except ValueError as exc:
         raise ValueError(f"Channel {name!r}: {exc}") from exc
-    return ChannelMapping(psk_16, telegram_chat, name.strip())
+    return ChannelMapping(
+        psk_16,
+        telegram_chat,
+        name.strip(),
+        channel_name.strip() if isinstance(channel_name, str) else None,
+        channel_idx,
+    )
 
 
 def resolve_configuration(args: argparse.Namespace) -> dict:
@@ -893,17 +1113,31 @@ def resolve_configuration(args: argparse.Namespace) -> dict:
                 f"(use --{required_key.replace('_', '-')} or the config file)"
             )
         resolved[required_key] = resolved[required_key].strip()
-    if not isinstance(resolved["mqtt_topic"], str) or not resolved["mqtt_topic"].strip():
-        raise ValueError("mqtt_topic must be a non-empty string")
+    for key in ("mqtt_topic", "mqtt_message_topic"):
+        if not isinstance(resolved[key], str) or not resolved[key].strip():
+            raise ValueError(f"{key} must be a non-empty string")
+        resolved[key] = resolved[key].strip()
     try:
         resolved["mqtt_port"] = int(resolved["mqtt_port"])
-        for key in ("dedup_ttl", "throttle_per_sender", "throttle_global", "stats_interval"):
+        for key in (
+            "dedup_ttl",
+            "content_dedup_ttl",
+            "throttle_per_sender",
+            "throttle_global",
+            "stats_interval",
+        ):
             resolved[key] = float(resolved[key])
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid numeric setting in configuration: {exc}") from exc
     if not 1 <= resolved["mqtt_port"] <= 65535:
         raise ValueError("mqtt_port must be between 1 and 65535")
-    for key in ("dedup_ttl", "throttle_per_sender", "throttle_global", "stats_interval"):
+    for key in (
+        "dedup_ttl",
+        "content_dedup_ttl",
+        "throttle_per_sender",
+        "throttle_global",
+        "stats_interval",
+    ):
         if resolved[key] < 0:
             raise ValueError(f"{key} cannot be negative")
     if not isinstance(resolved["debug"], bool):
@@ -916,7 +1150,10 @@ def resolve_configuration(args: argparse.Namespace) -> dict:
     for index, item in enumerate(raw_config_mappings):
         if not isinstance(item, dict):
             raise ValueError(f"channel_mappings[{index}] must be a JSON object")
-        unknown = sorted(set(item) - {"name", "psk", "telegram_chat"})
+        unknown = sorted(
+            set(item)
+            - {"name", "psk", "telegram_chat", "channel_name", "channel_idx"}
+        )
         if unknown:
             raise ValueError(
                 f"channel_mappings[{index}] has unknown key(s): {', '.join(unknown)}"
@@ -927,7 +1164,15 @@ def resolve_configuration(args: argparse.Namespace) -> dict:
                 f"channel_mappings[{index}] is missing: {', '.join(sorted(missing))}"
             )
         name = item.get("name", f"channel-{len(mappings) + 1}")
-        mappings.append(make_channel_mapping(item["psk"], item["telegram_chat"], name))
+        mappings.append(
+            make_channel_mapping(
+                item["psk"],
+                item["telegram_chat"],
+                name,
+                item.get("channel_name"),
+                item.get("channel_idx"),
+            )
+        )
 
     # CLI mappings add routes to those from the config file instead of replacing them.
     for value in args.channel_map or []:
@@ -1000,6 +1245,8 @@ EXAMPLES
     p.add_argument("--mqtt-password", default=None, help="MQTT password (optional)")
     p.add_argument("--mqtt-topic", default=None,
                    help="MQTT topic pattern (default: meshcore/+/+/packets)")
+    p.add_argument("--mqtt-message-topic", default=None,
+                   help="Decoded HA message topic (default: meshcore/+/+/messages)")
     p.add_argument("--telegram-token", default=None,
                    help="Telegram Bot API token (from @BotFather)")
     p.add_argument("--channel-map", action="append", default=None,
@@ -1011,6 +1258,8 @@ EXAMPLES
                    help="Legacy single Telegram target (use with --channel-psk)")
     p.add_argument("--dedup-ttl", type=float, default=None, metavar="SECONDS",
                    help="Duplicate TTL (default: 120s, 0 to disable)")
+    p.add_argument("--content-dedup-ttl", type=float, default=None, metavar="SECONDS",
+                   help="Same-content duplicate TTL (default: 5s, 0 to disable)")
     p.add_argument("--throttle-per-sender", type=float, default=None, metavar="SECONDS",
                    help="Min seconds between messages from one sender (default: off)")
     p.add_argument("--throttle-global", type=float, default=None, metavar="SECONDS",
@@ -1044,9 +1293,11 @@ def main() -> None:
         mqtt_user           = config["mqtt_user"],
         mqtt_password       = config["mqtt_password"],
         mqtt_topic          = config["mqtt_topic"],
+        mqtt_message_topic  = config["mqtt_message_topic"],
         telegram_token      = config["telegram_token"],
         channel_mappings    = config["channel_mappings"],
         dedup_ttl           = config["dedup_ttl"],
+        content_dedup_ttl   = config["content_dedup_ttl"],
         throttle_per_sender = config["throttle_per_sender"],
         throttle_global     = config["throttle_global"],
         stats_interval      = config["stats_interval"],
