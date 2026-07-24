@@ -49,7 +49,7 @@ void ESP32Board::powerOff() {
   enterDeepSleep(0); // Do not wakeup
 }
 
-void ESP32Board::enterDeepSleep(uint32_t secs) {
+void ESP32Board::enterDeepSleep(uint32_t secs, int wake_pin, int wake_level) {
   // Power off the display if any
 #ifdef DISPLAY_CLASS
   display.turnOff();
@@ -78,6 +78,21 @@ void ESP32Board::enterDeepSleep(uint32_t secs) {
   // Clear stale wakeup sources to avoid ghost wakeup
   // This is required when Power Management and automatic lightsleep are enabled
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+  if (wake_pin >= 0 && rtc_gpio_is_valid_gpio((gpio_num_t)wake_pin)) {
+    // EXT0 supports the active-low user buttons used by the Heltec V4 while
+    // leaving the generic ESP32 true-off behaviour unchanged by default.
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    rtc_gpio_set_direction((gpio_num_t)wake_pin, RTC_GPIO_MODE_INPUT_ONLY);
+    if (wake_level == LOW) {
+      rtc_gpio_pullup_en((gpio_num_t)wake_pin);
+      rtc_gpio_pulldown_dis((gpio_num_t)wake_pin);
+    } else {
+      rtc_gpio_pulldown_en((gpio_num_t)wake_pin);
+      rtc_gpio_pullup_dis((gpio_num_t)wake_pin);
+    }
+    (void)esp_sleep_enable_ext0_wakeup((gpio_num_t)wake_pin, wake_level == LOW ? 0 : 1);
+  }
 
   if (secs > 0) {
     esp_sleep_enable_timer_wakeup(secs * 1000000ULL);

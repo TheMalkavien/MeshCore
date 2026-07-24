@@ -18,8 +18,15 @@ class SerialBLEInterface : public BaseSerialInterface, BLESecurityCallbacks, BLE
   uint32_t _pin_code;
   unsigned long _last_write;
   unsigned long adv_restart_time;
+#if defined(BLE_ADV_FAST_INTERVAL_MIN) && defined(BLE_ADV_FAST_INTERVAL_MAX) && defined(BLE_ADV_FAST_DURATION_MS)
+  unsigned long adv_fast_until;   // millis() deadline for fast advertising; 0 = slow/steady
+#endif
   bool _conn_params_pending;
   esp_bd_addr_t _pending_bda;
+
+#if defined(BLE_ADV_FAST_INTERVAL_MIN) && defined(BLE_ADV_FAST_INTERVAL_MAX) && defined(BLE_ADV_FAST_DURATION_MS)
+  void startAdvertising(bool fast);
+#endif
 
   struct Frame {
     uint8_t len;
@@ -61,6 +68,9 @@ public:
     deviceConnected = false;
     oldDeviceConnected = false;
     adv_restart_time = 0;
+#if defined(BLE_ADV_FAST_INTERVAL_MIN) && defined(BLE_ADV_FAST_INTERVAL_MAX) && defined(BLE_ADV_FAST_DURATION_MS)
+    adv_fast_until = 0;
+#endif
     _isEnabled = false;
     _last_write = 0;
     last_conn_id = 0;

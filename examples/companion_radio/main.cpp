@@ -7,6 +7,7 @@
   #include <freertos/task.h>
   #if defined(ESP_PLATFORM)
     #include <esp_sleep.h>
+    #include <driver/gpio.h>
     #include <driver/rtc_io.h>
     #if defined(CONFIG_IDF_TARGET_ESP32S3)
       #include <soc/soc.h>
@@ -163,6 +164,14 @@ static void disableESP32S3USBSerialJTAG() {
 }
 #endif
 
+#ifndef LOOP_BUSY_DELAY_MS
+  #define LOOP_BUSY_DELAY_MS 6
+#endif
+
+#ifndef LOOP_IDLE_DELAY_MS
+  #define LOOP_IDLE_DELAY_MS 30
+#endif
+
 #if defined(ESP32) && defined(ESP_PLATFORM)
 static bool tryManualLightSleep(uint32_t sleep_ms) {
 #if defined(P_LORA_DIO_1)
@@ -193,12 +202,74 @@ static bool tryManualLightSleep(uint32_t sleep_ms) {
   #define MANUAL_LIGHT_SLEEP_CONNECTED_MS 0
 #endif
 
-#ifndef LOOP_BUSY_DELAY_MS
-  #define LOOP_BUSY_DELAY_MS 6
+#if defined(EVENT_DRIVEN_LOOP)
+  // Idle caps: the loop blocks up to this long, but a real event (LoRa DIO1 IRQ,
+  // BLE RX) resumes it immediately. With CONFIG_PM + tickless idle the SoC auto
+  // light-sleeps during the wait, so longer caps = fewer wakeups = less power.
+  #ifndef EVENT_LOOP_CONNECTED_MAX_MS
+    #define EVENT_LOOP_CONNECTED_MAX_MS 30   // phone connected: stay snappy
+  #endif
+  #ifndef EVENT_LOOP_IDLE_MAX_MS
+    #define EVENT_LOOP_IDLE_MAX_MS 500       // disconnected: LoRa IRQ still wakes us
+  #endif
+
+// Handle to the Arduino loop task, so ISRs / BLE callbacks can resume it.
+static TaskHandle_t g_main_loop_task = NULL;
+
+// Button edges are also events. Keep a short polling grace period after each
+// edge so MomentaryButton can finish its multi-click window without falling
+// back to the long disconnected idle cap.
+#if defined(PIN_USER_BTN)
+static volatile uint32_t g_button_irq_count = 0;
 #endif
 
-#ifndef LOOP_IDLE_DELAY_MS
-  #define LOOP_IDLE_DELAY_MS 30
+// Resume the loop from thread context (called by the BLE RX callback; overrides
+// the weak no-op in SerialBLEInterface.cpp).
+extern "C" void meshcore_wake_main_loop(void) {
+  if (g_main_loop_task) xTaskNotifyGive(g_main_loop_task);
+}
+
+static void IRAM_ATTR notifyMainLoopFromISR(void) {
+  if (g_main_loop_task) {
+    BaseType_t hpw = pdFALSE;
+    vTaskNotifyGiveFromISR(g_main_loop_task, &hpw);
+    if (hpw) portYIELD_FROM_ISR(hpw);
+  }
+}
+
+// Resume the loop from ISR context on a LoRa DIO1 IRQ (RX/TX complete). Overrides
+// the weak hook in RadioLibWrappers.cpp so a packet wakes us with ~0 latency.
+// IRAM_ATTR is mandatory: setFlag() runs from IRAM, and this may fire while the
+// flash cache is disabled (e.g. during a contacts save).
+extern "C" void IRAM_ATTR meshcore_on_lora_dio1_irq(void) {
+  notifyMainLoopFromISR();
+}
+
+#if defined(PIN_USER_BTN)
+static void IRAM_ATTR onUserButtonEdge(void) {
+  ++g_button_irq_count;
+  notifyMainLoopFromISR();
+}
+#endif
+
+static void configureEventDrivenWakeSources(void) {
+#if defined(ESP_PLATFORM)
+  // CONFIG_PM_SLP_DISABLE_GPIO isolates GPIOs during automatic light sleep.
+  // Keep event pins on their active configuration so their normal GPIO ISRs
+  // can wake the CPU. Do NOT use gpio_wakeup_enable() here: on ESP32-S3 it
+  // rewrites the pin interrupt type to HIGH/LOW level. For DIO1 that replaces
+  // RadioLib's rising-edge IRQ and causes an ISR storm while SX1262 DIO1 stays
+  // high at TX/RX completion.
+#if defined(P_LORA_DIO_1)
+  gpio_sleep_sel_dis((gpio_num_t)P_LORA_DIO_1);
+#endif
+#if defined(PIN_USER_BTN)
+  pinMode(PIN_USER_BTN, INPUT_PULLUP);
+  gpio_sleep_sel_dis((gpio_num_t)PIN_USER_BTN);
+  attachInterrupt(digitalPinToInterrupt(PIN_USER_BTN), onUserButtonEdge, CHANGE);
+#endif
+#endif
+}
 #endif
 
 /* WIFI RECONNECT TRACKERS */
@@ -345,6 +416,12 @@ void setup() {
   configureESP32PowerManagement();
 #endif
 
+#if defined(EVENT_DRIVEN_LOOP)
+  // setup() runs in the Arduino loop task, so this is the task loop() blocks on.
+  g_main_loop_task = xTaskGetCurrentTaskHandle();
+  configureEventDrivenWakeSources();
+#endif
+
   board.onBootComplete();
 }
 
@@ -356,21 +433,64 @@ void loop() {
 #endif
   rtc_clock.tick();
 
-#if defined(ESP32)
-  // Manual low-power policy: short light-sleep windows when idle.
+#if defined(EVENT_DRIVEN_LOOP)
+  // Event-driven idle: block until a real event (LoRa DIO1 IRQ, BLE RX) or a
+  // capped deadline. With CONFIG_PM + tickless idle the SoC auto light-sleeps
+  // during the wait; a genuine event resumes us immediately -> low power without
+  // losing reactivity.
+  const bool busy = the_mesh.hasPendingWork() || serial_interface.isWriteBusy();
+  bool gps_streaming = false;
+  #if ENV_INCLUDE_GPS
+    #if GPS_SLEEP_BETWEEN_UPDATES
+      gps_streaming = sensors.isGPSFixWindowActive();  // NMEA only flows during a fix window
+    #else
+      gps_streaming = sensors.isGPSActive();           // NMEA flows whenever GPS is on
+    #endif
+  #endif
+  uint32_t wait_ms;
+  if (busy || gps_streaming) {
+    wait_ms = LOOP_BUSY_DELAY_MS;                       // service pending work / drain GPS UART promptly
+  } else if (serial_interface.isConnected()) {
+    wait_ms = EVENT_LOOP_CONNECTED_MAX_MS;
+  } else {
+    wait_ms = EVENT_LOOP_IDLE_MAX_MS;
+  }
+#if defined(PIN_USER_BTN)
+  static uint32_t seen_button_irq_count = 0;
+  static uint32_t button_fast_poll_until = 0;
+  const uint32_t button_irq_count = g_button_irq_count;
+  if (button_irq_count != seen_button_irq_count) {
+    seen_button_irq_count = button_irq_count;
+    button_fast_poll_until = millis() + 350U;
+  }
+  const bool button_fast_poll =
+      digitalRead(PIN_USER_BTN) == LOW ||
+      (button_fast_poll_until != 0 &&
+       (int32_t)(millis() - button_fast_poll_until) < 0);
+  if (button_fast_poll && wait_ms > EVENT_LOOP_CONNECTED_MAX_MS) {
+    wait_ms = EVENT_LOOP_CONNECTED_MAX_MS;
+  }
+#endif
+  const TickType_t ticks = pdMS_TO_TICKS(wait_ms);
+  ulTaskNotifyTake(pdTRUE, ticks ? ticks : 1);           // cleared/short-circuited by any wake notification
+#elif defined(ESP32)
+  // Preserve the legacy pacing for ESP32 companion profiles that do not opt in
+  // to the event-driven low-power loop.
   const bool link_connected = serial_interface.isConnected();
   const bool busy = the_mesh.hasPendingWork() || serial_interface.isWriteBusy();
-  #if defined(BLE_PIN_CODE)
-    const bool allow_manual_sleep = false; // BLE advertising/stack can become unstable with aggressive manual light sleep
-  #else
-    const bool allow_manual_sleep = true;
-  #endif
+#if defined(BLE_PIN_CODE)
+  const bool allow_manual_sleep = false;
+#else
+  const bool allow_manual_sleep = true;
+#endif
   if (busy) {
     const TickType_t busy_ticks = pdMS_TO_TICKS(LOOP_BUSY_DELAY_MS);
     vTaskDelay((busy_ticks > 0) ? busy_ticks : 1);
   } else {
-  #if defined(ESP_PLATFORM) && !defined(WIFI_SSID)
-    const uint32_t sleep_ms = allow_manual_sleep ? (link_connected ? MANUAL_LIGHT_SLEEP_CONNECTED_MS : MANUAL_LIGHT_SLEEP_IDLE_MS) : 0;
+#if defined(ESP_PLATFORM) && !defined(WIFI_SSID)
+    const uint32_t sleep_ms = allow_manual_sleep
+        ? (link_connected ? MANUAL_LIGHT_SLEEP_CONNECTED_MS : MANUAL_LIGHT_SLEEP_IDLE_MS)
+        : 0;
     if (sleep_ms > 0 && !tryManualLightSleep(sleep_ms)) {
       const TickType_t idle_ticks = pdMS_TO_TICKS(LOOP_IDLE_DELAY_MS);
       vTaskDelay((idle_ticks > 0) ? idle_ticks : 1);
@@ -378,10 +498,10 @@ void loop() {
       const TickType_t idle_ticks = pdMS_TO_TICKS(LOOP_IDLE_DELAY_MS);
       vTaskDelay((idle_ticks > 0) ? idle_ticks : 1);
     }
-  #else
+#else
     const TickType_t idle_ticks = pdMS_TO_TICKS(LOOP_IDLE_DELAY_MS);
     vTaskDelay((idle_ticks > 0) ? idle_ticks : 1);
-  #endif
+#endif
   }
 #endif
 

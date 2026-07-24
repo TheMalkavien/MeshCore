@@ -37,6 +37,19 @@
   #define BLE_WRITE_MIN_INTERVAL 60
 #endif
 
+#if defined(BLE_ADV_FAST_INTERVAL_MIN) && defined(BLE_ADV_FAST_INTERVAL_MAX) && defined(BLE_ADV_FAST_DURATION_MS)
+  #define BLE_ADAPTIVE_ADVERTISING 1
+#endif
+
+static inline bool bleDeadlineReached(unsigned long deadline) {
+  return (int32_t)(millis() - deadline) >= 0;
+}
+
+// Optional hook: resume the main loop immediately on BLE activity. The low-power
+// companion firmware defines this strongly; everywhere else it is a weak no-op.
+extern "C" void meshcore_wake_main_loop(void) __attribute__((weak));
+extern "C" void meshcore_wake_main_loop(void) {}
+
 void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code) {
   _pin_code = pin_code;
 
@@ -168,6 +181,7 @@ void SerialBLEInterface::onDisconnect(BLEServer* pServer) {
 
     // loop() will detect this on next loop, and set deviceConnected to false
   }
+  meshcore_wake_main_loop();  // wake so advertising restarts promptly after disconnect
 }
 
 // -------- BLECharacteristicCallbacks methods
@@ -185,6 +199,7 @@ void SerialBLEInterface::onWrite(BLECharacteristic* pCharacteristic, esp_ble_gat
     memcpy(recv_queue[recv_queue_len].buf, rxValue, len);
     recv_queue_len++;
   }
+  meshcore_wake_main_loop();  // process the inbound frame without waiting for the idle timeout
 }
 
 // ---------- public methods
@@ -198,13 +213,34 @@ void SerialBLEInterface::enable() {
   // Start the service
   pService->start();
 
-  // Start advertising
+  // Adaptive advertising is opt-in through the three BLE_ADV_FAST_* build flags.
+#if defined(BLE_ADAPTIVE_ADVERTISING)
+  startAdvertising(true);
+#else
   pServer->getAdvertising()->setMinInterval(BLE_ADV_INTERVAL_MIN);
   pServer->getAdvertising()->setMaxInterval(BLE_ADV_INTERVAL_MAX);
-
   pServer->getAdvertising()->start();
+#endif
   adv_restart_time = 0;
 }
+
+#if defined(BLE_ADAPTIVE_ADVERTISING)
+void SerialBLEInterface::startAdvertising(bool fast) {
+  BLEAdvertising* adv = pServer->getAdvertising();
+  adv->stop();
+  if (fast) {
+    adv->setMinInterval(BLE_ADV_FAST_INTERVAL_MIN);
+    adv->setMaxInterval(BLE_ADV_FAST_INTERVAL_MAX);
+    adv_fast_until = millis() + BLE_ADV_FAST_DURATION_MS;
+    if (adv_fast_until == 0) adv_fast_until = 1;  // 0 is the "not fast" sentinel
+  } else {
+    adv->setMinInterval(BLE_ADV_INTERVAL_MIN);
+    adv->setMaxInterval(BLE_ADV_INTERVAL_MAX);
+    adv_fast_until = 0;
+  }
+  adv->start();
+}
+#endif
 
 void SerialBLEInterface::disable() {
   _isEnabled = false;
@@ -216,6 +252,9 @@ void SerialBLEInterface::disable() {
   pService->stop();
   oldDeviceConnected = deviceConnected = false;
   adv_restart_time = 0;
+#if defined(BLE_ADAPTIVE_ADVERTISING)
+  adv_fast_until = 0;
+#endif
 }
 
 size_t SerialBLEInterface::writeFrame(const uint8_t src[], size_t len) {
@@ -295,15 +334,32 @@ size_t SerialBLEInterface::checkRecvFrame(uint8_t dest[]) {
     oldDeviceConnected = deviceConnected;
   }
 
-  if (adv_restart_time && millis() >= adv_restart_time) {
+  if (adv_restart_time && bleDeadlineReached(adv_restart_time)) {
     if (pServer->getConnectedCount() == 0) {
+#if defined(BLE_ADAPTIVE_ADVERTISING)
+      BLE_DEBUG_PRINTLN("SerialBLEInterface -> re-starting advertising (fast)");
+      startAdvertising(true);  // fast advertising for quick reconnect
+#else
       BLE_DEBUG_PRINTLN("SerialBLEInterface -> re-starting advertising");
       pServer->getAdvertising()->setMinInterval(BLE_ADV_INTERVAL_MIN);
       pServer->getAdvertising()->setMaxInterval(BLE_ADV_INTERVAL_MAX);
-      pServer->getAdvertising()->start();  // re-Start advertising
+      pServer->getAdvertising()->start();
+#endif
     }
     adv_restart_time = 0;
   }
+
+#if defined(BLE_ADAPTIVE_ADVERTISING)
+  // Downgrade fast -> slow advertising once the fast window has elapsed.
+  if (adv_fast_until != 0 && bleDeadlineReached(adv_fast_until)) {
+    if (_isEnabled && pServer->getConnectedCount() == 0) {
+      BLE_DEBUG_PRINTLN("SerialBLEInterface -> advertising fast->slow");
+      startAdvertising(false);
+    } else {
+      adv_fast_until = 0;
+    }
+  }
+#endif
   return 0;
 }
 

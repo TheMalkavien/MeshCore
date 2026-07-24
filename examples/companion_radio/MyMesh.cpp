@@ -941,7 +941,6 @@ void MyMesh::begin(bool has_display) {
   _prefs.tx_power_dbm = constrain(_prefs.tx_power_dbm, -9, MAX_LORA_TX_POWER);
   _prefs.gps_enabled = constrain(_prefs.gps_enabled, 0, 1);  // Ensure boolean 0 or 1
   _prefs.gps_interval = constrain(_prefs.gps_interval, 0, 86400);  // Max 24 hours
-  _prefs.gps_interval = 60; // Keep a fixed 60s GPS interval on this target.
 #ifdef BLE_PIN_CODE // 123456 by default
   if (_prefs.ble_pin == 0) {
 #ifdef DISPLAY_CLASS
@@ -2218,7 +2217,10 @@ void MyMesh::checkSerialInterface() {
 bool MyMesh::hasPendingWork() const {
   if (_mgr->getOutboundCount(0xFFFFFFFF) > 0) return true;
   if (_iter_started || _cli_rescue) return true;
-  if (offline_queue_len > 0) return true;
+  // The offline queue is only drained by the connected companion app
+  // (CMD_SYNC_NEXT_MESSAGE). When the phone is disconnected these frames can
+  // never be delivered, so they must NOT keep the loop "busy" and block sleep.
+  if (_serial && _serial->isConnected() && offline_queue_len > 0) return true;
   // A deferred contacts save does not require "busy" pacing; allow idle/sleep
   // between checks and commit only when the deadline is reached in loop().
   if (pending_login || pending_status || pending_telemetry || pending_discovery || pending_req) return true;
