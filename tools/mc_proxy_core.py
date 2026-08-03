@@ -38,6 +38,7 @@ CMD_GET_CHANNEL = 0x1F
 CMD_SET_CHANNEL = 0x20
 RESP_CODE_SELF_INFO = 0x05
 RESP_CODE_NO_MORE_MESSAGES = 0x0A
+RESP_CODE_CONTACTS_START = 0x02
 RESP_CODE_END_OF_CONTACTS = 0x04
 
 # Offset of the 4-byte uint32_t LE lastmod field inside a CONTACT wire frame.
@@ -73,6 +74,9 @@ IDX_OFFSET = 4      # CHANNEL_INFO channel-index byte
 CONTACT_TYPE = 0x03         # RESP_CODE_CONTACT
 CHANNEL_INFO_TYPE = 0x12    # RESP_CODE_CHANNEL_INFO
 NEW_ADVERT_TYPE = 0x8A      # PUSH_CODE_NEW_ADVERT (same wire layout as CONTACT)
+ADVERT_TYPE = 0x80          # PUSH_CODE_ADVERT (stored/accepted contact pubkey)
+PATH_UPDATED_TYPE = 0x81    # PUSH_CODE_PATH_UPDATED (stored contact pubkey)
+CONTACT_DELETED_TYPE = 0x8F # PUSH_CODE_CONTACT_DELETED
 
 
 def _contact_pubkey_key(frame: bytes) -> Optional[bytes]:
@@ -82,6 +86,12 @@ def _contact_pubkey_key(frame: bytes) -> Optional[bytes]:
 
 def _channel_idx_key(frame: bytes) -> Optional[bytes]:
     return frame[IDX_OFFSET:IDX_OFFSET + 1] if len(frame) > IDX_OFFSET else None
+
+
+def _contact_lastmod(frame: bytes) -> Optional[int]:
+    if len(frame) < CONTACT_LASTMOD_OFFSET + 4:
+        return None
+    return struct.unpack_from("<I", frame, CONTACT_LASTMOD_OFFSET)[0]
 
 
 CACHE_TYPES = {
@@ -107,6 +117,7 @@ DEFAULT_MAX_CLIENTS = 32
 DEFAULT_INACTIVE_STATE_MAX_AGE = 86400
 DEFAULT_RECONNECT_BACKOFF_MAX = 60.0
 DEFAULT_BACKEND_WRITE_TIMEOUT = 10.0
+CONTACT_SYNC_IDLE_TIMEOUT = 15.0
 # A backend connection must stay up at least this long to be considered "stable"
 # and reset the exponential reconnect backoff. Shorter -> treated as flapping.
 DEFAULT_STABLE_CONNECTION_SECS = 5.0
@@ -349,10 +360,24 @@ class ProxyCore:
         # State cache (mechanism 2): packet_type -> {entity_key -> latest frame}.
         # Singletons use the key None. Only CACHE_TYPES are cached (allowlist).
         self._state_cache: dict[int, dict] = {}
-        # Set when a client renames / reset-paths a contact and the backend won't
-        # echo a fresh CONTACT: the next GET_CONTACTS is forwarded so the backend
-        # response refreshes the cache (the cache is never cleared).
+        # CONTACT cache validity is tracked separately from its contents: an empty
+        # dictionary may be a fully synchronized, authoritative empty list.
+        self._contacts_synced: bool = False
         self._contacts_dirty: bool = False
+        self._contacts_lastmod: int = 0
+        self._contacts_revision: int = 0
+        self._contacts_require_full_sync: bool = False
+
+        # A single backend GET_CONTACTS serves every client waiting for a fresh
+        # snapshot. Responses are staged until END_OF_CONTACTS, then committed
+        # atomically so reconnecting clients never observe a partial list.
+        self._contact_sync_active: bool = False
+        self._contact_sync_full: bool = False
+        self._contact_sync_expected_count: Optional[int] = None
+        self._contact_sync_staging: dict[bytes, bytes] = {}
+        self._contact_sync_waiters: list[tuple[str, int]] = []
+        self._contact_sync_revision: int = 0
+        self._contact_sync_timeout_task: Optional[asyncio.Task] = None
 
         self._server: Optional[asyncio.base_events.Server] = None
         self._stop = asyncio.Event()
@@ -501,6 +526,12 @@ class ProxyCore:
                 await asyncio.sleep(0.1)
                 continue
 
+            # GET_CONTACTS owns the companion's contact iterator. Avoid injecting
+            # message-poll commands into the middle of that response sequence.
+            if self._contact_sync_active:
+                await asyncio.sleep(0.1)
+                continue
+
             poll_count += 1
             if poll_count % _PRUNE_EVERY_N_POLLS == 0:
                 self._prune_stale_client_states()
@@ -640,25 +671,215 @@ class ProxyCore:
     def _cache_backend_frame(self, frame: bytes, packet_type: Optional[int]) -> None:
         """Upsert an allowlisted backend frame into the state cache (latest wins).
 
-        NEW_ADVERT (0x8A) carries a full contact with the same wire layout as a
-        CONTACT, so it is stored as a CONTACT (only the code byte differs). Types
-        not in CACHE_TYPES are ignored here (they are still forwarded live by the
-        caller). Messages never reach here — they go to the message queue.
+        Only CONTACT (0x03) is authoritative contact state. NEW_ADVERT (0x8A)
+        has the same layout but is a candidate awaiting user approval, so it is
+        forwarded live and never cached. Other non-allowlisted types are ignored
+        here; messages use the separate per-client message queue.
         """
-        if packet_type is None:
+        if packet_type not in CACHE_TYPES:
             return
-        cache_type = packet_type
-        if packet_type == NEW_ADVERT_TYPE:
-            cache_type = CONTACT_TYPE
-            frame = bytes((frame[0], frame[1], frame[2], CONTACT_TYPE)) + frame[4:]
-        if cache_type not in CACHE_TYPES:
-            return
-        key_fn = CACHE_TYPES[cache_type]
+        key_fn = CACHE_TYPES[packet_type]
         key = None if key_fn is None else key_fn(frame)
         if key_fn is not None and key is None:
             return  # frame too short to extract its key — skip
-        bucket = self._state_cache.setdefault(cache_type, {})
+        bucket = self._state_cache.setdefault(packet_type, {})
         bucket[key] = frame
+        if packet_type == CONTACT_TYPE:
+            lastmod = _contact_lastmod(frame)
+            if lastmod is not None:
+                self._contacts_lastmod = max(self._contacts_lastmod, lastmod)
+
+    def _mark_contacts_dirty(self, reason: str) -> None:
+        """Invalidate the authoritative contact snapshot without discarding it."""
+        if not self._contacts_dirty:
+            self._logger.debug("[cache] contacts marked dirty: %s", reason)
+        self._contacts_dirty = True
+        self._contacts_revision += 1
+
+    async def _send_cached_contacts(self, state: ClientState, since: int) -> None:
+        """Serve one protocol-correct GET_CONTACTS response from the cache."""
+        cached_contacts = self._state_cache.get(CONTACT_TYPE, {})
+        filtered: list[bytes] = []
+        most_recent = 0
+        for contact_frame in cached_contacts.values():
+            lastmod = _contact_lastmod(contact_frame)
+            if lastmod is not None and lastmod > since:
+                filtered.append(contact_frame)
+                most_recent = max(most_recent, lastmod)
+
+        # Firmware reports the total table size, not the number selected by the
+        # optional `since` filter.
+        contacts_start = (
+            bytes((ord(">"), 5, 0, RESP_CODE_CONTACTS_START))
+            + struct.pack("<I", len(cached_contacts))
+        )
+        await self._send_bytes_to_client(state, contacts_start)
+        for contact_frame in filtered:
+            await self._send_bytes_to_client(state, contact_frame)
+        end_of_contacts = (
+            bytes((ord(">"), 5, 0, RESP_CODE_END_OF_CONTACTS))
+            + struct.pack("<I", most_recent)
+        )
+        await self._send_bytes_to_client(state, end_of_contacts)
+        self._logger.debug(
+            "[cli->%s] GET_CONTACTS since=%d -> %d/%d contact(s) from synchronized cache",
+            state.client_id, since, len(filtered), len(cached_contacts),
+        )
+
+    def _queue_contact_sync(self, state: ClientState, since: int) -> None:
+        """Register a client request to be answered by the current/next sync."""
+        self._contact_sync_waiters.append((state.client_id, since))
+        self._logger.debug(
+            "[cli->%s] GET_CONTACTS since=%d queued for backend sync (waiters=%d)",
+            state.client_id, since, len(self._contact_sync_waiters),
+        )
+
+    async def _start_contact_sync(self, force_full: bool = False) -> None:
+        """Start one shared backend contact sync, if one is needed and possible."""
+        if self._contact_sync_active or not self._contact_sync_waiters:
+            return
+        if not self.backend_connected.is_set():
+            self._logger.debug("[cache] contact sync deferred while backend is down")
+            return
+
+        full = force_full or self._contacts_require_full_sync or not self._contacts_synced
+        since = 0 if full else max(0, self._contacts_lastmod - 1)
+        self._contact_sync_active = True
+        self._contact_sync_full = full
+        self._contact_sync_expected_count = None
+        self._contact_sync_staging = {}
+        self._contact_sync_revision = self._contacts_revision
+
+        request = (
+            bytes((ord("<"), 5, 0, CMD_GET_CONTACTS))
+            + struct.pack("<I", since)
+        )
+        self._logger.info(
+            "[cache] starting %s contact sync since=%d for %d waiting request(s)",
+            "full" if full else "incremental", since, len(self._contact_sync_waiters),
+        )
+        await self._send_to_backend(request)
+        self._arm_contact_sync_timeout()
+
+    def _arm_contact_sync_timeout(self) -> None:
+        previous = self._contact_sync_timeout_task
+        if previous is not None and not previous.done():
+            previous.cancel()
+        self._contact_sync_timeout_task = asyncio.create_task(
+            self._contact_sync_timeout(), name="contact-sync-timeout"
+        )
+
+    async def _contact_sync_timeout(self) -> None:
+        try:
+            await asyncio.sleep(CONTACT_SYNC_IDLE_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+        if not self._contact_sync_active:
+            return
+        self._logger.warning(
+            "[cache] contact sync timed out after %.0fs without a complete response",
+            CONTACT_SYNC_IDLE_TIMEOUT,
+        )
+        self._contact_sync_timeout_task = None
+        self._contacts_require_full_sync = True
+        self._mark_contacts_dirty("backend contact sync timeout")
+        self._reset_contact_sync(keep_waiters=True)
+        await self._fail_contact_sync_waiters()
+
+    def _reset_contact_sync(self, keep_waiters: bool = True) -> None:
+        timeout_task = self._contact_sync_timeout_task
+        self._contact_sync_timeout_task = None
+        if (timeout_task is not None and not timeout_task.done()
+                and timeout_task is not asyncio.current_task()):
+            timeout_task.cancel()
+        self._contact_sync_active = False
+        self._contact_sync_full = False
+        self._contact_sync_expected_count = None
+        self._contact_sync_staging = {}
+        if not keep_waiters:
+            self._contact_sync_waiters = []
+
+    async def _fail_contact_sync_waiters(self) -> None:
+        """Fail pending GET_CONTACTS commands after an unusable full snapshot."""
+        waiters = self._contact_sync_waiters
+        self._contact_sync_waiters = []
+        error = bytes((ord(">"), 2, 0, 0x01, 0x04))  # ERR / ERR_CODE_BAD_STATE
+        for client_id, _since in waiters:
+            state = self.client_states.get(client_id)
+            if state is not None and state.writer is not None:
+                await self._send_bytes_to_client(state, error)
+
+    async def _serve_contact_sync_waiters(self) -> None:
+        waiters = self._contact_sync_waiters
+        self._contact_sync_waiters = []
+        for client_id, since in waiters:
+            state = self.client_states.get(client_id)
+            if state is not None and state.writer is not None:
+                await self._send_cached_contacts(state, since)
+
+    async def _handle_contact_sync_frame(self, frame: bytes, packet_type: int) -> None:
+        """Stage and atomically commit frames belonging to the shared sync."""
+        if packet_type == RESP_CODE_CONTACTS_START:
+            self._contact_sync_expected_count = (
+                struct.unpack_from("<I", frame, 4)[0] if len(frame) >= 8 else None
+            )
+            return
+
+        if packet_type == CONTACT_TYPE:
+            key = _contact_pubkey_key(frame)
+            if key is not None and _contact_lastmod(frame) is not None:
+                self._contact_sync_staging[key] = frame
+            else:
+                self._logger.warning("[cache] ignored malformed CONTACT during sync")
+            return
+
+        if packet_type != RESP_CODE_END_OF_CONTACTS:
+            return
+
+        if self._contact_sync_full:
+            candidate = dict(self._contact_sync_staging)
+        else:
+            candidate = dict(self._state_cache.get(CONTACT_TYPE, {}))
+            candidate.update(self._contact_sync_staging)
+
+        expected = self._contact_sync_expected_count
+        if expected is None or len(candidate) != expected:
+            mode = "full" if self._contact_sync_full else "incremental"
+            self._logger.warning(
+                "[cache] %s contact sync count mismatch: assembled=%d backend=%s",
+                mode, len(candidate), expected if expected is not None else "unknown",
+            )
+            if not self._contact_sync_full:
+                # A delta cannot identify contacts deleted while the proxy was
+                # disconnected. Replace the entire snapshot on one full retry.
+                self._reset_contact_sync(keep_waiters=True)
+                await self._start_contact_sync(force_full=True)
+            else:
+                self._contacts_require_full_sync = True
+                self._mark_contacts_dirty("incomplete full backend snapshot")
+                self._reset_contact_sync(keep_waiters=True)
+                await self._fail_contact_sync_waiters()
+            return
+
+        self._state_cache[CONTACT_TYPE] = candidate
+        self._contacts_lastmod = max(
+            (_contact_lastmod(contact_frame) or 0 for contact_frame in candidate.values()),
+            default=0,
+        )
+        completed_mode = "full" if self._contact_sync_full else "incremental"
+        received = len(self._contact_sync_staging)
+        changed_during_sync = self._contacts_revision != self._contact_sync_revision
+        if self._contact_sync_full:
+            self._contacts_require_full_sync = False
+        self._contacts_synced = True
+        self._contacts_dirty = changed_during_sync
+        self._reset_contact_sync(keep_waiters=True)
+        self._logger.info(
+            "[cache] %s contact sync complete: %d received, %d cached, lastmod=%d%s",
+            completed_mode, received, len(candidate), self._contacts_lastmod,
+            " (changed during sync; remains dirty)" if changed_during_sync else "",
+        )
+        await self._serve_contact_sync_waiters()
 
     def _evict_contact_from_cache(self, pubkey: bytes) -> None:
         """Remove a contact from the state cache by pubkey (delete / auto-evict)."""
@@ -943,59 +1164,16 @@ class ProxyCore:
                             state.awaiting_replay_after_self_info = True
                             forward_frames.append(frame)
                     elif command == CMD_GET_CONTACTS:
-                        cached_contacts = self._state_cache.get(CONTACT_TYPE, {})
-                        if cached_contacts and not self._contacts_dirty:
-                            since: int = 0
-                            if len(frame) >= 8:
-                                since = struct.unpack_from("<I", frame, 4)[0]
-                            filtered = [
-                                f for f in cached_contacts.values()
-                                if len(f) >= CONTACT_LASTMOD_OFFSET + 4
-                                and struct.unpack_from("<I", f, CONTACT_LASTMOD_OFFSET)[0] > since
-                            ]
-                            most_recent = max(
-                                (struct.unpack_from("<I", f, CONTACT_LASTMOD_OFFSET)[0]
-                                 for f in filtered),
-                                default=since,
-                            )
-                            n = len(filtered)
-                            contacts_start = bytes([ord(">"), 5, 0, 0x02]) + struct.pack("<I", n)
-                            await self._send_bytes_to_client(state, contacts_start)
-                            for cf in filtered:
-                                await self._send_bytes_to_client(state, cf)
-                            eoc = bytes([ord(">"), 5, 0, 0x04]) + struct.pack("<I", most_recent)
-                            await self._send_bytes_to_client(state, eoc)
-                            self._logger.debug(
-                                "[cli→%s] GET_CONTACTS since=%d → %d/%d contact(s) from cache",
-                                state.client_id, since, n, len(cached_contacts),
-                            )
-                        elif self._contacts_dirty:
-                            # A contact was mutated (rename / path): forward this
-                            # GET_CONTACTS to the backend so its fresh CONTACT frames
-                            # update the cache in place (dedup-by-pubkey). The cache
-                            # is NOT cleared — deletions are handled by eviction — so
-                            # the contact list never transiently empties.
-                            # PX-6: the dirty flag is cleared on the backend's
-                            # END_OF_CONTACTS (in _handle_backend_frame), NOT here,
-                            # so a forward dropped because the backend is down leaves
-                            # the flag armed for a retry instead of going stale.
-                            forward_frames.append(frame)
-                            self._logger.debug(
-                                "[cli→%s] GET_CONTACTS — cache dirty, forwarding to refresh",
-                                state.client_id,
-                            )
+                        since = struct.unpack_from("<I", frame, 4)[0] if len(frame) >= 8 else 0
+                        if (self._contacts_synced and not self._contacts_dirty
+                                and not self._contact_sync_active):
+                            await self._send_cached_contacts(state, since)
                         else:
-                            # PX-1: cache is cold. Forcing since=0 makes the backend
-                            # return the COMPLETE contact list, so the cache is
-                            # populated fully instead of with a partial delta that
-                            # would later be served as if complete to other clients.
-                            if len(frame) >= 8:
-                                frame = frame[:4] + b"\x00\x00\x00\x00" + frame[8:]
-                            forward_frames.append(frame)
-                            self._logger.debug(
-                                "[cli→%s] GET_CONTACTS — cache cold, forwarding full sync (since=0)",
-                                state.client_id,
-                            )
+                            # The request is answered only after one shared backend
+                            # snapshot has completed. It is deliberately not placed
+                            # in forward_frames: raw iterator responses must not be
+                            # broadcast to unrelated clients.
+                            self._queue_contact_sync(state, since)
                     elif command == CMD_REMOVE_CONTACT and len(frame) >= PUBKEY_OFFSET + PUBKEY_SIZE:
                         # Forward the delete AND evict the contact from the cache
                         # immediately, so reconnecting clients are not re-served a
@@ -1004,6 +1182,7 @@ class ProxyCore:
                         pubkey = frame[PUBKEY_OFFSET:PUBKEY_OFFSET + PUBKEY_SIZE]
                         forward_frames.append(frame)
                         self._evict_contact_from_cache(pubkey)
+                        self._mark_contacts_dirty("client removed a contact")
                     elif command == CMD_RESET_PATH:
                         # PX-2: the firmware resets out_path_len to OUT_PATH_UNKNOWN
                         # without bumping lastmod, so a dirty-flag refresh (which
@@ -1023,7 +1202,7 @@ class ProxyCore:
                         # cached copy goes stale. Mark the cache dirty to force a
                         # refresh on the next GET_CONTACTS.
                         forward_frames.append(frame)
-                        self._contacts_dirty = True
+                        self._mark_contacts_dirty("client added or updated a contact")
                         self._logger.debug(
                             "[cli→%s] contact mutation cmd=0x%02X → cache marked dirty",
                             state.client_id, command,
@@ -1076,6 +1255,11 @@ class ProxyCore:
                         # inject a local echo for it.
                         self._logger.info(self._BACKEND_DOWN_MSG)
 
+                # Start the shared contact read only after all earlier commands in
+                # this client batch have been written, preserving command order.
+                if self._contact_sync_waiters and not self._contact_sync_active:
+                    await self._start_contact_sync()
+
         except (asyncio.CancelledError, ConnectionError):
             pass
         except Exception as exc:
@@ -1114,6 +1298,11 @@ class ProxyCore:
                 )
                 await asyncio.sleep(delay)
                 continue
+
+            # A client may have requested contacts while the backend was down.
+            # Keep the request pending and satisfy it as soon as transport returns.
+            if self._contact_sync_waiters and not self._contact_sync_active:
+                await self._start_contact_sync()
 
             connected_at = asyncio.get_running_loop().time()
             try:
@@ -1163,6 +1352,14 @@ class ProxyCore:
     async def _close_backend(self) -> None:
         self.backend_connected.clear()
         self.backend_parser.reset()
+        if self._contact_sync_active:
+            self._logger.info("[cache] contact sync interrupted; it will restart after reconnect")
+            self._reset_contact_sync(keep_waiters=True)
+        if self._contacts_synced:
+            # Contact changes may occur on the companion while the proxy is
+            # disconnected, so the next client request must validate the cache.
+            self._contacts_require_full_sync = True
+            self._mark_contacts_dirty("backend disconnected")
         # Unblock the poll loop if it is waiting for a backend response.
         self._poll_event.set()
         await self._transport_close()
@@ -1269,23 +1466,37 @@ class ProxyCore:
                 connected,
             )
 
+        # Iterator responses belong to the proxy's one shared contact sync. Stage
+        # them privately and answer each waiting client from the committed cache;
+        # broadcasting these raw frames would mix one client's request into every
+        # connected app.
+        if (not synthetic and self._contact_sync_active
+                and packet_type in {
+                    RESP_CODE_CONTACTS_START, CONTACT_TYPE, RESP_CODE_END_OF_CONTACTS,
+                }):
+            self._arm_contact_sync_timeout()
+            await self._handle_contact_sync_frame(frame, packet_type)
+            return
+
         # State cache (mechanism 2): keep the latest snapshot of allowlisted types
         # so (re)connecting clients can be served without hitting the backend.
-        # NEW_ADVERT (0x8A) is folded into the CONTACT cache by _cache_backend_frame;
-        # everything not in CACHE_TYPES is simply forwarded live below.
+        # NEW_ADVERT (0x8A) is intentionally not allowlisted: it is a transient,
+        # unapproved discovery rather than an authoritative stored contact.
         if not is_msg:
             self._cache_backend_frame(frame, packet_type)
+            # These pushes refer to an accepted/stored contact and indicate that
+            # metadata or its path changed in firmware. Validate the snapshot
+            # lazily on the next GET_CONTACTS.
+            if packet_type in {ADVERT_TYPE, PATH_UPDATED_TYPE}:
+                reason = (
+                    "stored contact advert received"
+                    if packet_type == ADVERT_TYPE
+                    else "stored contact path updated"
+                )
+                self._mark_contacts_dirty(reason)
             # Backend auto-evicted a contact (storage full) -> drop it from cache.
-            if packet_type == 0x8F and len(frame) >= PUBKEY_OFFSET + PUBKEY_SIZE:
+            if packet_type == CONTACT_DELETED_TYPE and len(frame) >= PUBKEY_OFFSET + PUBKEY_SIZE:
                 self._evict_contact_from_cache(frame[PUBKEY_OFFSET:PUBKEY_OFFSET + PUBKEY_SIZE])
-            # PX-6: a forwarded GET_CONTACTS refresh has completed. Clear the dirty
-            # flag on the backend's END_OF_CONTACTS (not at forward time) so a
-            # forward that was dropped/failed because the backend was down leaves
-            # the flag armed for a later retry instead of silently going stale.
-            if (not synthetic and packet_type == RESP_CODE_END_OF_CONTACTS
-                    and self._contacts_dirty):
-                self._contacts_dirty = False
-                self._logger.debug("[cache] contacts refresh complete — dirty flag cleared")
 
         # Signal the poll loop only for real backend frames, not synthetic echoes.
         if not synthetic:
@@ -1321,19 +1532,31 @@ class ProxyCore:
             if packet_type == RESP_CODE_SELF_INFO:
                 continue
             if packet_type == CONTACT_TYPE:
+                if (not self._contacts_synced or self._contacts_dirty
+                        or self._contact_sync_active):
+                    self._logger.debug(
+                        "[cache] skipped contact replay to %s: snapshot is not synchronized",
+                        state.client_id,
+                    )
+                    continue
                 snapshot = list(bucket.values())
                 n = len(snapshot)
-                contacts_start = bytes([ord(">"), 5, 0, 0x02]) + struct.pack("<I", n)
+                contacts_start = (
+                    bytes((ord(">"), 5, 0, RESP_CODE_CONTACTS_START))
+                    + struct.pack("<I", n)
+                )
                 await self._send_bytes_to_client(state, contacts_start)
                 most_recent = 0
                 for frame in snapshot:
                     await self._send_bytes_to_client(state, frame)
                     total += 1
-                    if len(frame) >= CONTACT_LASTMOD_OFFSET + 4:
-                        lm = struct.unpack_from("<I", frame, CONTACT_LASTMOD_OFFSET)[0]
-                        if lm > most_recent:
-                            most_recent = lm
-                end_of_contacts = bytes([ord(">"), 5, 0, 0x04]) + struct.pack("<I", most_recent)
+                    lastmod = _contact_lastmod(frame)
+                    if lastmod is not None:
+                        most_recent = max(most_recent, lastmod)
+                end_of_contacts = (
+                    bytes((ord(">"), 5, 0, RESP_CODE_END_OF_CONTACTS))
+                    + struct.pack("<I", most_recent)
+                )
                 await self._send_bytes_to_client(state, end_of_contacts)
                 continue
             for frame in list(bucket.values()):
