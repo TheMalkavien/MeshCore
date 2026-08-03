@@ -235,6 +235,7 @@ private:
 
   uint8_t cmd_frame[MAX_FRAME_SIZE + 1];
   uint8_t out_frame[MAX_FRAME_SIZE + 1];
+  uint8_t rx_log_frame[MAX_TRANS_UNIT + 3];
   CayenneLPP telemetry;
 
   struct Frame {
