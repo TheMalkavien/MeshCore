@@ -82,52 +82,98 @@ def build_artifact(target, source, env):
     mode = env.GetProjectOption("custom_dual_ota_artifact")
     app_path = Path(str(source[0]))
     shim_path = Path(str(source[1]))
-    output_path = Path(str(target[0]))
-    metadata_path = Path(str(target[1]))
     app = app_path.read_bytes()
 
-    if len(app) > MAX_APP_SIZE:
+    if len(app) > MAX_APP_SIZE or len(app) & 3:
         raise ValueError(
-            f"application is 0x{len(app):x} bytes; max is 0x{MAX_APP_SIZE:x}"
+            f"application is 0x{len(app):x} bytes; max is 0x{MAX_APP_SIZE:x} "
+            "and the serial bootloader requires a 4-byte-aligned size"
         )
     app_stack, app_reset = validate_vectors(
         app, APP_ADDRESS, APP_ADDRESS + len(app), "application"
     )
+    common = {
+        "app_size": len(app),
+        "app_crc32": f"0x{crc32(app):08x}",
+        "app_initial_stack": f"0x{app_stack:08x}",
+        "app_reset_vector": f"0x{app_reset:08x}",
+    }
 
-    if mode == "installer":
+    if mode == "migration":
         prefix = installer_prefix(shim_path.read_bytes(), app)
-        artifact = prefix + app
-        metadata = {
-            "format": "meshcore-rp2040-dual-ota-installer-v1",
+        stage1 = prefix + app
+        stage1_path = Path(str(target[0]))
+        stage1_json = Path(str(target[1]))
+        stage2_path = Path(str(target[2]))
+        stage2_json = Path(str(target[3]))
+
+        if (len(prefix) != SHIM_SIZE or SHIM_SIZE % 0x1000 != 0):
+            raise AssertionError("stage 2 must be exactly one 12 KiB shim prefix")
+        if stage1[:SHIM_SIZE] != prefix or stage1[SHIM_SIZE:] != app:
+            raise AssertionError("stage 1/stage 2 migration pair is inconsistent")
+
+        # The historical ESP32 flasher seals the exact uploaded file size.
+        # Stage 1 installs shim+app, then stage 2 uploads the identical 12 KiB
+        # prefix so the final serial header covers the immutable shim only.
+        stage1_path.write_bytes(stage1)
+        stage2_path.write_bytes(prefix)
+        pair_crc = f"0x{crc32(stage1):08x}"
+        write_json(stage1_json, {
+            **common,
+            "artifact": stage1_path.name,
+            "format": "meshcore-rp2040-dual-ota-stage1-v1",
             "load_address": f"0x{SHIM_ADDRESS:08x}",
-            "seal_crc32": f"0x{crc32(prefix):08x}",
-            "seal_size": SHIM_SIZE,
+            "size": len(stage1),
+            "crc32": pair_crc,
+            "historical_seal_size": len(stage1),
             "app_file_offset": SHIM_SIZE,
             "app_flash_address": f"0x{APP_ADDRESS:08x}",
-        }
+            "migration_pair_crc32": pair_crc,
+            "next_artifact": stage2_path.name,
+        })
+        write_json(stage2_json, {
+            **common,
+            "artifact": stage2_path.name,
+            "format": "meshcore-rp2040-dual-ota-stage2-seal-v1",
+            "load_address": f"0x{SHIM_ADDRESS:08x}",
+            "size": len(prefix),
+            "crc32": f"0x{crc32(prefix):08x}",
+            "seal_size": SHIM_SIZE,
+            "seal_crc32": f"0x{crc32(prefix):08x}",
+            "preserves_application_from": f"0x{APP_ADDRESS:08x}",
+            "migration_pair_crc32": pair_crc,
+            "previous_artifact": stage1_path.name,
+        })
+
+        # Remove names produced by the superseded one-pass/modified-ESP32
+        # workflow so a stale build artifact cannot be selected by mistake.
+        for obsolete in (
+            stage1_path.parent / "firmware-esp32-installer.bin",
+            stage1_path.parent / "firmware-esp32-installer.json",
+        ):
+            if obsolete.exists():
+                obsolete.unlink()
+
+        print(f"Dual OTA stage 1: {stage1_path} ({len(stage1)} bytes)")
+        print(f"Dual OTA stage 2: {stage2_path} ({len(prefix)} bytes)")
+        return 0
     elif mode == "lora":
-        artifact = app
+        output_path = Path(str(target[0]))
+        metadata_path = Path(str(target[1]))
+        output_path.write_bytes(app)
         metadata = {
+            **common,
+            "artifact": output_path.name,
             "format": "meshcore-rp2040-dual-ota-app-v1",
             "load_address": f"0x{APP_ADDRESS:08x}",
+            "size": len(app),
+            "crc32": f"0x{crc32(app):08x}",
         }
     else:
         raise ValueError(f"unknown custom_dual_ota_artifact={mode!r}")
 
-    output_path.write_bytes(artifact)
-    metadata.update(
-        {
-            "artifact": output_path.name,
-            "size": len(artifact),
-            "crc32": f"0x{crc32(artifact):08x}",
-            "app_size": len(app),
-            "app_crc32": f"0x{crc32(app):08x}",
-            "app_initial_stack": f"0x{app_stack:08x}",
-            "app_reset_vector": f"0x{app_reset:08x}",
-        }
-    )
     write_json(metadata_path, metadata)
-    print(f"Dual OTA artifact: {output_path} ({len(artifact)} bytes)")
+    print(f"Dual OTA artifact: {output_path} ({len(app)} bytes)")
     return 0
 
 
@@ -135,16 +181,26 @@ project_dir = Path(env.subst("$PROJECT_DIR"))
 build_dir = Path(env.subst("$BUILD_DIR"))
 program_name = env.subst("${PROGNAME}")
 mode = env.GetProjectOption("custom_dual_ota_artifact")
-artifact_stem = "firmware-esp32-installer" if mode == "installer" else "firmware-lora"
 
 app_binary = build_dir / f"{program_name}.bin"
 shim_binary = project_dir / "variants" / "waveshare_rp2040_lora" / "dual_ota" / "dual_ota_shim.bin"
 format_header = project_dir / "variants" / "waveshare_rp2040_lora" / "dual_ota" / "dual_ota_format.h"
-artifact_binary = build_dir / f"{artifact_stem}.bin"
-artifact_json = build_dir / f"{artifact_stem}.json"
+
+if mode == "migration":
+    artifact_targets = [
+        build_dir / "firmware-esp32-stage1.bin",
+        build_dir / "firmware-esp32-stage1.json",
+        build_dir / "firmware-esp32-stage2-seal.bin",
+        build_dir / "firmware-esp32-stage2-seal.json",
+    ]
+else:
+    artifact_targets = [
+        build_dir / "firmware-lora.bin",
+        build_dir / "firmware-lora.json",
+    ]
 
 artifact = env.Command(
-    [str(artifact_binary), str(artifact_json)],
+    [str(path) for path in artifact_targets],
     [str(app_binary), str(shim_binary), str(format_header)],
     build_artifact,
 )

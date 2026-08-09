@@ -50,6 +50,16 @@ static uint32_t crc32(const void *source, uint32_t length) {
   return ~crc32_update(0xffffffffu, source, length);
 }
 
+static bool serial_header_finalized(void) {
+  const MLKDualOTAUARTHeaderPrefix *header =
+      (const MLKDualOTAUARTHeaderPrefix *)MLK_DUAL_OTA_UART_HEADER_ADDRESS;
+  return header->vtor == MLK_DUAL_OTA_SHIM_ADDRESS &&
+         header->size == MLK_DUAL_OTA_SHIM_SIZE &&
+         header->crc32 ==
+             crc32((const void *)MLK_DUAL_OTA_SHIM_ADDRESS,
+                   MLK_DUAL_OTA_SHIM_SIZE);
+}
+
 static bool valid_app_vectors(const uint32_t vectors[2], uint32_t image_length) {
   uint32_t stack = vectors[0];
   uint32_t reset = vectors[1];
@@ -96,6 +106,13 @@ static bool command_ok(void) {
 }
 
 static bool has_dual_ota(void) {
+  // Stage 1 is bootable so that migration can be completed remotely, but its
+  // UART header still covers shim+application. Ignore every staged LoRa
+  // command until stage 2 has sealed exactly the immutable shim prefix.
+  if (!serial_header_finalized()) {
+    return false;
+  }
+
   uint32_t fs_start = *fs_start_word;
   uint32_t fs_end = *fs_end_word;
   if (fs_start != MLK_DUAL_OTA_FS_START ||
