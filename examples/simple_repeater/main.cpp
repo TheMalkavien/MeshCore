@@ -6,6 +6,10 @@
 #endif
 #include "MyMesh.h"
 
+#if defined(MLK_DUAL_OTA)
+#include "dual_ota/dual_ota_format.h"
+#endif
+
 #ifdef DISPLAY_CLASS
   #include "UITask.h"
   static UITask ui_task(board, display);
@@ -107,6 +111,14 @@ void setup() {
   IdentityStore store(SPIFFS, "/identity");
 #elif defined(RP2040_PLATFORM)
   LittleFS.begin();
+#if defined(MLK_DUAL_OTA)
+  // The dual-OTA shim (LFS_READONLY) no longer erases the applied LoRa command;
+  // it detects "already applied" by CRC and leaves the files for the app to
+  // clean up. Remove them here, through the full read/write LittleFS, so no
+  // stale command record or ~app-sized firmware.bin lingers across reboots.
+  LittleFS.remove(MLK_DUAL_OTA_COMMAND_FILE);
+  LittleFS.remove(MLK_DUAL_OTA_STAGED_FILE);
+#endif
   fs = &LittleFS;
   IdentityStore store(LittleFS, "/identity");
   store.begin();
