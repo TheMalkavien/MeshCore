@@ -78,6 +78,41 @@ def write_json(path, values):
     path.write_text(json.dumps(values, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def flash_safety_text(mode, app_name):
+    """Human-readable marker dropped in the build dir.
+
+    The historical ESP32 serial flasher validates nothing and writes whatever
+    file it is given to 0x10004000. Any application binary is linked for
+    0x10007000, so flashing it serially lands it 0x3000 too low and hardfaults.
+    This marker names the only files that are safe to send to the flasher,
+    right next to them where the operator selects one.
+    """
+    if mode == "migration":
+        return (
+            "=== SECURITE FLASHAGE — waveshare_rp2040_lora dual OTA (migration) ===\n"
+            "\n"
+            "A envoyer au flasheur serie ESP32, DANS CET ORDRE, UNIQUEMENT :\n"
+            "  1) firmware-esp32-stage1.bin\n"
+            "  2) firmware-esp32-stage2-seal.bin\n"
+            "\n"
+            "NE JAMAIS envoyer au flasheur ESP32 (il ecrit a 0x10004000) :\n"
+            f"  - {app_name}  (application liee a 0x10007000 -> hardfault si flashee ici)\n"
+            "  - tout .json / .elf / .uf2 / .gz, ou un fichier renomme\n"
+            "\n"
+            "Ne lancer AUCUNE OTA LoRa entre l'etape 1 et l'etape 2.\n"
+        )
+    return (
+        "=== SECURITE FLASHAGE — waveshare_rp2040_lora dual OTA (LoRa) ===\n"
+        "\n"
+        "Mise a jour applicative VIA OTA LoRa UNIQUEMENT :\n"
+        "  - firmware-lora.bin\n"
+        "\n"
+        f"NE JAMAIS envoyer firmware-lora.bin ni {app_name} au flasheur serie ESP32\n"
+        "(application liee a 0x10007000 ; ecrite a 0x10004000 -> hardfault).\n"
+        "Pour un reflash serie, utiliser la paire de migration stage1 + stage2.\n"
+    )
+
+
 def build_artifact(target, source, env):
     mode = env.GetProjectOption("custom_dual_ota_artifact")
     app_path = Path(str(source[0]))
@@ -154,6 +189,10 @@ def build_artifact(target, source, env):
             if obsolete.exists():
                 obsolete.unlink()
 
+        Path(str(target[4])).write_text(
+            flash_safety_text("migration", app_path.name), encoding="utf-8"
+        )
+
         print(f"Dual OTA stage 1: {stage1_path} ({len(stage1)} bytes)")
         print(f"Dual OTA stage 2: {stage2_path} ({len(prefix)} bytes)")
         return 0
@@ -173,6 +212,9 @@ def build_artifact(target, source, env):
         raise ValueError(f"unknown custom_dual_ota_artifact={mode!r}")
 
     write_json(metadata_path, metadata)
+    Path(str(target[2])).write_text(
+        flash_safety_text("lora", app_path.name), encoding="utf-8"
+    )
     print(f"Dual OTA artifact: {output_path} ({len(app)} bytes)")
     return 0
 
@@ -192,11 +234,13 @@ if mode == "migration":
         build_dir / "firmware-esp32-stage1.json",
         build_dir / "firmware-esp32-stage2-seal.bin",
         build_dir / "firmware-esp32-stage2-seal.json",
+        build_dir / "FLASH_SAFETY.txt",
     ]
 else:
     artifact_targets = [
         build_dir / "firmware-lora.bin",
         build_dir / "firmware-lora.json",
+        build_dir / "FLASH_SAFETY.txt",
     ]
 
 artifact = env.Command(
