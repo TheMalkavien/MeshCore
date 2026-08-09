@@ -9,6 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(MLK_DUAL_OTA)
+  #include "dual_ota/dual_ota_format.h"
+#endif
+
 #define OTA_CMD_MAX_CHUNK_BYTES  160
 #define OTA_PROGRESS_LOG_STEP_BYTES 4096
 
@@ -48,6 +52,107 @@
 
 #ifndef RP2040_OTA_SERIAL_DEBUG
   #define RP2040_OTA_SERIAL_DEBUG 1
+#endif
+
+#if defined(MLK_DUAL_OTA)
+static uint32_t dualOTACRC32Update(uint32_t crc, const void *source, size_t length) {
+  const uint8_t *data = (const uint8_t *) source;
+  for (size_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc & 1u) ? ((crc >> 1) ^ 0xedb88320u) : (crc >> 1);
+    }
+  }
+  return crc;
+}
+
+static bool dualOTAAppVectorsOK(const uint32_t vectors[2], size_t image_size) {
+  uint32_t stack = vectors[0];
+  uint32_t reset = vectors[1];
+  uint32_t reset_address = reset & ~1u;
+  uint32_t image_end = MLK_DUAL_OTA_APP_ADDRESS + (uint32_t) image_size;
+  return (stack & 3u) == 0u
+      && stack >= 0x20000000u && stack <= 0x20042000u
+      && (reset & 1u) != 0u
+      && reset_address >= MLK_DUAL_OTA_APP_ADDRESS
+      && reset_address < image_end
+      && image_end <= MLK_DUAL_OTA_FS_START;
+}
+
+static bool commitDualOTACommand(size_t image_size, char reply[]) {
+  static const uint8_t command_magic[8] = MLK_DUAL_OTA_COMMAND_MAGIC_BYTES;
+  // Core 0 has a 2 KiB stack on RP2040. Keep the CRC work buffer and the
+  // intentionally non-inline (656-byte) LittleFS record out of that stack.
+  static uint8_t buffer[1024];
+  static MLKDualOTACommand command;
+
+  // Updater always creates the stock PicoOTA command targeting XIP_BASE.
+  // The immutable shim ignores it, but remove it immediately so this staged
+  // image can never be dangerous if the flash layout is changed later.
+  LittleFS.remove("otacommand.bin");
+  LittleFS.remove(MLK_DUAL_OTA_COMMAND_TEMP);
+
+  File firmware = LittleFS.open(MLK_DUAL_OTA_STAGED_FILE, "r");
+  if (!firmware || firmware.size() != image_size || image_size < 8
+      || image_size > MLK_DUAL_OTA_MAX_APP_SIZE) {
+    if (firmware) firmware.close();
+    strcpy(reply, "Err - invalid dual OTA image size");
+    return false;
+  }
+
+  uint32_t vectors[2];
+  if (firmware.read((uint8_t *) vectors, sizeof(vectors)) != sizeof(vectors)
+      || !dualOTAAppVectorsOK(vectors, image_size)
+      || !firmware.seek(0)) {
+    firmware.close();
+    strcpy(reply, "Err - firmware is not a 0x10007000 image");
+    return false;
+  }
+
+  uint32_t image_crc = 0xffffffffu;
+  size_t remaining = image_size;
+  while (remaining > 0) {
+    size_t length = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+    if (firmware.read(buffer, length) != length) {
+      firmware.close();
+      strcpy(reply, "Err - staged firmware read failed");
+      return false;
+    }
+    image_crc = dualOTACRC32Update(image_crc, buffer, length);
+    remaining -= length;
+  }
+  firmware.close();
+
+  memset(&command, 0, sizeof(command));
+  memcpy(command.magic, command_magic, sizeof(command.magic));
+  command.version = MLK_DUAL_OTA_COMMAND_VERSION;
+  command.header_size = sizeof(command);
+  command.target_address = MLK_DUAL_OTA_APP_ADDRESS;
+  command.file_offset = 0;
+  command.image_length = (uint32_t) image_size;
+  command.image_crc32 = ~image_crc;
+  strncpy(command.filename, MLK_DUAL_OTA_STAGED_FILE,
+          sizeof(command.filename) - 1);
+  command.command_crc32 = ~dualOTACRC32Update(
+      0xffffffffu, &command, offsetof(MLKDualOTACommand, command_crc32));
+
+  File temp = LittleFS.open(MLK_DUAL_OTA_COMMAND_TEMP, "w");
+  if (!temp || temp.write((const uint8_t *) &command, sizeof(command)) != sizeof(command)) {
+    if (temp) temp.close();
+    LittleFS.remove(MLK_DUAL_OTA_COMMAND_TEMP);
+    strcpy(reply, "Err - dual OTA command write failed");
+    return false;
+  }
+  temp.close();
+
+  LittleFS.remove(MLK_DUAL_OTA_COMMAND_FILE);
+  if (!LittleFS.rename(MLK_DUAL_OTA_COMMAND_TEMP, MLK_DUAL_OTA_COMMAND_FILE)) {
+    LittleFS.remove(MLK_DUAL_OTA_COMMAND_TEMP);
+    strcpy(reply, "Err - dual OTA command commit failed");
+    return false;
+  }
+  return true;
+}
 #endif
 
 #if RP2040_OTA_SERIAL_DEBUG
@@ -263,11 +368,21 @@ bool RP2040OTAController::startSession(const char *id, char reply[]) {
   FSInfo fs_info;
   if (LittleFS.info(fs_info) && fs_info.totalBytes >= fs_info.usedBytes) {
     uint32_t free_kb = (uint32_t)((fs_info.totalBytes - fs_info.usedBytes) / 1024ULL);
+#if defined(MLK_DUAL_OTA)
+    sprintf(reply, "OK - OTA ready (%lukB free, blk=%u, gz=0, nack=miss)",
+            (unsigned long) free_kb, (unsigned int) flushBlockBytes());
+#else
     sprintf(reply, "OK - OTA ready (%lukB free, blk=%u, nack=miss)",
             (unsigned long) free_kb, (unsigned int) flushBlockBytes());
+#endif
     OTA_DEBUG_PRINTLN("session armed, free=%lu kB, blk=%u", (unsigned long) free_kb, (unsigned int) flushBlockBytes());
   } else {
+#if defined(MLK_DUAL_OTA)
+    sprintf(reply, "OK - OTA ready (blk=%u, gz=0, nack=miss)",
+            (unsigned int) flushBlockBytes());
+#else
     sprintf(reply, "OK - OTA ready (blk=%u, nack=miss)", (unsigned int) flushBlockBytes());
+#endif
     OTA_DEBUG_PRINTLN("session armed, fs info unavailable");
   }
   return true;
@@ -332,6 +447,13 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
       strcpy(reply, "Err - bad OTA size");
       return true;
     }
+#if defined(MLK_DUAL_OTA)
+    if (size_ul > MLK_DUAL_OTA_MAX_APP_SIZE) {
+      OTA_DEBUG_PRINTLN("begin rejected: image too large for dual OTA app slot");
+      strcpy(reply, "Err - image exceeds dual OTA app slot");
+      return true;
+    }
+#endif
     sub = skipSpaces(endptr);
 
     bool has_md5 = false;
@@ -410,6 +532,22 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
         return true;
       }
     }
+
+#if defined(MLK_DUAL_OTA)
+    // The CRC stored in mcota2.cmd protects the staged copy, but only the MD5
+    // supplied by the sender proves that this copy matches the selected build.
+    if (!has_md5) {
+      OTA_DEBUG_PRINTLN("begin rejected: MD5 required for dual OTA");
+      strcpy(reply, "Err - MD5 required for dual OTA");
+      return true;
+    }
+
+    // A newly armed transfer supersedes any command left from an earlier
+    // staged image. The running application is still intact at this point.
+    LittleFS.remove(MLK_DUAL_OTA_COMMAND_TEMP);
+    LittleFS.remove(MLK_DUAL_OTA_COMMAND_FILE);
+    LittleFS.remove("otacommand.bin");
+#endif
 
     if (!Update.begin((size_t) size_ul, U_FLASH)) {
       sprintf(reply, "Err - begin failed (%u)", (uint32_t) Update.getError());
@@ -519,6 +657,14 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
       clearState();
       return true;
     }
+
+#if defined(MLK_DUAL_OTA)
+    if (!commitDualOTACommand(_expected_size, reply)) {
+      OTA_DEBUG_PRINTLN("end failed: %s", reply);
+      clearState();
+      return true;
+    }
+#endif
 
     OTA_DEBUG_PRINTLN("end ok, image staged");
     clearState();
