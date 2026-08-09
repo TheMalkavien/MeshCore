@@ -206,6 +206,20 @@ Après une migration réussie, une récupération complète par l'ESP32 historiq
 utilise elle aussi une nouvelle paire `stage1` puis `stage2`. Le binaire LoRa
 seul n'est pas une image de récupération série.
 
+### Réparer uniquement le shim d'un nœud déjà migré
+
+Si les étapes 1 et 2 ont déjà été confirmées et que le header série scelle donc
+exactement `0x3000` octets, un nouveau `firmware-esp32-stage2-seal.bin` peut être
+renvoyé seul pour mettre à jour ou réparer le shim. Cette opération réécrit
+uniquement `0x10004000`–`0x10006fff` et préserve l'application ainsi que
+LittleFS. Une commande LoRa valide déjà présente dans LittleFS sera traitée par
+le nouveau shim au redémarrage.
+
+Cette procédure en un fichier est réservée à un nœud dont la migration complète
+avait été vérifiée auparavant. Si l'état du header ou de l'application est
+incertain, reprendre la paire complète issue d'une même compilation : `stage1`,
+puis `stage2`.
+
 ## Mises à jour LoRa après la migration
 
 Une fois l'étape 2 confirmée, construire une mise à jour LoRa avec :
