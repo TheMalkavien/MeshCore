@@ -122,7 +122,15 @@ static bool has_dual_ota(void) {
   if (!lfsMount((uint8_t *)fs_start, FLASH_SECTOR_SIZE, fs_end - fs_start)) {
     return false;
   }
-  return lfsReadCommand(&command, &command_block);
+  if (!lfsReadCommand(&command, &command_block)) {
+    return false;
+  }
+
+  // The successful OTA path erases the command data block, while LittleFS
+  // metadata can still describe the file until the application mounts the
+  // filesystem again. Reject that erased/stale record here, before the rest
+  // of the shim runtime is initialized and we hand control to the app.
+  return command_ok();
 }
 
 static bool verify_staged_image(void) {
