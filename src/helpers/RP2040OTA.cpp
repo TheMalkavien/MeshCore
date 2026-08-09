@@ -66,6 +66,20 @@ static uint32_t dualOTACRC32Update(uint32_t crc, const void *source, size_t leng
   return crc;
 }
 
+static bool dualOTASerialHeaderFinalized() {
+  const MLKDualOTAUARTHeaderPrefix *header =
+      (const MLKDualOTAUARTHeaderPrefix *) MLK_DUAL_OTA_UART_HEADER_ADDRESS;
+  if (header->vtor != MLK_DUAL_OTA_SHIM_ADDRESS ||
+      header->size != MLK_DUAL_OTA_SHIM_SIZE) {
+    return false;
+  }
+
+  uint32_t shim_crc = ~dualOTACRC32Update(
+      0xffffffffu, (const void *) MLK_DUAL_OTA_SHIM_ADDRESS,
+      MLK_DUAL_OTA_SHIM_SIZE);
+  return header->crc32 == shim_crc;
+}
+
 static bool dualOTAAppVectorsOK(const uint32_t vectors[2], size_t image_size) {
   uint32_t stack = vectors[0];
   uint32_t reset = vectors[1];
@@ -339,6 +353,19 @@ static void bytesToHex(const uint8_t *src, size_t len, char *dst) {
 bool RP2040OTAController::startSession(const char *id, char reply[]) {
   OTA_DEBUG_PRINTLN("start requested by %s", id ? id : "?");
   expireIfIdle();
+
+#if defined(MLK_DUAL_OTA)
+  // Stage 1 of the migration is deliberately bootable, but its historical
+  // UART header still covers shim+application. Replacing the application at
+  // that point would invalidate the header on the following reboot. Stage 2
+  // seals only the immutable shim and makes LoRa OTA safe.
+  if (!dualOTASerialHeaderFinalized()) {
+    strcpy(reply, "Err - finish ESP32 migration stage 2");
+    OTA_DEBUG_PRINTLN("rejected: UART header is not finalized for dual OTA");
+    clearState();
+    return true;
+  }
+#endif
 
   if (!LittleFS.begin()) {
     strcpy(reply, "Err - LittleFS unavailable");
