@@ -33,7 +33,6 @@ static const uint32_t *const fs_end_word =
     (const uint32_t *)(MLK_DUAL_OTA_APP_ADDRESS - 0x0cu);
 
 static MLKDualOTACommand command __attribute__((section(".globals")));
-static uint32_t command_block;
 
 static uint32_t crc32_update(uint32_t crc, const void *source, uint32_t length) {
   const uint8_t *data = (const uint8_t *)source;
@@ -105,6 +104,18 @@ static bool command_ok(void) {
   return expected_crc == command.command_crc32;
 }
 
+// True when the application already in flash is byte-identical (by CRC) to the
+// staged command's image — i.e. this command was applied on an earlier boot and
+// the app has not yet removed it. There is then nothing to do; the app deletes
+// mcota2.cmd/firmware.bin at startup through the full read/write LittleFS. This
+// lets the read-only shim signal "already applied" WITHOUT writing to the
+// filesystem: no raw block erase, no dangling directory entry.
+static bool app_matches_command(void) {
+  const uint32_t *vectors = (const uint32_t *)MLK_DUAL_OTA_APP_ADDRESS;
+  return valid_app_vectors(vectors, command.image_length) &&
+         crc32(vectors, command.image_length) == command.image_crc32;
+}
+
 static bool has_dual_ota(void) {
   // Stage 1 is bootable so that migration can be completed remotely, but its
   // UART header still covers shim+application. Ignore every staged LoRa
@@ -122,15 +133,18 @@ static bool has_dual_ota(void) {
   if (!lfsMount((uint8_t *)fs_start, FLASH_SECTOR_SIZE, fs_end - fs_start)) {
     return false;
   }
-  if (!lfsReadCommand(&command, &command_block)) {
+  if (!lfsReadCommand(&command)) {
+    return false;
+  }
+  if (!command_ok()) {
     return false;
   }
 
-  // The successful OTA path erases the command data block, while LittleFS
-  // metadata can still describe the file until the application mounts the
-  // filesystem again. Reject that erased/stale record here, before the rest
-  // of the shim runtime is initialized and we hand control to the app.
-  return command_ok();
+  // If the running application already matches this command (applied on an
+  // earlier boot, not yet cleaned up by the app), there is nothing to do: boot
+  // it. This is how the read-only shim avoids re-applying in a loop without
+  // erasing the command file — the application removes it afterwards.
+  return !app_matches_command();
 }
 
 static bool verify_staged_image(void) {
@@ -263,7 +277,11 @@ static void perform_dual_ota(void) {
     enter_uart_recovery();
   }
 
-  lfsEraseBlock(command_block);
+  // Do NOT touch the command here: the shim is LFS_READONLY and a raw block
+  // erase would leave a dangling LittleFS entry. Just reboot — has_dual_ota
+  // then sees the app already matches the command (app_matches_command) and
+  // boots it without re-applying, and the app deletes the command + staged
+  // image. A power cut before that cleanup only re-applies (idempotent).
   clear_bootloader_magic();
   watchdog_reboot(0, 0, 100);
   while (true) {

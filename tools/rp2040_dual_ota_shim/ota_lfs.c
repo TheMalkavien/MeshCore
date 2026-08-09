@@ -15,13 +15,11 @@ static lfs_t lfs;
 static struct lfs_config lfs_cfg;
 static uint8_t *flash_start;
 static uint32_t flash_block_size;
-static lfs_block_t last_block;
 
 static int flash_read(const struct lfs_config *cfg, lfs_block_t block,
                       lfs_off_t off, void *dst, lfs_size_t size) {
   (void)cfg;
   memcpy(dst, flash_start + (block * flash_block_size) + off, size);
-  last_block = block;
   return 0;
 }
 
@@ -82,7 +80,7 @@ bool lfsMount(uint8_t *start, uint32_t block_size, uint32_t size) {
 static uint8_t command_buffer[256] __attribute__((section(".globals")));
 static struct lfs_file_config command_cfg = {command_buffer, NULL, 0};
 
-bool lfsReadCommand(MLKDualOTACommand *command, uint32_t *block_to_erase) {
+bool lfsReadCommand(MLKDualOTACommand *command) {
   lfs_file_t file;
   if (lfs_file_opencfg(&lfs, &file, MLK_DUAL_OTA_COMMAND_FILE,
                        LFS_O_RDONLY, &command_cfg) < 0) {
@@ -90,14 +88,8 @@ bool lfsReadCommand(MLKDualOTACommand *command, uint32_t *block_to_erase) {
   }
 
   lfs_ssize_t count = lfs_file_read(&lfs, &file, command, sizeof(*command));
-  uint32_t data_block = last_block;
   lfs_file_close(&lfs, &file);
-  if (count != (lfs_ssize_t)sizeof(*command)) {
-    return false;
-  }
-
-  *block_to_erase = data_block;
-  return true;
+  return count == (lfs_ssize_t)sizeof(*command);
 }
 
 static lfs_file_t firmware_file;
@@ -140,8 +132,4 @@ void lfsClose(void) {
   }
   lfs_file_close(&lfs, &firmware_file);
   firmware_open = false;
-}
-
-void lfsEraseBlock(uint32_t block_to_erase) {
-  flash_erase(&lfs_cfg, (lfs_block_t)block_to_erase);
 }
