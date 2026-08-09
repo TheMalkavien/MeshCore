@@ -49,14 +49,26 @@ static unsigned long userBtnDownAt = 0;
 #endif
 
 void setup() {
-#ifdef MLK_PIN_SERIAL_RX
-  Serial.setRX(MLK_PIN_SERIAL_RX);
-  Serial.setTX(MLK_PIN_SERIAL_TX);
-#endif
+#ifndef MLK_PIN_SERIAL_RX
   Serial.begin(115200);
   delay(1000);
+#endif
 
   board.begin();
+
+#ifdef MLK_PIN_SERIAL_RX
+  // Console bridged to the companion ESP32 over UART1 (Serial2). Two constraints:
+  //  - baud MUST match the ESP32 serial bridge (RP2040_SERIAL_BAUD = 921600 in
+  //    the RP2040_WIFI_BLE_OTA firmware), which is also the serial-bootloader
+  //    link speed;
+  //  - Serial2 is clocked by clk_peri (= clk_sys), so begin() MUST run AFTER
+  //    board.begin() has applied the 48 MHz active profile. Initialising it at
+  //    the ~125 MHz boot clock bakes a wrong divisor and corrupts the baud.
+  Serial.setRX(MLK_PIN_SERIAL_RX);
+  Serial.setTX(MLK_PIN_SERIAL_TX);
+  Serial.begin(921600);
+  delay(1000);
+#endif
 
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.begin();
