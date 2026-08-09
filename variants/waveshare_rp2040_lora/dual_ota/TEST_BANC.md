@@ -125,11 +125,17 @@ coïncident. C'est la preuve indépendante du test comportemental.
 3. Au redémarrage, le shim doit : trouver `mcota2.cmd`, vérifier la source (CRC +
    vecteurs), programmer `0x10007000`, relire (CRC + vecteurs), purger la
    commande, rebooter dans la **nouvelle** app.
+4. Une fois le nœud revenu, lancer une nouvelle fois `start ota`. La réponse
+   doit être `OK - OTA ready (...)`, puis terminer cette session avec
+   `ota abort`.
+5. Provoquer un redémarrage normal supplémentaire et vérifier que le nœud
+   revient encore sur la nouvelle app, sans boucle de redémarrage.
 
 **Attendu :** le nœud revient sur le mesh avec la **version LoRa distincte**
 (≠ version étape 1). Cela valide en une passe : H1 (déblocage), la lecture
 LittleFS par le shim (géométrie compatible), la programmation à la bonne adresse,
-et la chaîne d'intégrité MD5+CRC.
+la chaîne d'intégrité MD5+CRC, la purge de la commande et le chemin de boot sans
+double initialisation du runtime.
 
 ## Étape 4 — Tests de robustesse (recommandés)
 
