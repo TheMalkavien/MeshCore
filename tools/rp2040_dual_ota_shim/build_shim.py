@@ -45,6 +45,79 @@ def validate(blob: bytes) -> None:
         raise RuntimeError(f"invalid shim reset vector 0x{reset:08x}")
 
 
+def validate_elf(
+    nm_output: str, disassembly: str, data_section: bytes
+) -> None:
+    symbols: dict[str, list[tuple[int, str]]] = {}
+    for line in nm_output.splitlines():
+        fields = line.split()
+        if len(fields) >= 3:
+            try:
+                address = int(fields[0], 16)
+            except ValueError:
+                continue
+            symbols.setdefault(fields[-1], []).append((address, fields[-2]))
+
+    runtime_init_symbols = symbols.get("runtime_init", [])
+    if not any(symbol_type == "T" for _, symbol_type in runtime_init_symbols):
+        rendered = ", ".join(item[1] for item in runtime_init_symbols) or "missing"
+        raise RuntimeError(
+            "runtime_init must be a strong global text symbol so that RP2040 "
+            f"pre-init hooks execute; found: {rendered}"
+        )
+    required_symbols = (
+        "runtime_run_initializers",
+        "check_dual_ota",
+        "__pre_init_check_dual_ota",
+        "__preinit_array_start",
+        "__preinit_array_end",
+        "__data_start__",
+        "boot_application",
+        "flash_range_erase",
+        "flash_range_program",
+    )
+    for required in required_symbols:
+        if required not in symbols:
+            raise RuntimeError(f"required early OTA symbol is missing: {required}")
+
+    runtime_block = disassembly.split("<runtime_init>:", 1)
+    if len(runtime_block) != 2 or "<runtime_run_initializers>" not in runtime_block[
+        1
+    ].split("\n\n", 1)[0]:
+        raise RuntimeError("runtime_init does not call runtime_run_initializers")
+
+    def address(name: str) -> int:
+        return symbols[name][0][0]
+
+    preinit_entry = address("__pre_init_check_dual_ota")
+    preinit_start = address("__preinit_array_start")
+    preinit_end = address("__preinit_array_end")
+    if preinit_entry != preinit_start or preinit_entry + 4 > preinit_end:
+        raise RuntimeError("dual OTA check is not the first RP2040 pre-init hook")
+
+    data_offset = preinit_entry - address("__data_start__")
+    if data_offset < 0 or data_offset + 4 > len(data_section):
+        raise RuntimeError("dual OTA pre-init entry lies outside the data section")
+    preinit_pointer = struct.unpack_from("<I", data_section, data_offset)[0]
+    expected_pointer = address("check_dual_ota") | 1
+    if preinit_pointer != expected_pointer:
+        raise RuntimeError(
+            "dual OTA pre-init entry does not point to check_dual_ota: "
+            f"0x{preinit_pointer:08x} != 0x{expected_pointer:08x}"
+        )
+
+    for ram_function in (
+        "boot_application",
+        "flash_range_erase",
+        "flash_range_program",
+    ):
+        function_address = address(ram_function)
+        if not SRAM_START <= function_address < SRAM_END:
+            raise RuntimeError(
+                f"{ram_function} must execute from SRAM, found 0x{function_address:08x}"
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -82,6 +155,8 @@ def main() -> int:
 
     gcc = tool(toolchain, "arm-none-eabi-gcc")
     objcopy = tool(toolchain, "arm-none-eabi-objcopy")
+    objdump = tool(toolchain, "arm-none-eabi-objdump")
+    nm = tool(toolchain, "arm-none-eabi-nm")
     framework_arg = framework.as_posix() + "/"
     platform_inc = framework / "lib" / "rp2040" / "platform_inc.txt"
     core_inc = framework / "lib" / "core_inc.txt"
@@ -134,6 +209,11 @@ def main() -> int:
         (source_dir / "ota.c", "ota.o", "gnu11"),
         (source_dir / "ota_lfs.c", "ota_lfs.o", "gnu11"),
         (framework / "ota" / "ota_clocks.c", "ota_clocks.o", "gnu11"),
+        (
+            framework / "cores" / "rp2040" / "sdkoverride" / "newlib_interface.c",
+            "newlib_interface.o",
+            "gnu11",
+        ),
         (littlefs / "lfs.c", "lfs.o", "gnu11"),
         (littlefs / "lfs_util.c", "lfs_util.o", "gnu11"),
     ]
@@ -185,6 +265,19 @@ def main() -> int:
         "-Wl,--end-group",
     ]
     subprocess.run(link, check=True)
+
+    nm_result = subprocess.run(
+        [nm, "-a", str(elf)], check=True, capture_output=True, text=True
+    )
+    objdump_result = subprocess.run(
+        [objdump, "-d", str(elf)], check=True, capture_output=True, text=True
+    )
+    data_section = build_dir / "meshcore_dual_ota_shim.data.bin"
+    subprocess.run(
+        [objcopy, "-O", "binary", "--only-section=.data", str(elf), str(data_section)],
+        check=True,
+    )
+    validate_elf(nm_result.stdout, objdump_result.stdout, data_section.read_bytes())
 
     generated = build_dir / "meshcore_dual_ota_shim.bin"
     subprocess.run([objcopy, "-O", "binary", str(elf), str(generated)], check=True)
