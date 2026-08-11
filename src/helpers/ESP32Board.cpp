@@ -3,7 +3,11 @@
 #include "ESP32Board.h"
 #include <target.h>
 
-#if defined(ADMIN_PASSWORD) && !defined(DISABLE_WIFI_OTA)   // Repeater or Room Server only
+// 'start ota' arms the mesh OTA session by default (same LoRa OTA protocol
+// as the RP2040 targets — see helpers/ESP32OTA.cpp). Build with
+// -D WIFI_OTA_ON_START to restore the legacy behavior where 'start ota'
+// spawns the WiFi AP + ElegantOTA web portal instead.
+#if defined(WIFI_OTA_ON_START) && defined(ADMIN_PASSWORD) && !defined(DISABLE_WIFI_OTA)   // Repeater or Room Server only
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
@@ -41,7 +45,7 @@ bool ESP32Board::startOTAUpdate(const char* id, char reply[]) {
 
 #else
 bool ESP32Board::startOTAUpdate(const char* id, char reply[]) {
-  return false; // not supported
+  return ota.startSession(id, reply);
 }
 #endif
 
