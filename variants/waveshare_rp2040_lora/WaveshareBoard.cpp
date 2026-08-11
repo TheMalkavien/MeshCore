@@ -1,11 +1,80 @@
 #include "WaveshareBoard.h"
 
 #include <Arduino.h>
+#include <SPI.h>
 #include <Wire.h>
+
+#if defined(ARDUINO_ARCH_RP2040)
+  #include <hardware/clocks.h>
+  #include <hardware/sync.h>
+#if !defined(NO_USB) && !defined(USE_TINYUSB)
+  #include <USB.h>
+#endif
+#endif
+
+#if defined(ARDUINO_ARCH_RP2040)
+#if !defined(NO_USB) && !defined(USE_TINYUSB)
+static bool g_usb_connected = true;
+
+extern "C" bool meshcore_board_usb_on_demand(void) {
+#ifdef MLK_RP2040_LOWPOWER
+  // USB needs the active profile (clock + voltage) to enumerate reliably.
+  rp2040_restore_active_profile();
+#endif
+  if (!g_usb_connected) {
+    // Keep the USB stack alive and only re-attach to the host.
+    USB.connect();
+    delay(20);
+    g_usb_connected = true;
+  }
+  return true;
+}
+
+extern "C" bool meshcore_board_usb_off_demand(void) {
+  if (g_usb_connected) {
+    Serial.flush();
+    USB.disconnect();
+    g_usb_connected = false;
+  }
+#ifdef MLK_RP2040_LOWPOWER
+  // Once USB is down, keep the runtime in the lowest clock/voltage profile.
+  rp2040_enter_sleep_profile();
+#endif
+  return true;
+}
+
+extern "C" bool meshcore_board_usb_is_connected(void) {
+  return g_usb_connected;
+}
+#else
+extern "C" bool meshcore_board_usb_on_demand(void) { return false; }
+extern "C" bool meshcore_board_usb_off_demand(void) { return false; }
+extern "C" bool meshcore_board_usb_is_connected(void) { return false; }
+#endif
+#endif
+
+void WaveshareBoard::sleep(uint32_t secs) {
+  if (isOTASessionActive()) {
+    return;   // a firmware update in flight needs the full clock and USB
+  }
+  // NOTE: 'secs' is ignored and there is NO real sleep / wake-timer here. The RP2040 has no
+  // usable deep-sleep in this design, so "sleeping" means: disable USB and drop to the low
+  // clock/voltage profile, staying there continuously until an incoming 'usb on' command.
+  // The radio keeps receiving; there is no timed wake-up.
+  (void)secs;
+#if defined(ARDUINO_ARCH_RP2040) && defined(MLK_RP2040_LOWPOWER)
+  Serial.println("Disabling USB for low power sleep. Use command 'usb on' to re-enable.");
+  meshcore_board_usb_off_demand();
+#endif
+}
 
 void WaveshareBoard::begin() {
   // for future use, sub-classes SHOULD call this from their begin()
   startup_reason = BD_STARTUP_NORMAL;
+
+#if defined(ARDUINO_ARCH_RP2040)
+  rp2040_restore_active_profile();
+#endif
 
 #ifdef P_LORA_TX_LED
   pinMode(P_LORA_TX_LED, OUTPUT);
