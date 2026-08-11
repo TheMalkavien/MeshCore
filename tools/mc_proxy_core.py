@@ -1,0 +1,1628 @@
+#!/usr/bin/env python3
+"""
+Shared core for the MeshCore companion-link broadcast proxies.
+
+Both the serial proxy (tools/serial_proxy/serial_proxy.py) and the TCP proxy
+(tools/tcp_proxy/tcp_proxy.py) relay the MeshCore companion serial protocol
+between a single backend (a firmware over serial or TCP) and multiple app
+clients.  The two proxies differ ONLY in their backend transport, so all the
+common logic lives here in ProxyCore; each proxy is a thin subclass that
+implements the transport hooks (open / read / write / close) and provides its
+own CLI entrypoint.
+
+- Multi clients -> single backend connection
+- Proxy polls backend at a fixed interval; results cached locally
+- Client CMD_SYNC_NEXT_MESSAGE always served from local cache (never forwarded)
+- Reconnecting clients replay only missed messages from the proxy history
+"""
+
+import asyncio
+import itertools
+import logging
+import socket
+import struct
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+CMD_APP_START = 0x01
+CMD_SEND_CHAN_MSG = 0x03
+CMD_GET_CONTACTS = 0x04
+CMD_ADD_UPDATE_CONTACT = 0x09
+CMD_SYNC_NEXT_MESSAGE = 0x0A
+CMD_RESET_PATH = 0x0D
+CMD_REMOVE_CONTACT = 0x0F
+CMD_GET_CHANNEL = 0x1F
+CMD_SET_CHANNEL = 0x20
+RESP_CODE_SELF_INFO = 0x05
+RESP_CODE_NO_MORE_MESSAGES = 0x0A
+RESP_CODE_CONTACTS_START = 0x02
+RESP_CODE_END_OF_CONTACTS = 0x04
+
+# Offset of the 4-byte uint32_t LE lastmod field inside a CONTACT wire frame.
+# Wire frame: '>'(1) + len_LE(2) + code(1) + pubkey(32) + type(1) + flags(1)
+#             + out_path_len(1) + out_path(64) + name(32) + last_advert(4)
+#             + lat(4) + lon(4) + lastmod(4) = total 151 bytes
+CONTACT_LASTMOD_OFFSET = 147
+# Offset of the 1-byte out_path_len field inside a CONTACT wire frame
+# (header 3 + code 1 + pubkey 32 + type 1 + flags 1). OUT_PATH_UNKNOWN = 0xFF.
+CONTACT_OUT_PATH_LEN_OFFSET = 38
+OUT_PATH_UNKNOWN = 0xFF
+
+# Offset of the node-name string inside a SELF_INFO wire frame. node_name is the
+# trailing variable-length field: header(3) + code(1) + adv_type(1) + tx_power(1)
+# + max_tx_power(1) + pubkey(32) + lat(4) + lon(4) + multi_acks(1)
+# + advert_loc_policy(1) + telemetry(1) + manual_add(1) + freq(4) + bw(4)
+# + sf(1) + cr(1) = 61, then node_name to end of frame.
+SELF_INFO_NAME_OFFSET = 61
+
+PUBKEY_OFFSET = 4   # CONTACT/advert pubkey starts here: '>' + len_LE(2) + code
+PUBKEY_SIZE   = 32
+IDX_OFFSET = 4      # CHANNEL_INFO channel-index byte
+
+# --- State cache (mechanism 2): the latest snapshot of heavy / slow-changing
+# backend state, so a (re)connecting client can be served without hitting the
+# backend. This is an ALLOWLIST: only the types below are cached; everything
+# else is forwarded live and never cached (the safe default). Messages are NOT
+# here — they go through the per-client message queue (mechanism 1).
+#
+# Each type maps to a key function (frame -> key bytes) identifying the entity
+# (a contact's pubkey, a channel index…), or None for a singleton (one per
+# device, latest wins). The cache stores one latest frame per (type, key).
+CONTACT_TYPE = 0x03         # RESP_CODE_CONTACT
+CHANNEL_INFO_TYPE = 0x12    # RESP_CODE_CHANNEL_INFO
+NEW_ADVERT_TYPE = 0x8A      # PUSH_CODE_NEW_ADVERT (same wire layout as CONTACT)
+ADVERT_TYPE = 0x80          # PUSH_CODE_ADVERT (stored/accepted contact pubkey)
+PATH_UPDATED_TYPE = 0x81    # PUSH_CODE_PATH_UPDATED (stored contact pubkey)
+CONTACT_DELETED_TYPE = 0x8F # PUSH_CODE_CONTACT_DELETED
+
+
+def _contact_pubkey_key(frame: bytes) -> Optional[bytes]:
+    end = PUBKEY_OFFSET + PUBKEY_SIZE
+    return frame[PUBKEY_OFFSET:end] if len(frame) >= end else None
+
+
+def _channel_idx_key(frame: bytes) -> Optional[bytes]:
+    return frame[IDX_OFFSET:IDX_OFFSET + 1] if len(frame) > IDX_OFFSET else None
+
+
+def _contact_lastmod(frame: bytes) -> Optional[int]:
+    if len(frame) < CONTACT_LASTMOD_OFFSET + 4:
+        return None
+    return struct.unpack_from("<I", frame, CONTACT_LASTMOD_OFFSET)[0]
+
+
+CACHE_TYPES = {
+    0x05: None,                           # SELF_INFO            (singleton)
+    0x0D: None,                           # DEVICE_INFO          (singleton)
+    0x15: None,                           # CUSTOM_VARS          (singleton)
+    0x17: None,                           # TUNING_PARAMS        (singleton)
+    0x19: None,                           # AUTOADD_CONFIG       (singleton)
+    0x1A: None,                           # ALLOWED_REPEAT_FREQ  (singleton)
+    CONTACT_TYPE: _contact_pubkey_key,    # keyed by pubkey
+    CHANNEL_INFO_TYPE: _channel_idx_key,  # keyed by channel index
+}
+
+MAX_COMPANION_FRAME_SIZE = 2048
+DEFAULT_HISTORY_BYTES = 512 * 1024
+DEFAULT_HISTORY_FRAMES = 4096
+DEFAULT_CLIENT_WRITE_TIMEOUT = 2.0
+DEFAULT_CLIENT_QUEUE_FRAMES = 512
+DEFAULT_POLL_INTERVAL = 1.0
+DEFAULT_MAX_CLIENTS = 32
+# Keep inactive client cursors for as long as the message history (86400 = 24h).
+# Pruning cursors earlier than the history window causes full replays on reconnect.
+DEFAULT_INACTIVE_STATE_MAX_AGE = 86400
+DEFAULT_RECONNECT_BACKOFF_MAX = 60.0
+DEFAULT_BACKEND_WRITE_TIMEOUT = 10.0
+CONTACT_SYNC_IDLE_TIMEOUT = 15.0
+# A backend connection must stay up at least this long to be considered "stable"
+# and reset the exponential reconnect backoff. Shorter -> treated as flapping.
+DEFAULT_STABLE_CONNECTION_SECS = 5.0
+
+# Synthetic sent echoes are local proxy events, not RF receptions.  Using the
+# receive-side 0xFF "direct" sentinel here makes clients which decode the byte
+# as packed path metadata display the impossible value "63 hops / 4-byte".
+# Encode an unambiguous empty path instead (0 hops, 1-byte hash mode).
+SYNTHETIC_ECHO_PATH_LEN = 0x00
+
+# Per-client message stream, queued on the node and retrieved one-at-a-time via
+# CMD_SYNC_NEXT_MESSAGE (history + per-client cursor; missed ones replayed):
+#   RESP_CODE_CONTACT_MSG_RECV / CHANNEL_MSG_RECV       (v<3 : 0x07, 0x08)
+#   RESP_CODE_CONTACT_MSG_RECV_V3 / CHANNEL_MSG_RECV_V3 (v≥3 : 0x10, 0x11)
+#   RESP_CODE_CHANNEL_DATA_RECV (0x1B) — binary channel data, also SYNC-queued.
+MESSAGE_PACKET_TYPES = {0x07, 0x08, 0x10, 0x11, 0x1B}
+
+PACKET_TYPE_NAMES: dict[int, str] = {
+    # Responses to client commands
+    0x00: "OK",
+    0x01: "ERR",
+    0x02: "CONTACTS_START",
+    0x03: "CONTACT",
+    0x04: "END_OF_CONTACTS",
+    0x05: "SELF_INFO",
+    0x06: "SENT",
+    0x07: "MSG_RECV",
+    0x08: "CHANNEL_MSG_RECV",
+    0x09: "CURR_TIME",
+    0x0A: "NO_MORE_MESSAGES",
+    0x0B: "EXPORT_CONTACT",
+    0x0C: "BATT_AND_STORAGE",
+    0x0D: "DEVICE_INFO",
+    0x0E: "PRIVATE_KEY",
+    0x0F: "DISABLED",
+    0x10: "MSG_RECV_V3",
+    0x11: "CHANNEL_MSG_RECV_V3",
+    0x12: "CHANNEL_INFO",
+    0x13: "SIGN_START",
+    0x14: "SIGNATURE",
+    0x15: "CUSTOM_VARS",
+    0x16: "ADVERT_PATH",
+    0x17: "TUNING_PARAMS",
+    0x18: "STATS",
+    0x19: "AUTOADD_CONFIG",
+    0x1A: "ALLOWED_REPEAT_FREQ",
+    0x1B: "CHANNEL_DATA_RECV",
+    # Unsolicited push notifications (0x80–0x90)
+    0x80: "PUSH_ADVERT",
+    0x81: "PUSH_PATH_UPDATED",
+    0x82: "PUSH_SEND_CONFIRMED",
+    0x83: "PUSH_MSG_WAITING",
+    0x84: "PUSH_RAW_DATA",
+    0x85: "PUSH_LOGIN_SUCCESS",
+    0x86: "PUSH_LOGIN_FAIL",
+    0x87: "PUSH_STATUS_RESPONSE",
+    0x88: "PUSH_LOG_RX_DATA",
+    0x89: "PUSH_TRACE_DATA",
+    0x8A: "PUSH_NEW_ADVERT",
+    0x8B: "PUSH_TELEMETRY_RESPONSE",
+    0x8C: "PUSH_BINARY_RESPONSE",
+    0x8D: "PUSH_PATH_DISCOVERY_RESPONSE",
+    0x8E: "PUSH_CONTROL_DATA",
+    0x8F: "PUSH_CONTACT_DELETED",
+    0x90: "PUSH_CONTACTS_FULL",
+}
+
+
+def _build_sent_echo_frame(channel_idx: int, text_data: bytes, timestamp: int) -> bytes:
+    """Build the synthetic V3 channel-message frame shared with peer clients."""
+    payload = bytes([
+        0x11,                         # CHANNEL_MSG_RECV_V3
+        0,                            # SNR = 0 (synthetic, no RF)
+        0, 0,                         # reserved
+        channel_idx,                  # target channel
+        SYNTHETIC_ECHO_PATH_LEN,      # empty synthetic path
+        0,                            # txt_type = plain text
+    ]) + timestamp.to_bytes(4, "little") + text_data
+
+    return bytes([
+        ord(">"),
+        len(payload) & 0xFF,
+        (len(payload) >> 8) & 0xFF,
+    ]) + payload
+
+# How often (in poll iterations) to prune stale inactive client states.
+_PRUNE_EVERY_N_POLLS = 60
+
+
+def fmt_ptype(pt: Optional[int]) -> str:
+    if pt is None:
+        return "NONE"
+    return PACKET_TYPE_NAMES.get(pt, f"0x{pt:02X}")
+
+
+class CompanionStreamParser:
+    def __init__(self, header_byte: int, max_frame_size: int = MAX_COMPANION_FRAME_SIZE):
+        self.header_byte = header_byte
+        self.max_frame_size = max_frame_size
+        self.buffer = bytearray()
+
+    def reset(self) -> None:
+        self.buffer.clear()
+
+    def feed(self, data: bytes) -> list[bytes]:
+        if data:
+            self.buffer.extend(data)
+
+        frames: list[bytes] = []
+        header = self.header_byte
+
+        while self.buffer:
+            if self.buffer[0] != header:
+                next_header = self.buffer.find(bytes((header,)))
+                if next_header < 0:
+                    self.buffer.clear()
+                    break
+                del self.buffer[:next_header]
+
+            if len(self.buffer) < 3:
+                break
+
+            # frame_len is always 0–65535 (unsigned); no negative check needed.
+            frame_len = self.buffer[1] | (self.buffer[2] << 8)
+            if frame_len > self.max_frame_size:
+                del self.buffer[0]
+                continue
+
+            total_len = 3 + frame_len
+            if len(self.buffer) < total_len:
+                break
+
+            frames.append(bytes(self.buffer[:total_len]))
+            del self.buffer[:total_len]
+
+        return frames
+
+
+@dataclass
+class BufferedFrame:
+    seq: int
+    data: bytes
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class ClientState:
+    client_id: str
+    peer_group: str
+    app_name: str = ""
+    writer: Optional[asyncio.StreamWriter] = None
+    # Initialized in _register_client inside the running event loop (Python 3.10+ safe).
+    send_lock: Optional[asyncio.Lock] = field(default=None, init=False, repr=False)
+    client_parser: CompanionStreamParser = field(
+        default_factory=lambda: CompanionStreamParser(ord("<"))
+    )
+    awaiting_replay_after_self_info: bool = False
+    # True once the client has sent CMD_APP_START. Live backend messages are only
+    # queued to a client after this; before it, they stay in history and are
+    # captured (based on the adopted cursor) at APP_START, so a reconnecting
+    # client whose prior session already served a message is not re-served it.
+    app_started: bool = False
+    replay_capture_seq: int = 0
+    pending_message_frames: deque = field(default_factory=deque)
+    outbound_queue: Optional[asyncio.Queue] = None
+    sender_task: Optional[asyncio.Task] = None
+    last_disconnect_at: float = 0.0
+
+
+def get_packet_type(frame: bytes) -> Optional[int]:
+    if len(frame) < 4:
+        return None
+    return frame[3]
+
+
+def is_message_frame(frame: bytes) -> bool:
+    return get_packet_type(frame) in MESSAGE_PACKET_TYPES
+
+
+def build_backend_frame(packet_type: int) -> bytes:
+    return bytes((ord(">"), 1, 0, packet_type))
+
+
+class ProxyCore:
+    """Transport-agnostic broadcast proxy core.
+
+    Subclasses provide the backend transport by implementing the hooks marked
+    below (``_connect_backend``, ``_transport_read``, ``_transport_write``,
+    ``_transport_close``, ``_transport_after_write_error``, ``_backend_is_readable``,
+    ``_backend_is_writable``, ``_log_listening`` and, optionally, ``_pre_start_check``)
+    and by overriding ``_DISCONNECT_EXC`` / ``_BACKEND_DOWN_MSG``.
+    """
+
+    # Exceptions the read loop treats as a clean backend disconnect (logged as
+    # "[backend] disconnected"), as opposed to an unexpected read error.
+    _DISCONNECT_EXC: tuple = (OSError,)
+    # Log line emitted when client->backend bytes are dropped because the backend
+    # is down.
+    _BACKEND_DOWN_MSG: str = "[proxy] backend down, dropping client->backend bytes"
+
+    def __init__(
+        self,
+        listen_host: str,
+        listen_port: int,
+        reconnect_delay: float = 1.0,
+        history_bytes: int = DEFAULT_HISTORY_BYTES,
+        history_frames: int = DEFAULT_HISTORY_FRAMES,
+        history_max_age: int = 86400,
+        client_write_timeout: float = DEFAULT_CLIENT_WRITE_TIMEOUT,
+        client_queue_frames: int = DEFAULT_CLIENT_QUEUE_FRAMES,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
+        max_clients: int = DEFAULT_MAX_CLIENTS,
+        inactive_state_max_age: float = DEFAULT_INACTIVE_STATE_MAX_AGE,
+    ):
+        self.listen_host = listen_host
+        self.listen_port = listen_port
+        self.reconnect_delay = reconnect_delay
+        self.history_bytes = max(history_bytes, 0)
+        self.history_frames = max(history_frames, 0)
+        self.history_max_age = max(history_max_age, 0)
+        self.client_write_timeout = max(client_write_timeout, 0.1)
+        self.client_queue_frames = max(client_queue_frames, 1)
+        self.poll_interval = max(poll_interval, 0.1)
+        self.max_clients = max(max_clients, 1)
+        self.inactive_state_max_age = max(inactive_state_max_age, 0.0)
+
+        self._logger = logging.getLogger(__name__)
+
+        self.client_states: dict[str, ClientState] = {}
+        self._next_client_slot = 1
+
+        self.backend_lock = asyncio.Lock()
+        self.backend_connected = asyncio.Event()
+        self.backend_parser = CompanionStreamParser(ord(">"))
+
+        self.history: deque = deque()
+        self.history_size_bytes = 0
+        self.next_history_seq = 1
+
+        # State cache (mechanism 2): packet_type -> {entity_key -> latest frame}.
+        # Singletons use the key None. Only CACHE_TYPES are cached (allowlist).
+        self._state_cache: dict[int, dict] = {}
+        # CONTACT cache validity is tracked separately from its contents: an empty
+        # dictionary may be a fully synchronized, authoritative empty list.
+        self._contacts_synced: bool = False
+        self._contacts_dirty: bool = False
+        self._contacts_lastmod: int = 0
+        self._contacts_revision: int = 0
+        self._contacts_require_full_sync: bool = False
+
+        # A single backend GET_CONTACTS serves every client waiting for a fresh
+        # snapshot. Responses are staged until END_OF_CONTACTS, then committed
+        # atomically so reconnecting clients never observe a partial list.
+        self._contact_sync_active: bool = False
+        self._contact_sync_full: bool = False
+        self._contact_sync_expected_count: Optional[int] = None
+        self._contact_sync_staging: dict[bytes, bytes] = {}
+        self._contact_sync_waiters: list[tuple[str, int]] = []
+        self._contact_sync_revision: int = 0
+        self._contact_sync_timeout_task: Optional[asyncio.Task] = None
+
+        self._server: Optional[asyncio.base_events.Server] = None
+        self._stop = asyncio.Event()
+        self._backend_task: Optional[asyncio.Task] = None
+        self._poll_task: Optional[asyncio.Task] = None
+        self._poll_event: asyncio.Event = asyncio.Event()
+        self._poll_got_message: bool = False
+        # Tracked fire-and-forget tasks (echo injections); awaited on shutdown.
+        self._background_tasks: set[asyncio.Task] = set()
+        # Monotonically increasing counter for exponential reconnect backoff.
+        self._reconnect_attempt: int = 0
+
+    # --- Transport hooks: implemented by subclasses ------------------------
+
+    def _pre_start_check(self) -> None:
+        """Raise if the transport prerequisites are not met. Default: no-op."""
+
+    def _log_listening(self, addr: str) -> None:
+        raise NotImplementedError
+
+    async def _connect_backend(self) -> None:
+        raise NotImplementedError
+
+    async def _transport_close(self) -> None:
+        raise NotImplementedError
+
+    def _backend_is_readable(self) -> bool:
+        raise NotImplementedError
+
+    async def _transport_read(self) -> bytes:
+        raise NotImplementedError
+
+    def _backend_is_writable(self) -> bool:
+        raise NotImplementedError
+
+    async def _transport_write(self, data: bytes) -> None:
+        raise NotImplementedError
+
+    def _transport_after_write_error(self) -> None:
+        raise NotImplementedError
+
+    # --- Common logic ------------------------------------------------------
+
+    def _q_info(self, state: "ClientState") -> str:
+        q = state.outbound_queue
+        qsize = q.qsize() if q is not None else -1
+        return (
+            f"q={qsize}/{self.client_queue_frames} "
+            f"pending_msgs={len(state.pending_message_frames)} "
+            f"cursor={state.replay_capture_seq} "
+            f"connected={'yes' if state.writer is not None else 'NO'}"
+        )
+
+    def _make_client_id(self, peer) -> str:
+        if isinstance(peer, tuple) and peer:
+            return str(peer[0])
+        return str(peer or "unknown")
+
+    def _connected_client_count(self) -> int:
+        return sum(1 for state in self.client_states.values() if state.writer is not None)
+
+    def _allocate_client_id(self, peer_group: str) -> str:
+        client_id = f"{peer_group}#{self._next_client_slot}"
+        self._next_client_slot += 1
+        return client_id
+
+    def _prune_stale_client_states(self) -> None:
+        if self.inactive_state_max_age <= 0:
+            return
+        now = asyncio.get_running_loop().time()
+        stale = [
+            cid for cid, s in self.client_states.items()
+            if s.writer is None and (now - s.last_disconnect_at) > self.inactive_state_max_age
+        ]
+        for cid in stale:
+            self._logger.info("[client] pruning stale state %s", cid)
+            del self.client_states[cid]
+
+    async def start(self) -> None:
+        self._pre_start_check()
+
+        self._server = await asyncio.start_server(
+            self._handle_client, host=self.listen_host, port=self.listen_port
+        )
+        addr = ", ".join(str(sock.getsockname()) for sock in (self._server.sockets or []))
+        self._log_listening(addr)
+        self._logger.info(
+            "[proxy] history: %d frames / %d bytes | poll: %.1fs | max_clients: %d",
+            self.history_frames, self.history_bytes, self.poll_interval, self.max_clients,
+        )
+
+        self._backend_task = asyncio.create_task(self._backend_manager(), name="backend-manager")
+        self._poll_task = asyncio.create_task(self._poll_backend_loop(), name="poll-loop")
+
+        try:
+            async with self._server:
+                await self._stop.wait()
+        finally:
+            self._logger.info("[proxy] stopping...")
+
+            if self._server:
+                self._server.close()
+                await self._server.wait_closed()
+
+            await self._close_all_clients()
+            await self._close_backend()
+
+            for task in (self._backend_task, self._poll_task):
+                if task and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+            if self._background_tasks:
+                await asyncio.gather(*self._background_tasks, return_exceptions=True)
+
+    async def stop(self) -> None:
+        if self._stop.is_set():
+            return
+        self._stop.set()
+
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+
+        await self._close_all_clients()
+        await self._close_backend()
+
+        for task in (self._backend_task, self._poll_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _poll_backend_loop(self) -> None:
+        self._logger.debug("[poll] loop started")
+        SYNC_FRAME = bytes((ord("<"), 1, 0, CMD_SYNC_NEXT_MESSAGE))
+        poll_count = 0
+
+        while not self._stop.is_set():
+            if not self.backend_connected.is_set():
+                await asyncio.sleep(0.1)
+                continue
+
+            # GET_CONTACTS owns the companion's contact iterator. Avoid injecting
+            # message-poll commands into the middle of that response sequence.
+            if self._contact_sync_active:
+                await asyncio.sleep(0.1)
+                continue
+
+            poll_count += 1
+            if poll_count % _PRUNE_EVERY_N_POLLS == 0:
+                self._prune_stale_client_states()
+
+            self._poll_event.clear()
+            self._poll_got_message = False
+            await self._send_to_backend(SYNC_FRAME)
+
+            try:
+                await asyncio.wait_for(self._poll_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                self._logger.debug("[poll] timeout waiting for backend response")
+                await asyncio.sleep(self.poll_interval)
+                continue
+
+            if not self.backend_connected.is_set():
+                continue
+
+            if not self._poll_got_message:
+                await asyncio.sleep(self.poll_interval)
+
+    async def _register_client(self, peer_group: str, writer: asyncio.StreamWriter) -> ClientState:
+        state = ClientState(
+            client_id=self._allocate_client_id(peer_group),
+            peer_group=peer_group,
+        )
+        # Must be created inside the running event loop.
+        state.send_lock = asyncio.Lock()
+        self.client_states[state.client_id] = state
+        state.writer = writer
+        state.awaiting_replay_after_self_info = False
+        state.last_disconnect_at = 0.0
+        state.outbound_queue = asyncio.Queue(maxsize=self.client_queue_frames)
+        self._cancel_sender_task(state)
+        state.sender_task = asyncio.create_task(
+            self._client_sender(state, writer),
+            name=f"sender-{state.client_id}",
+        )
+        return state
+
+    def _adopt_prior_state(self, state: ClientState) -> None:
+        """Supersede every prior session sharing this client's app_name.
+
+        A client is identified solely by its app_name (IP-independent), so a
+        fresh APP_START is treated as the same logical client reconnecting:
+        migrate the furthest cursor and all unserved pending messages from every
+        other session with the same app_name, then close those sessions. This
+        guarantees a single live session per app_name, which prevents a message
+        from being duplicated onto a half-open (zombie) connection and then
+        re-delivered as a flood of already-seen messages on the next reconnect.
+        """
+        if not state.app_name:
+            self._logger.info(
+                "[client] %s has no app_name, keeping fresh replay state", state.client_id
+            )
+            return
+
+        priors = [
+            other for other in self.client_states.values()
+            if other is not state and other.app_name == state.app_name
+        ]
+        if not priors:
+            self._logger.info(
+                "[client] %s identified as %s, no prior session",
+                state.client_id, state.app_name,
+            )
+            return
+
+        # Merge cursors (furthest wins) and pending messages (union by seq, so a
+        # message already queued on the old session is never delivered twice).
+        merged: dict[int, BufferedFrame] = {
+            bf.seq: bf for bf in state.pending_message_frames
+        }
+        writers_to_close: list[asyncio.StreamWriter] = []
+        live = 0
+        for other in priors:
+            if other.replay_capture_seq > state.replay_capture_seq:
+                state.replay_capture_seq = other.replay_capture_seq
+            for bf in other.pending_message_frames:
+                merged.setdefault(bf.seq, bf)
+            if other.writer is not None:
+                live += 1
+                writers_to_close.append(other.writer)
+            other.writer = None
+            self._reset_client_runtime_state(other)
+            self._cancel_sender_task(other)
+            other.outbound_queue = None
+            self.client_states.pop(other.client_id, None)
+
+        state.pending_message_frames = deque(bf for _, bf in sorted(merged.items()))
+
+        self._logger.info(
+            "[client] %s identified as %s — superseded %d prior session(s)%s "
+            "(cursor=%d, pending=%d)",
+            state.client_id, state.app_name, len(priors),
+            f" ({live} still live)" if live else "",
+            state.replay_capture_seq, len(state.pending_message_frames),
+        )
+
+        for writer in writers_to_close:
+            self._close_writer_background(writer)
+
+    def _cancel_sender_task(self, state: ClientState) -> None:
+        task = state.sender_task
+        state.sender_task = None
+        if task and not task.done():
+            task.cancel()
+
+    def _reset_client_runtime_state(self, state: ClientState) -> None:
+        state.awaiting_replay_after_self_info = False
+
+    def _on_background_task_done(self, task: asyncio.Task) -> None:
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._logger.warning("[task] background %s failed: %s", task.get_name(), exc)
+
+    def _close_writer_background(self, writer: asyncio.StreamWriter) -> None:
+        """Close a client writer without blocking the caller.
+
+        Used from the backend broadcast path: awaiting wait_closed() on a
+        half-open client there would stall delivery to every other client.
+        """
+        async def _closer() -> None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+        task = asyncio.create_task(_closer(), name="close-writer")
+        self._background_tasks.add(task)
+        task.add_done_callback(self._on_background_task_done)
+
+    def _cache_backend_frame(self, frame: bytes, packet_type: Optional[int]) -> None:
+        """Upsert an allowlisted backend frame into the state cache (latest wins).
+
+        Only CONTACT (0x03) is authoritative contact state. NEW_ADVERT (0x8A)
+        has the same layout but is a candidate awaiting user approval, so it is
+        forwarded live and never cached. Other non-allowlisted types are ignored
+        here; messages use the separate per-client message queue.
+        """
+        if packet_type not in CACHE_TYPES:
+            return
+        key_fn = CACHE_TYPES[packet_type]
+        key = None if key_fn is None else key_fn(frame)
+        if key_fn is not None and key is None:
+            return  # frame too short to extract its key — skip
+        bucket = self._state_cache.setdefault(packet_type, {})
+        bucket[key] = frame
+        if packet_type == CONTACT_TYPE:
+            lastmod = _contact_lastmod(frame)
+            if lastmod is not None:
+                self._contacts_lastmod = max(self._contacts_lastmod, lastmod)
+
+    def _mark_contacts_dirty(self, reason: str) -> None:
+        """Invalidate the authoritative contact snapshot without discarding it."""
+        if not self._contacts_dirty:
+            self._logger.debug("[cache] contacts marked dirty: %s", reason)
+        self._contacts_dirty = True
+        self._contacts_revision += 1
+
+    async def _send_cached_contacts(self, state: ClientState, since: int) -> None:
+        """Serve one protocol-correct GET_CONTACTS response from the cache."""
+        cached_contacts = self._state_cache.get(CONTACT_TYPE, {})
+        filtered: list[bytes] = []
+        most_recent = 0
+        for contact_frame in cached_contacts.values():
+            lastmod = _contact_lastmod(contact_frame)
+            if lastmod is not None and lastmod > since:
+                filtered.append(contact_frame)
+                most_recent = max(most_recent, lastmod)
+
+        # Firmware reports the total table size, not the number selected by the
+        # optional `since` filter.
+        contacts_start = (
+            bytes((ord(">"), 5, 0, RESP_CODE_CONTACTS_START))
+            + struct.pack("<I", len(cached_contacts))
+        )
+        await self._send_bytes_to_client(state, contacts_start)
+        for contact_frame in filtered:
+            await self._send_bytes_to_client(state, contact_frame)
+        end_of_contacts = (
+            bytes((ord(">"), 5, 0, RESP_CODE_END_OF_CONTACTS))
+            + struct.pack("<I", most_recent)
+        )
+        await self._send_bytes_to_client(state, end_of_contacts)
+        self._logger.debug(
+            "[cli->%s] GET_CONTACTS since=%d -> %d/%d contact(s) from synchronized cache",
+            state.client_id, since, len(filtered), len(cached_contacts),
+        )
+
+    def _queue_contact_sync(self, state: ClientState, since: int) -> None:
+        """Register a client request to be answered by the current/next sync."""
+        self._contact_sync_waiters.append((state.client_id, since))
+        self._logger.debug(
+            "[cli->%s] GET_CONTACTS since=%d queued for backend sync (waiters=%d)",
+            state.client_id, since, len(self._contact_sync_waiters),
+        )
+
+    async def _start_contact_sync(self, force_full: bool = False) -> None:
+        """Start one shared backend contact sync, if one is needed and possible."""
+        if self._contact_sync_active or not self._contact_sync_waiters:
+            return
+        if not self.backend_connected.is_set():
+            self._logger.debug("[cache] contact sync deferred while backend is down")
+            return
+
+        full = force_full or self._contacts_require_full_sync or not self._contacts_synced
+        since = 0 if full else max(0, self._contacts_lastmod - 1)
+        self._contact_sync_active = True
+        self._contact_sync_full = full
+        self._contact_sync_expected_count = None
+        self._contact_sync_staging = {}
+        self._contact_sync_revision = self._contacts_revision
+
+        request = (
+            bytes((ord("<"), 5, 0, CMD_GET_CONTACTS))
+            + struct.pack("<I", since)
+        )
+        self._logger.info(
+            "[cache] starting %s contact sync since=%d for %d waiting request(s)",
+            "full" if full else "incremental", since, len(self._contact_sync_waiters),
+        )
+        await self._send_to_backend(request)
+        self._arm_contact_sync_timeout()
+
+    def _arm_contact_sync_timeout(self) -> None:
+        previous = self._contact_sync_timeout_task
+        if previous is not None and not previous.done():
+            previous.cancel()
+        self._contact_sync_timeout_task = asyncio.create_task(
+            self._contact_sync_timeout(), name="contact-sync-timeout"
+        )
+
+    async def _contact_sync_timeout(self) -> None:
+        try:
+            await asyncio.sleep(CONTACT_SYNC_IDLE_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+        if not self._contact_sync_active:
+            return
+        self._logger.warning(
+            "[cache] contact sync timed out after %.0fs without a complete response",
+            CONTACT_SYNC_IDLE_TIMEOUT,
+        )
+        self._contact_sync_timeout_task = None
+        self._contacts_require_full_sync = True
+        self._mark_contacts_dirty("backend contact sync timeout")
+        self._reset_contact_sync(keep_waiters=True)
+        await self._fail_contact_sync_waiters()
+
+    def _reset_contact_sync(self, keep_waiters: bool = True) -> None:
+        timeout_task = self._contact_sync_timeout_task
+        self._contact_sync_timeout_task = None
+        if (timeout_task is not None and not timeout_task.done()
+                and timeout_task is not asyncio.current_task()):
+            timeout_task.cancel()
+        self._contact_sync_active = False
+        self._contact_sync_full = False
+        self._contact_sync_expected_count = None
+        self._contact_sync_staging = {}
+        if not keep_waiters:
+            self._contact_sync_waiters = []
+
+    async def _fail_contact_sync_waiters(self) -> None:
+        """Fail pending GET_CONTACTS commands after an unusable full snapshot."""
+        waiters = self._contact_sync_waiters
+        self._contact_sync_waiters = []
+        error = bytes((ord(">"), 2, 0, 0x01, 0x04))  # ERR / ERR_CODE_BAD_STATE
+        for client_id, _since in waiters:
+            state = self.client_states.get(client_id)
+            if state is not None and state.writer is not None:
+                await self._send_bytes_to_client(state, error)
+
+    async def _serve_contact_sync_waiters(self) -> None:
+        waiters = self._contact_sync_waiters
+        self._contact_sync_waiters = []
+        for client_id, since in waiters:
+            state = self.client_states.get(client_id)
+            if state is not None and state.writer is not None:
+                await self._send_cached_contacts(state, since)
+
+    async def _handle_contact_sync_frame(self, frame: bytes, packet_type: int) -> None:
+        """Stage and atomically commit frames belonging to the shared sync."""
+        if packet_type == RESP_CODE_CONTACTS_START:
+            self._contact_sync_expected_count = (
+                struct.unpack_from("<I", frame, 4)[0] if len(frame) >= 8 else None
+            )
+            return
+
+        if packet_type == CONTACT_TYPE:
+            key = _contact_pubkey_key(frame)
+            if key is not None and _contact_lastmod(frame) is not None:
+                self._contact_sync_staging[key] = frame
+            else:
+                self._logger.warning("[cache] ignored malformed CONTACT during sync")
+            return
+
+        if packet_type != RESP_CODE_END_OF_CONTACTS:
+            return
+
+        if self._contact_sync_full:
+            candidate = dict(self._contact_sync_staging)
+        else:
+            candidate = dict(self._state_cache.get(CONTACT_TYPE, {}))
+            candidate.update(self._contact_sync_staging)
+
+        expected = self._contact_sync_expected_count
+        if expected is None or len(candidate) != expected:
+            mode = "full" if self._contact_sync_full else "incremental"
+            self._logger.warning(
+                "[cache] %s contact sync count mismatch: assembled=%d backend=%s",
+                mode, len(candidate), expected if expected is not None else "unknown",
+            )
+            if not self._contact_sync_full:
+                # A delta cannot identify contacts deleted while the proxy was
+                # disconnected. Replace the entire snapshot on one full retry.
+                self._reset_contact_sync(keep_waiters=True)
+                await self._start_contact_sync(force_full=True)
+            else:
+                self._contacts_require_full_sync = True
+                self._mark_contacts_dirty("incomplete full backend snapshot")
+                self._reset_contact_sync(keep_waiters=True)
+                await self._fail_contact_sync_waiters()
+            return
+
+        self._state_cache[CONTACT_TYPE] = candidate
+        self._contacts_lastmod = max(
+            (_contact_lastmod(contact_frame) or 0 for contact_frame in candidate.values()),
+            default=0,
+        )
+        completed_mode = "full" if self._contact_sync_full else "incremental"
+        received = len(self._contact_sync_staging)
+        changed_during_sync = self._contacts_revision != self._contact_sync_revision
+        if self._contact_sync_full:
+            self._contacts_require_full_sync = False
+        self._contacts_synced = True
+        self._contacts_dirty = changed_during_sync
+        self._reset_contact_sync(keep_waiters=True)
+        self._logger.info(
+            "[cache] %s contact sync complete: %d received, %d cached, lastmod=%d%s",
+            completed_mode, received, len(candidate), self._contacts_lastmod,
+            " (changed during sync; remains dirty)" if changed_during_sync else "",
+        )
+        await self._serve_contact_sync_waiters()
+
+    def _evict_contact_from_cache(self, pubkey: bytes) -> None:
+        """Remove a contact from the state cache by pubkey (delete / auto-evict)."""
+        bucket = self._state_cache.get(CONTACT_TYPE)
+        if bucket and pubkey in bucket:
+            del bucket[pubkey]
+            self._logger.info(
+                "[cache] evicted contact pubkey=%s… (now %d)", pubkey[:4].hex(), len(bucket)
+            )
+
+    def _evict_channel_from_cache(self, channel_idx: int) -> None:
+        """Remove a channel changed by CMD_SET_CHANNEL from the state cache.
+
+        The firmware acknowledges SET_CHANNEL with OK but does not emit a fresh
+        CHANNEL_INFO frame. Evicting the old snapshot makes the app's following
+        GET_CHANNEL reach the backend and repopulate the cache with the new data.
+        """
+        bucket = self._state_cache.get(CHANNEL_INFO_TYPE)
+        key = bytes((channel_idx,))
+        if bucket and key in bucket:
+            del bucket[key]
+            self._logger.info(
+                "[cache] evicted channel index=%d after SET_CHANNEL (now %d)",
+                channel_idx, len(bucket),
+            )
+
+    def _reset_contact_path_in_cache(self, pubkey: bytes) -> None:
+        """Patch a cached contact's out_path_len to OUT_PATH_UNKNOWN (0xFF).
+
+        RESET_PATH makes the firmware set out_path_len = OUT_PATH_UNKNOWN without
+        bumping the contact's lastmod, so a dirty-flag GET_CONTACTS refresh would
+        never pick the change up. Patch the cached frame directly so reconnecting
+        clients see the reset path immediately.
+        """
+        bucket = self._state_cache.get(CONTACT_TYPE)
+        if not bucket or pubkey not in bucket:
+            return
+        frame = bucket[pubkey]
+        if len(frame) <= CONTACT_OUT_PATH_LEN_OFFSET:
+            return
+        patched = bytearray(frame)
+        patched[CONTACT_OUT_PATH_LEN_OFFSET] = OUT_PATH_UNKNOWN
+        bucket[pubkey] = bytes(patched)
+        self._logger.info(
+            "[cache] reset out_path for contact pubkey=%s…", pubkey[:4].hex()
+        )
+
+    def _self_node_name(self) -> str:
+        """Return this node's name from the cached SELF_INFO frame, or ''.
+
+        node_name is the trailing string of the SELF_INFO frame; extracted
+        defensively so an unexpected/short frame just yields '' (no prefix).
+        """
+        frame = self._state_cache.get(RESP_CODE_SELF_INFO, {}).get(None)
+        if not frame or len(frame) <= SELF_INFO_NAME_OFFSET:
+            return ""
+        return frame[SELF_INFO_NAME_OFFSET:].decode("utf-8", errors="ignore").rstrip("\x00")
+
+    async def _client_sender(
+        self, state: ClientState, writer: asyncio.StreamWriter
+    ) -> None:
+        queue = state.outbound_queue
+        if queue is None:
+            return
+
+        self._logger.debug("[sender/%s] started", state.client_id)
+        try:
+            while not self._stop.is_set():
+                payload = await queue.get()
+                if payload is None:
+                    self._logger.debug("[sender/%s] sentinel received, exiting", state.client_id)
+                    break
+                if state.writer is not writer:
+                    self._logger.debug("[sender/%s] writer replaced, exiting", state.client_id)
+                    break
+
+                writer.write(payload)
+                await asyncio.wait_for(writer.drain(), timeout=self.client_write_timeout)
+        except asyncio.TimeoutError:
+            self._logger.info(
+                "[client] send timeout to %s, closing stalled connection", state.client_id
+            )
+        except asyncio.CancelledError:
+            self._logger.debug("[sender/%s] cancelled", state.client_id)
+        except Exception as exc:
+            self._logger.debug("[sender/%s] exception: %s", state.client_id, exc)
+        finally:
+            if state.writer is writer:
+                state.writer = None
+                self._reset_client_runtime_state(state)
+                state.last_disconnect_at = asyncio.get_running_loop().time()
+                state.outbound_queue = None
+            if state.sender_task is asyncio.current_task():
+                state.sender_task = None
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    def _capture_pending_history(self, state: ClientState) -> None:
+        captured_messages = 0
+        skipped_old = 0
+        cutoff = (time.time() - self.history_max_age) if self.history_max_age > 0 else 0.0
+
+        # history is ordered by seq; drop already-seen frames without iterating them.
+        for buffered in itertools.dropwhile(
+            lambda bf: bf.seq <= state.replay_capture_seq, self.history
+        ):
+            state.replay_capture_seq = buffered.seq
+
+            if get_packet_type(buffered.data) not in MESSAGE_PACKET_TYPES:
+                continue
+
+            if cutoff and buffered.timestamp < cutoff:
+                skipped_old += 1
+                continue
+
+            state.pending_message_frames.append(buffered)
+            captured_messages += 1
+
+        if captured_messages > 0:
+            self._logger.info(
+                "[client] captured %d buffered messages for %s (up to seq=%d)%s",
+                captured_messages, state.client_id, state.replay_capture_seq,
+                f", skipped {skipped_old} older than {self.history_max_age}s" if skipped_old else "",
+            )
+        else:
+            self._logger.info(
+                "[client] no buffered messages to capture for %s%s",
+                state.client_id,
+                f" ({skipped_old} too old)" if skipped_old else "",
+            )
+
+    async def _send_bytes_to_client(self, state: ClientState, payload: bytes) -> bool:
+        if state.send_lock is None:
+            return False
+        writer_to_close = None
+        async with state.send_lock:
+            writer = state.writer
+            queue = state.outbound_queue
+            if writer is None or queue is None or self._stop.is_set():
+                return False
+
+            try:
+                queue.put_nowait(payload)
+                return True
+            except asyncio.QueueFull:
+                self._logger.info(
+                    "[client] outbound queue full for %s, closing stalled connection",
+                    state.client_id,
+                )
+                # Mark disconnected and release the lock BEFORE the slow TCP close.
+                if state.writer is writer:
+                    state.writer = None
+                    self._reset_client_runtime_state(state)
+                    state.last_disconnect_at = asyncio.get_running_loop().time()
+                    state.outbound_queue = None
+                    writer_to_close = writer
+                self._cancel_sender_task(state)
+        if writer_to_close is not None:
+            # Close in the background: this can run inside the backend broadcast
+            # loop, where awaiting wait_closed() on a half-open client would stall
+            # delivery to every other client until the OS TCP timeout fires.
+            self._close_writer_background(writer_to_close)
+        return False
+
+    async def _serve_pending_message(self, state: ClientState) -> bool:
+        """Serve the next pending message to the client, or send a local NO_MORE.
+
+        Called whenever the client sends CMD_SYNC_NEXT_MESSAGE.  The backend is
+        never consulted; the proxy poll loop keeps pending_message_frames fresh.
+        """
+        if state.pending_message_frames:
+            buffered = state.pending_message_frames.popleft()
+            if await self._send_bytes_to_client(state, buffered.data):
+                self._logger.info(
+                    "[client] served message seq=%d to %s (remaining=%d)",
+                    buffered.seq, state.client_id, len(state.pending_message_frames),
+                )
+                return True
+            state.pending_message_frames.appendleft(buffered)
+            return False
+        else:
+            return await self._send_bytes_to_client(
+                state, build_backend_frame(RESP_CODE_NO_MORE_MESSAGES)
+            )
+
+    async def _handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        peer = writer.get_extra_info("peername")
+        peer_group = self._make_client_id(peer)
+
+        if self._connected_client_count() >= self.max_clients:
+            self._logger.info(
+                "[client] rejected %s — max_clients=%d reached", peer, self.max_clients
+            )
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
+
+        # Enable TCP keepalive so the OS detects half-open (zombie) connections.
+        # Without this, a client that disappears without a TCP FIN/RST can leave
+        # a phantom active connection for hours if no data is written to it.
+        _sock = writer.transport.get_extra_info("socket")
+        if _sock is not None:
+            try:
+                _sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                if hasattr(socket, "TCP_KEEPIDLE"):   # Linux
+                    _sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                if hasattr(socket, "TCP_KEEPINTVL"):
+                    _sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                if hasattr(socket, "TCP_KEEPCNT"):
+                    _sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            except Exception as exc:
+                self._logger.debug("[client] could not set keepalive on %s: %s", peer, exc)
+
+        state = await self._register_client(peer_group, writer)
+        self._logger.info(
+            "[client] connected %s as %s (clients=%d)",
+            peer, state.client_id, self._connected_client_count(),
+        )
+
+        try:
+            while not self._stop.is_set():
+                data = await reader.read(65536)
+                if not data:
+                    break
+
+                forward_frames: list[bytes] = []
+                # PX-5: echoes are only scheduled after the batch is actually
+                # forwarded to a live backend (see below), never for a message
+                # that was dropped because the backend was down.
+                pending_echoes: list[tuple[int, bytes]] = []
+                for frame in state.client_parser.feed(data):
+                    if len(frame) < 4:
+                        forward_frames.append(frame)
+                        continue
+
+                    command = frame[3]
+                    if command == CMD_APP_START:
+                        # PX-8(a): mark identified up-front so live messages that
+                        # arrive during APP_START processing are queued normally,
+                        # while messages that arrived BEFORE this were left in
+                        # history (not queued) and are captured just below.
+                        state.app_started = True
+                        if len(frame) > 11:
+                            app_name = frame[11:].decode("utf-8", errors="ignore").rstrip("\x00")
+                            state.app_name = app_name
+                        # Use app_name as the stable peer identity so that two
+                        # different apps on the same IP are never mixed up, and
+                        # a reconnecting app recovers its own state regardless of
+                        # IP changes (e.g. mobile switching networks).
+                        if state.app_name:
+                            state.peer_group = state.app_name
+                        self._adopt_prior_state(state)
+                        self._capture_pending_history(state)
+
+                        cached_self_info = self._state_cache.get(RESP_CODE_SELF_INFO, {}).get(None)
+                        if cached_self_info is not None:
+                            # Cache is warm: serve the response locally without
+                            # touching the backend.  Forwarding APP_START would
+                            # trigger a full contact dump from the backend which
+                            # blocks other client commands for several seconds.
+                            self._logger.info(
+                                "[client] APP_START from %s app_name=%s — served from cache",
+                                state.client_id, state.app_name or "<empty>",
+                            )
+                            await self._send_bytes_to_client(state, cached_self_info)
+                            await self._replay_state_cache(state)
+                            # Do NOT append to forward_frames — backend never sees this APP_START.
+                        else:
+                            # Cache is cold (first ever connection): must ask the backend.
+                            self._logger.info(
+                                "[client] APP_START from %s app_name=%s — cache cold, forwarding",
+                                state.client_id, state.app_name or "<empty>",
+                            )
+                            state.awaiting_replay_after_self_info = True
+                            forward_frames.append(frame)
+                    elif command == CMD_GET_CONTACTS:
+                        since = struct.unpack_from("<I", frame, 4)[0] if len(frame) >= 8 else 0
+                        if (self._contacts_synced and not self._contacts_dirty
+                                and not self._contact_sync_active):
+                            await self._send_cached_contacts(state, since)
+                        else:
+                            # The request is answered only after one shared backend
+                            # snapshot has completed. It is deliberately not placed
+                            # in forward_frames: raw iterator responses must not be
+                            # broadcast to unrelated clients.
+                            self._queue_contact_sync(state, since)
+                    elif command == CMD_REMOVE_CONTACT and len(frame) >= PUBKEY_OFFSET + PUBKEY_SIZE:
+                        # Forward the delete AND evict the contact from the cache
+                        # immediately, so reconnecting clients are not re-served a
+                        # ghost contact (which would reappear in the app and then
+                        # fail on a second delete with ERR_NOT_FOUND).
+                        pubkey = frame[PUBKEY_OFFSET:PUBKEY_OFFSET + PUBKEY_SIZE]
+                        forward_frames.append(frame)
+                        self._evict_contact_from_cache(pubkey)
+                        self._mark_contacts_dirty("client removed a contact")
+                    elif command == CMD_RESET_PATH:
+                        # PX-2: the firmware resets out_path_len to OUT_PATH_UNKNOWN
+                        # without bumping lastmod, so a dirty-flag refresh (which
+                        # relies on lastmod > since) would never pick this up. Patch
+                        # the cached contact's out_path_len directly instead.
+                        forward_frames.append(frame)
+                        if len(frame) >= PUBKEY_OFFSET + PUBKEY_SIZE:
+                            self._reset_contact_path_in_cache(
+                                frame[PUBKEY_OFFSET:PUBKEY_OFFSET + PUBKEY_SIZE]
+                            )
+                        self._logger.debug(
+                            "[cli→%s] RESET_PATH → cached out_path reset", state.client_id
+                        )
+                    elif command == CMD_ADD_UPDATE_CONTACT:
+                        # The backend mutates the contact (rename / flags) and bumps
+                        # lastmod but does not echo a fresh CONTACT frame, so the
+                        # cached copy goes stale. Mark the cache dirty to force a
+                        # refresh on the next GET_CONTACTS.
+                        forward_frames.append(frame)
+                        self._mark_contacts_dirty("client added or updated a contact")
+                        self._logger.debug(
+                            "[cli→%s] contact mutation cmd=0x%02X → cache marked dirty",
+                            state.client_id, command,
+                        )
+                    elif command == CMD_SYNC_NEXT_MESSAGE:
+                        # Always served locally from the proxy cache.
+                        await self._serve_pending_message(state)
+                    elif command == CMD_SET_CHANNEL and len(frame) >= 5:
+                        # SET_CHANNEL only yields OK/ERR; the backend does not
+                        # push the updated CHANNEL_INFO. Drop this index now so
+                        # the app's next GET_CHANNEL cannot receive stale data.
+                        forward_frames.append(frame)
+                        self._evict_channel_from_cache(frame[4])
+                    elif command == CMD_GET_CHANNEL and len(frame) >= 5:
+                        # CMD_GET_CHANNEL: serve from cache if available.
+                        channel_idx = frame[4]
+                        cached_channels = self._state_cache.get(CHANNEL_INFO_TYPE, {})
+                        cached = cached_channels.get(bytes([channel_idx]))
+                        if cached is not None:
+                            await self._send_bytes_to_client(state, cached)
+                        else:
+                            forward_frames.append(frame)
+                    elif command == CMD_SEND_CHAN_MSG and len(frame) >= 11:
+                        # frame[3]=0x03, frame[4]=0x00, frame[5]=chan_idx,
+                        # frame[6:10]=timestamp, frame[10:]=text
+                        chan_idx  = frame[5]
+                        text_data = frame[10:]
+                        forward_frames.append(frame)
+                        # PX-5: defer the echo until we know the frame was actually
+                        # forwarded to a live backend (scheduled after the batch).
+                        pending_echoes.append((chan_idx, text_data))
+                    else:
+                        forward_frames.append(frame)
+
+                if forward_frames:
+                    payload = b"".join(forward_frames)
+                    if self.backend_connected.is_set():
+                        await self._send_to_backend(payload)
+                        # PX-5: the batch reached a connected backend — now it is
+                        # safe to echo the channel messages to the other clients.
+                        for chan_idx, text_data in pending_echoes:
+                            task = asyncio.create_task(
+                                self._inject_sent_echo(chan_idx, text_data, state.client_id),
+                                name=f"echo-ch{chan_idx}-{state.client_id}",
+                            )
+                            self._background_tasks.add(task)
+                            task.add_done_callback(self._on_background_task_done)
+                    else:
+                        # PX-5: backend down — the message was never sent, so do NOT
+                        # inject a local echo for it.
+                        self._logger.info(self._BACKEND_DOWN_MSG)
+
+                # Start the shared contact read only after all earlier commands in
+                # this client batch have been written, preserving command order.
+                if self._contact_sync_waiters and not self._contact_sync_active:
+                    await self._start_contact_sync()
+
+        except (asyncio.CancelledError, ConnectionError):
+            pass
+        except Exception as exc:
+            self._logger.info("[client] error %s: %s", peer, exc)
+        finally:
+            if state.writer is writer:
+                state.writer = None
+                self._reset_client_runtime_state(state)
+                state.last_disconnect_at = asyncio.get_running_loop().time()
+                self._cancel_sender_task(state)
+                state.outbound_queue = None
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            # Drop never-identified phantom connections immediately instead of
+            # keeping them until the 24h prune: they can never be re-adopted and
+            # would be scanned on every backend frame.
+            if not state.app_name:
+                self.client_states.pop(state.client_id, None)
+            self._logger.info(
+                "[client] disconnected %s as %s (clients=%d)",
+                peer, state.client_id, self._connected_client_count(),
+            )
+
+    async def _backend_manager(self) -> None:
+        while not self._stop.is_set():
+            await self._connect_backend()
+
+            if not self.backend_connected.is_set():
+                # Exponential backoff: 1s, 2s, 4s, … capped at DEFAULT_RECONNECT_BACKOFF_MAX.
+                delay = self._next_reconnect_delay()
+                self._logger.info(
+                    "[backend] retry in %.1fs (attempt %d)", delay, self._reconnect_attempt
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            # A client may have requested contacts while the backend was down.
+            # Keep the request pending and satisfy it as soon as transport returns.
+            if self._contact_sync_waiters and not self._contact_sync_active:
+                await self._start_contact_sync()
+
+            connected_at = asyncio.get_running_loop().time()
+            try:
+                while not self._stop.is_set() and self.backend_connected.is_set():
+                    if not self._backend_is_readable():
+                        break
+                    data = await self._transport_read()
+                    if not data:
+                        continue
+
+                    for frame in self.backend_parser.feed(data):
+                        await self._handle_backend_frame(frame)
+            except asyncio.CancelledError:
+                raise
+            except self._DISCONNECT_EXC as exc:
+                self._logger.info("[backend] disconnected: %s", exc)
+            except Exception as exc:
+                self._logger.info("[backend] read error: %s", exc)
+            finally:
+                self.backend_connected.clear()
+                await self._close_backend()
+
+            # PX-7: only reset the exponential backoff after a STABLE connection.
+            # A backend that flaps (connects then immediately drops) must not reset
+            # the backoff, otherwise it reconnects in a tight ~reconnect_delay loop.
+            uptime = asyncio.get_running_loop().time() - connected_at
+            if uptime >= DEFAULT_STABLE_CONNECTION_SECS:
+                self._reconnect_attempt = 0
+                await asyncio.sleep(self.reconnect_delay)
+            else:
+                delay = self._next_reconnect_delay()
+                self._logger.info(
+                    "[backend] unstable connection (up %.1fs), backing off %.1fs (attempt %d)",
+                    uptime, delay, self._reconnect_attempt,
+                )
+                await asyncio.sleep(delay)
+
+    def _next_reconnect_delay(self) -> float:
+        """Return the next exponential-backoff delay and advance the attempt count."""
+        delay = min(
+            self.reconnect_delay * (2 ** min(self._reconnect_attempt, 10)),
+            DEFAULT_RECONNECT_BACKOFF_MAX,
+        )
+        self._reconnect_attempt += 1
+        return delay
+
+    async def _close_backend(self) -> None:
+        self.backend_connected.clear()
+        self.backend_parser.reset()
+        if self._contact_sync_active:
+            self._logger.info("[cache] contact sync interrupted; it will restart after reconnect")
+            self._reset_contact_sync(keep_waiters=True)
+        if self._contacts_synced:
+            # Contact changes may occur on the companion while the proxy is
+            # disconnected, so the next client request must validate the cache.
+            self._contacts_require_full_sync = True
+            self._mark_contacts_dirty("backend disconnected")
+        # Unblock the poll loop if it is waiting for a backend response.
+        self._poll_event.set()
+        await self._transport_close()
+
+    async def _close_all_clients(self) -> None:
+        writers = [state.writer for state in self.client_states.values() if state.writer is not None]
+        for state in self.client_states.values():
+            state.writer = None
+            self._reset_client_runtime_state(state)
+            state.last_disconnect_at = asyncio.get_running_loop().time()
+            self._cancel_sender_task(state)
+            state.outbound_queue = None
+
+        for writer in writers:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        for writer in writers:
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _send_to_backend(self, data: bytes) -> None:
+        async with self.backend_lock:
+            if self._stop.is_set() or not self._backend_is_writable():
+                return
+            try:
+                await self._transport_write(data)
+            except Exception as exc:
+                self._logger.info("[backend] write error: %s", exc)
+                # Tear the connection down so the read loop exits and reconnects;
+                # otherwise backend_connected stays cleared while the read loop keeps
+                # spinning on empty reads, permanently freezing message delivery.
+                self.backend_connected.clear()
+                self._poll_event.set()
+                self._transport_after_write_error()
+
+    async def _inject_sent_echo(self, channel_idx: int, text_data: bytes, exclude_client_id: str) -> None:
+        """Inject a synthetic CHANNEL_MSG_RECV_V3 for a message sent by a client.
+
+        All connected clients except the sender receive the message via the
+        normal PUSH_MSG_WAITING + SYNC mechanism, so both apps see sent messages.
+        """
+        timestamp = int(time.time())
+
+        # PX-4: RF-received channel messages are prefixed by the firmware with
+        # "<node_name>: ", so mirror that here (using our own node name from the
+        # cached SELF_INFO) — otherwise the echo renders without a sender name.
+        node_name = self._self_node_name()
+        if node_name:
+            text_data = node_name.encode("utf-8") + b": " + text_data
+
+        frame = _build_sent_echo_frame(channel_idx, text_data, timestamp)
+        self._logger.info(
+            "[echo] injecting sent msg ch=%d text=%r excluding=%s",
+            channel_idx, text_data.decode("utf-8", "ignore"), exclude_client_id,
+        )
+
+        # Pass exclude_ids instead of mutating client_states around an await —
+        # avoids a race where a reconnecting client's state could be overwritten.
+        # synthetic=True prevents the echo from waking the backend poll loop as if a
+        # real backend message had arrived, which would cause a spurious SYNC cycle.
+        await self._handle_backend_frame(
+            frame, exclude_ids=frozenset({exclude_client_id}), synthetic=True
+        )
+
+    def _append_history(self, frame: bytes) -> int:
+        seq = self.next_history_seq
+        self.next_history_seq += 1
+        self.history.append(BufferedFrame(seq=seq, data=frame))
+        self.history_size_bytes += len(frame)
+
+        while self.history and (
+            (self.history_frames and len(self.history) > self.history_frames)
+            or (self.history_bytes and self.history_size_bytes > self.history_bytes)
+        ):
+            evicted = self.history.popleft()
+            self.history_size_bytes -= len(evicted.data)
+
+        return seq
+
+    async def _handle_backend_frame(
+        self,
+        frame: bytes,
+        exclude_ids: Optional[frozenset] = None,
+        synthetic: bool = False,
+    ) -> None:
+        packet_type = get_packet_type(frame)
+        is_msg = is_message_frame(frame)
+        history_seq: Optional[int] = None
+
+        if is_msg:
+            history_seq = self._append_history(frame)
+
+        # Log every backend frame except the once-per-second NO_MORE poll keepalive.
+        if packet_type != RESP_CODE_NO_MORE_MESSAGES:
+            connected = sum(1 for s in self.client_states.values() if s.writer is not None)
+            self._logger.debug(
+                "[bkd←] %s size=%dB%s → %d client(s)",
+                fmt_ptype(packet_type), len(frame),
+                f" seq={history_seq}" if history_seq is not None else "",
+                connected,
+            )
+
+        # Iterator responses belong to the proxy's one shared contact sync. Stage
+        # them privately and answer each waiting client from the committed cache;
+        # broadcasting these raw frames would mix one client's request into every
+        # connected app.
+        if (not synthetic and self._contact_sync_active
+                and packet_type in {
+                    RESP_CODE_CONTACTS_START, CONTACT_TYPE, RESP_CODE_END_OF_CONTACTS,
+                }):
+            self._arm_contact_sync_timeout()
+            await self._handle_contact_sync_frame(frame, packet_type)
+            return
+
+        # State cache (mechanism 2): keep the latest snapshot of allowlisted types
+        # so (re)connecting clients can be served without hitting the backend.
+        # NEW_ADVERT (0x8A) is intentionally not allowlisted: it is a transient,
+        # unapproved discovery rather than an authoritative stored contact.
+        if not is_msg:
+            self._cache_backend_frame(frame, packet_type)
+            # These pushes refer to an accepted/stored contact and indicate that
+            # metadata or its path changed in firmware. Validate the snapshot
+            # lazily on the next GET_CONTACTS.
+            if packet_type in {ADVERT_TYPE, PATH_UPDATED_TYPE}:
+                reason = (
+                    "stored contact advert received"
+                    if packet_type == ADVERT_TYPE
+                    else "stored contact path updated"
+                )
+                self._mark_contacts_dirty(reason)
+            # Backend auto-evicted a contact (storage full) -> drop it from cache.
+            if packet_type == CONTACT_DELETED_TYPE and len(frame) >= PUBKEY_OFFSET + PUBKEY_SIZE:
+                self._evict_contact_from_cache(frame[PUBKEY_OFFSET:PUBKEY_OFFSET + PUBKEY_SIZE])
+
+        # Signal the poll loop only for real backend frames, not synthetic echoes.
+        if not synthetic:
+            if is_msg:
+                self._poll_got_message = True
+                self._poll_event.set()
+            elif packet_type == RESP_CODE_NO_MORE_MESSAGES:
+                self._poll_got_message = False
+                self._poll_event.set()
+
+        for state in list(self.client_states.values()):
+            if exclude_ids and state.client_id in exclude_ids:
+                # Advance cursor even for excluded clients so they don't receive
+                # the echo again as a "missed message" if they reconnect.
+                if history_seq is not None and history_seq > state.replay_capture_seq:
+                    state.replay_capture_seq = history_seq
+                continue
+            if state.writer is None:
+                continue
+            await self._send_frame_to_client(state, frame, packet_type, history_seq)
+
+    async def _replay_state_cache(self, state: ClientState) -> None:
+        """Replay all cached backend state to a client that just received SELF_INFO."""
+        total = 0
+        self._logger.info(
+            "[cache] snapshot before replay to %s: %s",
+            state.client_id,
+            ", ".join(f"{fmt_ptype(pt)}×{len(b)}" for pt, b in self._state_cache.items()),
+        )
+        # SELF_INFO was already sent; replay the rest. CONTACT frames are wrapped
+        # in synthetic CONTACTS_START / END_OF_CONTACTS delimiters.
+        for packet_type, bucket in list(self._state_cache.items()):
+            if packet_type == RESP_CODE_SELF_INFO:
+                continue
+            if packet_type == CONTACT_TYPE:
+                if (not self._contacts_synced or self._contacts_dirty
+                        or self._contact_sync_active):
+                    self._logger.debug(
+                        "[cache] skipped contact replay to %s: snapshot is not synchronized",
+                        state.client_id,
+                    )
+                    continue
+                snapshot = list(bucket.values())
+                n = len(snapshot)
+                contacts_start = (
+                    bytes((ord(">"), 5, 0, RESP_CODE_CONTACTS_START))
+                    + struct.pack("<I", n)
+                )
+                await self._send_bytes_to_client(state, contacts_start)
+                most_recent = 0
+                for frame in snapshot:
+                    await self._send_bytes_to_client(state, frame)
+                    total += 1
+                    lastmod = _contact_lastmod(frame)
+                    if lastmod is not None:
+                        most_recent = max(most_recent, lastmod)
+                end_of_contacts = (
+                    bytes((ord(">"), 5, 0, RESP_CODE_END_OF_CONTACTS))
+                    + struct.pack("<I", most_recent)
+                )
+                await self._send_bytes_to_client(state, end_of_contacts)
+                continue
+            for frame in list(bucket.values()):
+                await self._send_bytes_to_client(state, frame)
+                total += 1
+
+        n_types = sum(1 for pt in self._state_cache if pt != RESP_CODE_SELF_INFO)
+        self._logger.info(
+            "[client] replayed state cache to %s: %d frame(s) across %d type(s)",
+            state.client_id, total, n_types,
+        )
+        if state.pending_message_frames:
+            self._logger.info(
+                "[client] %d buffered message(s) pending for %s — will serve on next SYNC",
+                len(state.pending_message_frames), state.client_id,
+            )
+            # PX-8(b): after a cache replay there is no natural 0x83 to nudge the
+            # client into syncing the buffered messages, so emit a synthetic one.
+            await self._send_bytes_to_client(state, build_backend_frame(0x83))
+        else:
+            self._logger.info("[client] no buffered messages pending for %s", state.client_id)
+
+    async def _send_frame_to_client(
+        self,
+        state: ClientState,
+        frame: bytes,
+        packet_type: Optional[int],
+        history_seq: Optional[int],
+    ) -> None:
+        # NO_MORE from the backend is handled by the poll loop; clients receive a
+        # locally-generated NO_MORE when they SYNC and nothing is pending.
+        if packet_type == RESP_CODE_NO_MORE_MESSAGES:
+            return
+
+        # PUSH_MSG_WAITING from the backend arrives before the poll loop has
+        # retrieved the message.  The proxy generates its own 0x83 after
+        # queueing, so suppress the backend's to avoid a spurious SYNC/NO_MORE
+        # cycle on the client.
+        if packet_type == 0x83:
+            return
+
+        # Message frames go into the client's pending queue and are served on the
+        # client's next CMD_SYNC_NEXT_MESSAGE.
+        if history_seq is not None:
+            # PX-8(a): don't queue live messages to a client that has not yet sent
+            # APP_START. The message stays in history and is captured (based on the
+            # adopted cursor) at APP_START, so a reconnecting client whose prior
+            # session already served this seq is not re-served it as a duplicate.
+            if not state.app_started:
+                return
+            if history_seq > state.replay_capture_seq:
+                state.pending_message_frames.append(BufferedFrame(seq=history_seq, data=frame))
+                state.replay_capture_seq = history_seq
+                self._logger.info(
+                    "[client] queued message seq=%d for %s (pending=%d)",
+                    history_seq, state.client_id, len(state.pending_message_frames),
+                )
+                # Notify the client that a message is waiting so it sends
+                # CMD_SYNC_NEXT_MESSAGE.  Done AFTER queueing to avoid a race
+                # where the client SYNCs before the frame is in pending queue.
+                await self._send_bytes_to_client(state, build_backend_frame(0x83))
+            return
+
+        if not await self._send_bytes_to_client(state, frame):
+            return
+
+        if packet_type == RESP_CODE_SELF_INFO and state.awaiting_replay_after_self_info:
+            state.awaiting_replay_after_self_info = False
+            await self._replay_state_cache(state)
