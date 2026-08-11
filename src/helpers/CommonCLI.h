@@ -13,6 +13,10 @@
 #define WITH_BRIDGE
 #endif
 
+// Size of the 'reply' buffer every handleCommand()/handleGetCmd()/handleSetCmd()
+// caller is expected to provide.
+#define CLI_REPLY_SIZE        160
+
 #define ADVERT_LOC_NONE       0
 #define ADVERT_LOC_SHARE      1
 #define ADVERT_LOC_PREFS      2

@@ -290,15 +290,15 @@ uint8_t MyMesh::getExtraAckTransmitCount() const {
 }
 
 void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
-  if (_serial->isConnected() && len + 3 <= MAX_FRAME_SIZE) {
+  if (_serial->isConnected() && len >= 0 && len + 3 <= (int) sizeof(rx_log_frame)) {
     int i = 0;
-    out_frame[i++] = PUSH_CODE_LOG_RX_DATA;
-    out_frame[i++] = (int8_t)(snr * 4);
-    out_frame[i++] = (int8_t)(rssi);
-    memcpy(&out_frame[i], raw, len);
+    rx_log_frame[i++] = PUSH_CODE_LOG_RX_DATA;
+    rx_log_frame[i++] = (int8_t)(snr * 4);
+    rx_log_frame[i++] = (int8_t)(rssi);
+    memcpy(&rx_log_frame[i], raw, len);
     i += len;
 
-    _serial->writeFrame(out_frame, i);
+    _serial->writeFrame(rx_log_frame, i);
   }
 }
 

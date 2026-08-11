@@ -115,7 +115,11 @@ void CommonCLI::loadPrefsInt(FILESYSTEM* fs, const char* filename) {  // Legacy 
     _prefs->cr = constrain(_prefs->cr, 5, 8);
     _prefs->tx_power_dbm = constrain(_prefs->tx_power_dbm, -9, 30);
     _prefs->multi_acks = constrain(_prefs->multi_acks, 0, 1);
-    _prefs->adc_multiplier = constrain(_prefs->adc_multiplier, 0.0f, 10.0f);
+    // Some boards use large ADC multiplier scales (e.g. RP2040 variants around ~9900).
+    // Keep valid values, reset only clearly invalid/corrupted ones.
+    if (!isfinite(_prefs->adc_multiplier) || _prefs->adc_multiplier < 0.0f || _prefs->adc_multiplier > 100000.0f) {
+      _prefs->adc_multiplier = 0.0f;
+    }
     _prefs->path_hash_mode = constrain(_prefs->path_hash_mode, 0, 2);   // NOTE: mode 3 reserved for future
 
     // sanitise bad bridge pref values
@@ -250,7 +254,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
         strcpy(reply, "ERR: bad pubkey");
       }
     } else if (memcmp(command, "tempradio ", 10) == 0) {
-      strcpy(tmp, &command[10]);
+      StrHelper::strncpy(tmp, &command[10], sizeof(tmp));
       const char *parts[5];
       int num = mesh::Utils::parseTextParts(tmp, parts, 5);
       float freq  = num > 0 ? strtof(parts[0], nullptr) : 0.0f;
@@ -293,7 +297,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
         strcpy(reply, "null");
       }
     } else if (memcmp(command, "sensor set ", 11) == 0) {
-      strcpy(tmp, &command[11]);
+      StrHelper::strncpy(tmp, &command[11], sizeof(tmp));
       const char *parts[2];
       int num = mesh::Utils::parseTextParts(tmp, parts, 2, ' ');
       const char *key = (num > 0) ? parts[0] : "";
@@ -445,11 +449,11 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
     } else if (sender_timestamp == 0 && memcmp(command, "log", 3) == 0) {
       _callbacks->dumpLogFile();
       strcpy(reply, "   EOF");
-    } else if (sender_timestamp == 0 && memcmp(command, "stats-packets", 13) == 0 && (command[13] == 0 || command[13] == ' ')) {
+    } else if (memcmp(command, "stats-packets", 13) == 0 && (command[13] == 0 || command[13] == ' ')) {
       _callbacks->formatPacketStatsReply(reply);
-    } else if (sender_timestamp == 0 && memcmp(command, "stats-radio", 11) == 0 && (command[11] == 0 || command[11] == ' ')) {
+    } else if (memcmp(command, "stats-radio", 11) == 0 && (command[11] == 0 || command[11] == ' ')) {
       _callbacks->formatRadioStatsReply(reply);
-    } else if (sender_timestamp == 0 && memcmp(command, "stats-core", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
+    } else if (memcmp(command, "stats-core", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
       _callbacks->formatStatsReply(reply);
     } else {
       strcpy(reply, "Unknown command");
@@ -465,8 +469,8 @@ void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* rep
     strcpy(reply, "OK");
   } else if (memcmp(config, "flood.advert.interval ", 22) == 0) {
     int hours = _atoi(&config[22]);
-    if ((hours > 0 && hours < 3) || (hours > 168)) {
-      strcpy(reply, "Error: interval range is 3-168 hours");
+    if (hours < 0 || hours > 168) {   // 0 = disabled; reject negatives (would wrap in uint8_t) and >168
+      strcpy(reply, "Error: interval range is 0-168 hours (0 = off)");
     } else {
       _prefs->flood_advert_interval = (uint8_t)(hours);
       _callbacks->updateFloodAdvertTimer();
@@ -803,7 +807,7 @@ void CommonCLI::handleGetCmd(uint32_t sender_timestamp, char* command, char* rep
       sprintf(reply, "No extra SF configured");
     }
   } else {
-    sprintf(reply, "??: %s", config);
+    snprintf(reply, CLI_REPLY_SIZE, "??: %s", config);   // 'config' is caller-supplied, can be long
   }
 }
 
