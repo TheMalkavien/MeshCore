@@ -16,4 +16,8 @@ cmake-*
 compile_commands.json
 .venv/
 venv/
+__pycache__/
 platformio.local.ini
+
+# local runtime config for tools/telegram_bot (holds the bot token)
+tools/telegram_bot/meshcore_mqtt_telegram.json
