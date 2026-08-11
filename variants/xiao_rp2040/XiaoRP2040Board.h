@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <MeshCore.h>
 #include <helpers/KeyValueStore.h>
+#include <helpers/RP2040OTA.h>
 
 /*
  * This board has no built-in way to read battery voltage.
@@ -26,6 +27,7 @@
 class XiaoRP2040Board : public mesh::MainBoard {
 protected:
   uint8_t startup_reason;
+  RP2040OTAController ota;
 
 public:
   void begin();
@@ -60,4 +62,9 @@ public:
   void reboot() override { rp2040.reboot(); }
 
   bool startOTAUpdate(const char *id, char reply[]) override;
+  bool handleOTACommand(const char *command, char reply[]) override { return ota.handleCommand(command, reply); }
+  bool handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) override {
+    return ota.handleBinaryCommand(opcode, payload, payload_len, reply);
+  }
+  bool isOTASessionActive() const override { return ota.isSleepInhibited(); }
 };

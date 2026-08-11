@@ -76,6 +76,11 @@ void WaveshareBoard::begin() {
   rp2040_restore_active_profile();
 #endif
 
+#ifdef MLK_ESP32_FLASHER_PIN
+  pinMode(MLK_ESP32_FLASHER_PIN, OUTPUT);
+  digitalWrite(MLK_ESP32_FLASHER_PIN, LOW); // ensure ESP32Flasher is not woken up by default
+#endif
+
 #ifdef P_LORA_TX_LED
   pinMode(P_LORA_TX_LED, OUTPUT);
 #endif
@@ -95,5 +100,44 @@ void WaveshareBoard::begin() {
 }
 
 bool WaveshareBoard::startOTAUpdate(const char *id, char reply[]) {
-  return false;
+#if defined(ARDUINO_ARCH_RP2040)
+  rp2040_enter_ota_profile();
+#endif
+  return ota.startSession(id, reply);
+}
+
+bool WaveshareBoard::handleOTACommand(const char *command, char reply[]) {
+#if defined(ARDUINO_ARCH_RP2040)
+  // Only switch to the OTA clock profile when not already in it. During an active
+  // session isSleepInhibited() stays true, so the profile persists and we avoid
+  // re-running set_sys_clock_khz (thrashing the PLL feeding the radio SPI) on
+  // every command.
+  if (!ota.isSleepInhibited()) {
+    rp2040_enter_ota_profile();
+  }
+#endif
+  bool ok = ota.handleCommand(command, reply);
+#if defined(ARDUINO_ARCH_RP2040)
+  if (!ota.isSleepInhibited()) {
+    rp2040_restore_active_profile();
+  }
+#endif
+  return ok;
+}
+
+bool WaveshareBoard::handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) {
+#if defined(ARDUINO_ARCH_RP2040)
+  // See handleOTACommand: skip the profile switch while a session is already active
+  // so per-chunk writes don't thrash the system PLL feeding the radio SPI.
+  if (!ota.isSleepInhibited()) {
+    rp2040_enter_ota_profile();
+  }
+#endif
+  bool ok = ota.handleBinaryCommand(opcode, payload, payload_len, reply);
+#if defined(ARDUINO_ARCH_RP2040)
+  if (!ota.isSleepInhibited()) {
+    rp2040_restore_active_profile();
+  }
+#endif
+  return ok;
 }
