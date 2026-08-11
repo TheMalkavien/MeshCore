@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <MeshCore.h>
+#include <helpers/RP2040OTA.h>
 
 #if defined(ARDUINO_ARCH_RP2040)
   #include <hardware/clocks.h>
@@ -89,6 +90,12 @@ public:
   void reboot() override { rp2040.reboot(); }
 
   bool startOTAUpdate(const char *id, char reply[]) override;
+  bool handleOTACommand(const char *command, char reply[]) override;
+  bool handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) override;
+  bool isOTASessionActive() const override { return ota.isSleepInhibited(); }
+
+protected:
+  RP2040OTAController ota;
 };
 
 // Clock / core-voltage profiles. The whole set lives here so a single place owns the
@@ -145,5 +152,20 @@ inline void rp2040_restore_active_profile() {
   busy_wait_us(200);
 #endif
   rp2040_apply_clock_profile(RP2040_ACTIVE_CLOCK_MHZ);
+}
+
+// Flash programming and the sustained SPI traffic of an OTA transfer both want the
+// full system clock, whatever the board runs at normally. Same ordering rule as
+// rp2040_restore_active_profile(): voltage up and settled before the clock.
+#ifndef RP2040_OTA_CLOCK_MHZ
+  #define RP2040_OTA_CLOCK_MHZ 125
+#endif
+
+inline void rp2040_enter_ota_profile() {
+#ifdef MLK_RP2040_LOWPOWER
+  vreg_set_voltage(VREG_VOLTAGE_DEFAULT);
+  busy_wait_us(200);
+#endif
+  rp2040_apply_clock_profile(RP2040_OTA_CLOCK_MHZ);
 }
 #endif
