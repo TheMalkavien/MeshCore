@@ -87,6 +87,29 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 **Usage:**
 - `start ota`
 
+**Note:** On boards that implement mesh OTA (RP2040 variants, ESP32), this arms an OTA session that then accepts the `ota ...` transfer commands below, over LoRa or over a serial/companion link.
+
+**Note:** On ESP32 this replaces the legacy behaviour of spawning a WiFi access point with an ElegantOTA web portal. Build with `-D WIFI_OTA_ON_START` to restore it (the WiFi/AsyncWebServer stack is then linked in again, costing roughly 500KB flash and 24KB RAM).
+
+---
+
+### Transfer a firmware image to an armed OTA session
+**Usage:**
+- `ota begin <size> [<crc32>]`
+- `ota write [<offset>] <hex>`
+- `ota status`
+- `ota end`
+- `ota abort`
+- `ota help`
+
+**Note:** `ota status` reports `<received>/<expected>` plus the current flush block size, and advertises the target's capabilities: `gz=` tells the sender whether a gzip-compressed image is accepted, `nack=miss` that the target reports holes in the current block so only the missing chunks are resent.
+
+**Note:** `ota write` accepts chunks out of order when an explicit offset is given. Intermediate chunks are not acknowledged individually; the block checkpoints in `ota status` gate the transfer.
+
+**Note:** Over the mesh, the same protocol is available as a binary request (`0x70`) which avoids the hex encoding overhead. Admin permission is required.
+
+**Note:** Boards without OTA support reply `Err - OTA unsupported` rather than staying silent.
+
 ---
 
 ### Erase/Factory Reset
