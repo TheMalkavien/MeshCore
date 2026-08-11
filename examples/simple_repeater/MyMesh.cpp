@@ -63,6 +63,30 @@
 #define PING_MAX_COUNT               100   // max pings accepted by a single 'ping' command
 #define PING_INTERVAL_MILLIS         1700   // pacing gap between consecutive pings (>= CLI_REPLY_DELAY_MILLIS so remote replies keep their order)
 
+/* --------------------- Conditional flood retry ------------------------ */
+
+#ifndef ENABLE_FLOOD_CONDITIONAL_RETRY
+  #define ENABLE_FLOOD_CONDITIONAL_RETRY 1
+#endif
+#ifndef FLOOD_RETRY_MAX_RETRANSMITS
+  #define FLOOD_RETRY_MAX_RETRANSMITS 3
+#endif
+#ifndef FLOOD_RETRY_CONFIRM_WINDOW_MS
+  #define FLOOD_RETRY_CONFIRM_WINDOW_MS 2500
+#endif
+#ifndef FLOOD_RETRY_GAP_MIN_MS
+  #define FLOOD_RETRY_GAP_MIN_MS 350
+#endif
+#ifndef FLOOD_RETRY_GAP_MAX_MS
+  #define FLOOD_RETRY_GAP_MAX_MS 1200
+#endif
+#ifndef FLOOD_RETRY_AIRTIME_FACTOR
+  #define FLOOD_RETRY_AIRTIME_FACTOR 8
+#endif
+
+#define OTHER_PREFS_VERSION  1
+#define OTHER_PREFS_FILE     "/other_prefs"
+
 void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
 #if MAX_NEIGHBOURS // check if neighbours enabled
   // find existing neighbour, else use least recently updated
@@ -91,7 +115,8 @@ void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float sn
 }
 
 // Nearest scheduled wake for a low-power idle: the deadline of an in-progress ping
-// session. Returns 0 when nothing is pending.
+// session, and the earliest deadline among the active flood-retry slots.
+// Returns 0 when nothing is pending.
 uint32_t MyMesh::nextAppWake(uint32_t now) const {
   uint32_t best = 0;
   (void)now;
@@ -100,6 +125,13 @@ uint32_t MyMesh::nextAppWake(uint32_t now) const {
     uint32_t t = pending_ping.active ? pending_ping.expiry_at : pending_ping.next_at;
     if (t != 0) best = t;
   }
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  for (int i = 0; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
+    if (!_flood_retry[i].active) continue;
+    uint32_t t = _flood_retry[i].next_retry_at;
+    if (best == 0 || (int32_t)(t - best) < 0) best = t;
+  }
+#endif
 
   return best;
 }
@@ -384,6 +416,194 @@ void MyMesh::runLocalPingSession(char* reply) {
     formatPingLine(reply);  // legacy single-ping reply
   }
   endPingSession();
+}
+
+void MyMesh::loadOtherPrefs() {
+  // Always start from compile-time defaults so missing fields fall back gracefully.
+  _other_prefs.flood_max_retries = FLOOD_RETRY_MAX_RETRANSMITS;
+  _other_prefs.flood_timeout_ms  = FLOOD_RETRY_CONFIRM_WINDOW_MS;
+
+  if (!_fs || !_fs->exists(OTHER_PREFS_FILE)) return;
+
+#if defined(RP2040_PLATFORM)
+  File f = _fs->open(OTHER_PREFS_FILE, "r");
+#else
+  File f = _fs->open(OTHER_PREFS_FILE);
+#endif
+  if (!f) return;
+
+  uint8_t ver = 0;
+  if (f.read(&ver, 1) != 1 || ver != OTHER_PREFS_VERSION) { f.close(); return; }
+
+  f.read(&_other_prefs.flood_max_retries, sizeof(_other_prefs.flood_max_retries));
+  f.read((uint8_t*)&_other_prefs.flood_timeout_ms, sizeof(_other_prefs.flood_timeout_ms));
+  f.close();
+
+  // Sanitize to prevent out-of-range values from a corrupted file.
+  _other_prefs.flood_max_retries = constrain((int)_other_prefs.flood_max_retries, 1, 10);
+  _other_prefs.flood_timeout_ms  = (uint16_t)constrain((int)_other_prefs.flood_timeout_ms, 500, 10000);
+}
+
+void MyMesh::saveOtherPrefs() {
+  if (!_fs) return;
+
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  _fs->remove(OTHER_PREFS_FILE);
+  File f = _fs->open(OTHER_PREFS_FILE, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  File f = _fs->open(OTHER_PREFS_FILE, "w");
+#else
+  File f = _fs->open(OTHER_PREFS_FILE, "w", true);
+#endif
+  if (!f) return;
+
+  uint8_t ver = OTHER_PREFS_VERSION;
+  f.write(&ver, 1);
+  f.write(&_other_prefs.flood_max_retries, sizeof(_other_prefs.flood_max_retries));
+  f.write((uint8_t*)&_other_prefs.flood_timeout_ms, sizeof(_other_prefs.flood_timeout_ms));
+  f.close();
+}
+
+void MyMesh::clearFloodRetryState() {
+  memset(_flood_retry, 0, sizeof(_flood_retry));
+  _flood_retry_tracked = 0;
+  _flood_retry_confirmed = 0;
+  _flood_retry_failed = 0;
+  _flood_retry_retransmits = 0;
+}
+
+void MyMesh::onFloodQueued(const mesh::Packet* packet, uint8_t priority, uint32_t delay_ms) {
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  // Track floods WE ORIGINATE (not just forwards) so that if no repeater is heard
+  // relaying them within the confirm window, we retransmit up to flood_max_retries times.
+  // Adverts and PATH packets are excluded: adverts are periodic, PATH packets are low-priority helpers.
+  uint8_t type = packet->getPayloadType();
+  if (type == PAYLOAD_TYPE_ADVERT || type == PAYLOAD_TYPE_PATH) {
+    return;
+  }
+  // Synthesise a DispatcherAction that trackFloodForward() expects:
+  //   bits[31:24] = priority + 1   (slot.priority = (action>>24)-1)
+  //   bits[23:0]  = initial delay  (base_delay for next_retry_at calculation)
+  mesh::DispatcherAction action = ACTION_RETRANSMIT_DELAYED(priority, delay_ms);
+  trackFloodForward(packet, action);
+#else
+  (void)packet; (void)priority; (void)delay_ms;
+#endif
+}
+
+void MyMesh::trackFloodForward(const mesh::Packet* pkt, mesh::DispatcherAction action) {
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  uint8_t hash[MAX_HASH_SIZE];
+  pkt->calculatePacketHash(hash);
+
+  int use_idx = -1;
+  for (int i = 0; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
+    if (_flood_retry[i].active && memcmp(_flood_retry[i].hash, hash, MAX_HASH_SIZE) == 0) {
+      use_idx = i;
+      break;
+    }
+    if (!_flood_retry[i].active && use_idx < 0) {
+      use_idx = i;
+    }
+  }
+  if (use_idx < 0) {
+    // No free slot; replace oldest.
+    use_idx = 0;
+    for (int i = 1; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
+      if (_flood_retry[i].created_at < _flood_retry[use_idx].created_at) {
+        use_idx = i;
+      }
+    }
+  }
+
+  auto& slot = _flood_retry[use_idx];
+  slot.raw_len = pkt->writeTo(slot.raw);
+  if (slot.raw_len == 0) {
+    slot.active = 0;
+    return;
+  }
+
+  memcpy(slot.hash, hash, MAX_HASH_SIZE);
+  slot.active = 1;
+  slot.retries_sent = 0;
+  slot.priority = (action >> 24) - 1;
+  slot.created_at = millis();
+
+  uint32_t base_delay = action & 0xFFFFFF;
+  uint32_t est_airtime = _radio->getEstAirtimeFor(pkt->getRawLength());
+  uint32_t wait_ms = est_airtime * (uint32_t)FLOOD_RETRY_AIRTIME_FACTOR;
+  if (wait_ms < (uint32_t)_other_prefs.flood_timeout_ms) {
+    wait_ms = (uint32_t)_other_prefs.flood_timeout_ms;
+  }
+  slot.wait_ms = wait_ms;
+  slot.next_retry_at = futureMillis(base_delay + wait_ms);
+
+  _flood_retry_tracked++;
+#else
+  (void)pkt;
+  (void)action;
+#endif
+}
+
+void MyMesh::markFloodHeard(const mesh::Packet* pkt) {
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  uint8_t hash[MAX_HASH_SIZE];
+  pkt->calculatePacketHash(hash);
+
+  for (int i = 0; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
+    auto& slot = _flood_retry[i];
+    if (!slot.active || memcmp(slot.hash, hash, MAX_HASH_SIZE) != 0) {
+      continue;
+    }
+
+    bool heard_other_repeater = false;
+    if (pkt->path_len >= PATH_HASH_SIZE) {
+      uint8_t self_hash[PATH_HASH_SIZE];
+      self_id.copyHashTo(self_hash);
+      heard_other_repeater = memcmp(&pkt->path[pkt->path_len - PATH_HASH_SIZE], self_hash, PATH_HASH_SIZE) != 0;
+    }
+
+    if (heard_other_repeater) {
+      slot.active = 0;
+      _flood_retry_confirmed++;
+    }
+    break;
+  }
+#else
+  (void)pkt;
+#endif
+}
+
+void MyMesh::processFloodRetries() {
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  for (int i = 0; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
+    auto& slot = _flood_retry[i];
+    if (!slot.active || !millisHasNowPassed(slot.next_retry_at)) {
+      continue;
+    }
+
+    if (slot.retries_sent >= _other_prefs.flood_max_retries) {
+      slot.active = 0;
+      _flood_retry_failed++;
+      continue;
+    }
+
+    mesh::Packet* retry = obtainNewPacket();
+    if (retry && retry->readFrom(slot.raw, slot.raw_len)) {
+      sendPacket(retry, slot.priority, 0);
+      slot.retries_sent++;
+      _flood_retry_retransmits++;
+    } else if (retry) {
+      releasePacket(retry);
+    }
+
+    uint32_t gap = FLOOD_RETRY_GAP_MIN_MS;
+    if (FLOOD_RETRY_GAP_MAX_MS > FLOOD_RETRY_GAP_MIN_MS) {
+      gap = getRNG()->nextInt(FLOOD_RETRY_GAP_MIN_MS, FLOOD_RETRY_GAP_MAX_MS + 1);
+    }
+    slot.next_retry_at = futureMillis(slot.wait_ms + gap);
+  }
+#endif
 }
 
 uint8_t MyMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood) {
@@ -864,7 +1084,18 @@ mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
   } else {
     recv_pkt_region = NULL;
   }
-  return Mesh::onRecvPacket(pkt);
+  mesh::DispatcherAction action = Mesh::onRecvPacket(pkt);
+
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  if (pkt->isRouteFlood()) {
+    if (action > ACTION_MANUAL_HOLD) {
+      trackFloodForward(pkt, action);
+    }
+    markFloodHeard(pkt);
+  }
+#endif
+
+  return action;
 }
 
 void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const mesh::Identity &sender,
@@ -1219,6 +1450,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   active_cli_client = NULL;
   active_cli_path_hash_size = PATH_HASH_SIZE;
   memset(&pending_ping, 0, sizeof(pending_ping));
+  clearFloodRetryState();
   recv_pkt_region = NULL;
 
 #if MAX_NEIGHBOURS
@@ -1247,6 +1479,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.interference_threshold = 0; // disabled
   _prefs.cad_enabled = 0;            // hardware CAD before TX (off by default; 'set cad on')
   _prefs.loop_detect = LOOP_DETECT_MINIMAL;
+  _prefs.multi_acks = 1;             // default: send one extra ACK per hop for better ACK delivery
 
   // bridge defaults
   _prefs.bridge_enabled = 1;    // enabled
@@ -1285,6 +1518,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   _fs = fs;
   // load persisted prefs
   _cli.loadPrefs(_fs);
+  loadOtherPrefs();
   acl.load(_fs, self_id);
   // TODO: key_store.begin();
   region_map.load(_fs);
@@ -1514,6 +1748,23 @@ void MyMesh::formatPacketStatsReply(char *reply) {
                                        getNumRecvFlood(), getNumRecvDirect());
 }
 
+void MyMesh::formatFloodStatsReply(char *reply) {
+#if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  uint32_t resolved = _flood_retry_confirmed + _flood_retry_failed;
+  uint32_t loss_permille = (resolved == 0) ? 0 : (_flood_retry_failed * 1000UL) / resolved;
+  sprintf(reply,
+          "{\"trk\":%lu,\"ok\":%lu,\"fail\":%lu,\"retry\":%lu,\"loss\":\"%lu.%lu%%\"}",
+          _flood_retry_tracked,
+          _flood_retry_confirmed,
+          _flood_retry_failed,
+          _flood_retry_retransmits,
+          loss_permille / 10,
+          loss_permille % 10);
+#else
+  strcpy(reply, "flood retry disabled");
+#endif
+}
+
 void MyMesh::saveIdentity(const mesh::LocalIdentity &new_id) {
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   IdentityStore store(*_fs, "");
@@ -1653,6 +1904,28 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
         runLocalPingSession(reply);  // blocks, prints each ping, returns the summary
       }
     }
+  } else if (memcmp(command, "set flood.maxretry ", 19) == 0) {
+    int val = atoi(command + 19);
+    if (val < 1 || val > 10) {
+      strcpy(reply, "Err - valid range: 1-10");
+    } else {
+      _other_prefs.flood_max_retries = (uint8_t)val;
+      saveOtherPrefs();
+      sprintf(reply, "OK flood.maxretry=%d", val);
+    }
+  } else if (memcmp(command, "set flood.timeout ", 18) == 0) {
+    int val = atoi(command + 18);
+    if (val < 500 || val > 10000) {
+      strcpy(reply, "Err - valid range: 500-10000 ms");
+    } else {
+      _other_prefs.flood_timeout_ms = (uint16_t)val;
+      saveOtherPrefs();
+      sprintf(reply, "OK flood.timeout=%d ms", val);
+    }
+  } else if (strcmp(command, "get flood") == 0) {
+    sprintf(reply, "flood.maxretry=%d flood.timeout=%d ms",
+            (int)_other_prefs.flood_max_retries,
+            (int)_other_prefs.flood_timeout_ms);
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
@@ -1664,6 +1937,7 @@ void MyMesh::loop() {
 #endif
 
   mesh::Mesh::loop();
+  processFloodRetries();
 
   // drive an in-progress remote (async) ping session
   if (pending_ping.session_active && pending_ping.reply_remote) {
