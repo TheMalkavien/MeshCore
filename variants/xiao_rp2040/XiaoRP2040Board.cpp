@@ -26,5 +26,5 @@ void XiaoRP2040Board::begin() {
 }
 
 bool XiaoRP2040Board::startOTAUpdate(const char *id, char reply[]) {
-  return false;
+  return ota.startSession(id, reply);
 }
