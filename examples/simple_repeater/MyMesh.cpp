@@ -59,6 +59,9 @@
 #define CLI_REPLY_DELAY_MILLIS      600
 
 #define LAZY_CONTACTS_WRITE_DELAY    5000
+#define PING_TIMEOUT_MILLIS          8000
+#define PING_MAX_COUNT               100   // max pings accepted by a single 'ping' command
+#define PING_INTERVAL_MILLIS         700   // pacing gap between consecutive pings (>= CLI_REPLY_DELAY_MILLIS so remote replies keep their order)
 
 void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
 #if MAX_NEIGHBOURS // check if neighbours enabled
@@ -85,6 +88,302 @@ void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float sn
   neighbour->heard_timestamp = getRTCClock()->getCurrentTime();
   neighbour->snr = (int8_t)(snr * 4);
 #endif
+}
+
+// Nearest scheduled wake for a low-power idle: the deadline of an in-progress ping
+// session. Returns 0 when nothing is pending.
+uint32_t MyMesh::nextAppWake(uint32_t now) const {
+  uint32_t best = 0;
+  (void)now;
+
+  if (pending_ping.session_active) {
+    uint32_t t = pending_ping.active ? pending_ping.expiry_at : pending_ping.next_at;
+    if (t != 0) best = t;
+  }
+
+  return best;
+}
+
+// Resolves a full pubkey, or a unique prefix matched against the neighbours table.
+bool MyMesh::resolvePingTarget(const char* destination, mesh::Identity& target, char* error_reply) {
+  while (*destination == ' ') {
+    destination++;
+  }
+  if (*destination == 0) {
+    strcpy(error_reply, "Err - destination required");
+    return false;
+  }
+
+  int hex_len = strlen(destination);
+  if ((hex_len & 1) != 0) {
+    strcpy(error_reply, "Err - hex length must be even");
+    return false;
+  }
+
+  if (hex_len == PUB_KEY_SIZE * 2) {
+    if (!mesh::Utils::fromHex(target.pub_key, PUB_KEY_SIZE, destination)) {
+      strcpy(error_reply, "Err - bad pubkey");
+      return false;
+    }
+  } else {
+    int prefix_len = hex_len / 2;
+    if (prefix_len <= 0 || prefix_len > PUB_KEY_SIZE) {
+      strcpy(error_reply, "Err - bad pubkey prefix");
+      return false;
+    }
+
+    uint8_t prefix[PUB_KEY_SIZE];
+    if (!mesh::Utils::fromHex(prefix, prefix_len, destination)) {
+      strcpy(error_reply, "Err - bad pubkey prefix");
+      return false;
+    }
+
+    int matches = 0;
+#if MAX_NEIGHBOURS
+    for (int i = 0; i < MAX_NEIGHBOURS; i++) {
+      if (neighbours[i].heard_timestamp == 0) {
+        continue;
+      }
+      if (memcmp(neighbours[i].id.pub_key, prefix, prefix_len) == 0) {
+        target = neighbours[i].id;
+        matches++;
+      }
+    }
+#endif
+    if (matches == 0) {
+      strcpy(error_reply, "Err - neighbor not found");
+      return false;
+    }
+    if (matches > 1) {
+      strcpy(error_reply, "Err - ambiguous prefix");
+      return false;
+    }
+  }
+
+  if (target.matches(self_id)) {
+    strcpy(error_reply, "Err - cannot ping self");
+    return false;
+  }
+  return true;
+}
+
+bool MyMesh::startPingSession(const mesh::Identity& target, uint16_t count, bool reply_remote,
+                              const char* cli_prefix, char* error_reply) {
+  if (pending_ping.session_active) {
+    strcpy(error_reply, "Err - ping busy");
+    return false;
+  }
+
+  pending_ping.session_active = true;
+  pending_ping.reply_remote = reply_remote;
+  pending_ping.target = target;
+  pending_ping.requester = active_cli_client ? active_cli_client->id : self_id;
+  pending_ping.requester_path_hash_size = active_cli_path_hash_size > 0 ? active_cli_path_hash_size : PATH_HASH_SIZE;
+  StrHelper::strncpy(pending_ping.cli_prefix, cli_prefix ? cli_prefix : "", sizeof(pending_ping.cli_prefix));
+  pending_ping.count = count;
+  pending_ping.seq = 0;
+  pending_ping.recv = 0;
+  pending_ping.next_at = 0;
+  pending_ping.rtt_sum = pending_ping.rtt_min = pending_ping.rtt_max = 0;
+  pending_ping.lsnr_sum = 0; pending_ping.lsnr_min = pending_ping.lsnr_max = 0;
+  pending_ping.rsnr_sum = 0; pending_ping.rsnr_min = pending_ping.rsnr_max = 0;
+  pending_ping.active = false;
+
+  if (!firePing(error_reply)) {
+    pending_ping.session_active = false;
+    return false;
+  }
+  return true;
+}
+
+// Sends one TRACE for the next sequence number and arms the in-flight state.
+bool MyMesh::firePing(char* error_reply) {
+  uint8_t path[4];
+  memcpy(path, pending_ping.target.pub_key, sizeof(path));
+  uint8_t flags = 0x02; // 4-byte trace path hashes, same encoding as companion TRACE
+  uint32_t auth_code;
+  getRNG()->random((uint8_t*)&pending_ping.tag, 4);
+  getRNG()->random((uint8_t*)&auth_code, 4);
+
+  mesh::Packet* pkt = createTrace(pending_ping.tag, auth_code, flags);
+  if (pkt == NULL) {
+    if (error_reply) strcpy(error_reply, "Err - packet pool empty");
+    return false;
+  }
+
+  pending_ping.seq++;
+  pending_ping.active = true;
+  pending_ping.success = false;
+  pending_ping.started_at = millis();
+  pending_ping.expiry_at = futureMillis(PING_TIMEOUT_MILLIS);
+  pending_ping.next_at = 0;
+  pending_ping.remote_snr = 0;
+  pending_ping.local_snr = 0;
+
+  sendDirect(pkt, path, sizeof(path));
+  return true;
+}
+
+// Folds the just-completed in-flight ping into the session aggregates.
+void MyMesh::accumulatePingStats() {
+  if (!pending_ping.success) return;  // misses don't contribute to rtt/snr stats
+
+  unsigned long rtt = pending_ping.last_rtt;
+  if (pending_ping.recv == 0) {  // first sample seeds the min/max trackers
+    pending_ping.rtt_min = pending_ping.rtt_max = rtt;
+    pending_ping.lsnr_min = pending_ping.lsnr_max = pending_ping.local_snr;
+    pending_ping.rsnr_min = pending_ping.rsnr_max = pending_ping.remote_snr;
+  } else {
+    if (rtt < pending_ping.rtt_min) pending_ping.rtt_min = rtt;
+    if (rtt > pending_ping.rtt_max) pending_ping.rtt_max = rtt;
+    if (pending_ping.local_snr < pending_ping.lsnr_min) pending_ping.lsnr_min = pending_ping.local_snr;
+    if (pending_ping.local_snr > pending_ping.lsnr_max) pending_ping.lsnr_max = pending_ping.local_snr;
+    if (pending_ping.remote_snr < pending_ping.rsnr_min) pending_ping.rsnr_min = pending_ping.remote_snr;
+    if (pending_ping.remote_snr > pending_ping.rsnr_max) pending_ping.rsnr_max = pending_ping.remote_snr;
+  }
+  pending_ping.recv++;
+  pending_ping.rtt_sum += rtt;
+  pending_ping.lsnr_sum += pending_ping.local_snr;
+  pending_ping.rsnr_sum += pending_ping.remote_snr;
+}
+
+// One per-ping result line. For a single ping (count==1) the legacy format is preserved.
+void MyMesh::formatPingLine(char* out) const {
+  char* p = out;
+  if (pending_ping.count > 1) {
+    p += sprintf(p, "seq=%u/%u ", (unsigned)pending_ping.seq, (unsigned)pending_ping.count);
+  }
+  if (!pending_ping.success) {
+    strcpy(p, "timeout");
+    return;
+  }
+  sprintf(p,
+          "rtt=%lums snr_rx=%.2f snr_tx=%.2f",
+          pending_ping.last_rtt,
+          pending_ping.local_snr / 4.0f,
+          pending_ping.remote_snr / 4.0f);
+}
+
+// Global summary over the whole session.
+void MyMesh::formatPingSummary(char* out) const {
+  uint16_t sent = pending_ping.seq;   // pings actually transmitted
+  uint16_t recv = pending_ping.recv;
+  uint16_t lost = sent - recv;
+  uint32_t loss_permille = (sent == 0) ? 0 : ((uint32_t)lost * 1000UL) / sent;
+
+  char* p = out;
+  p += sprintf(p, "--- stats: sent=%u recv=%u loss=%lu.%lu%%",
+               (unsigned)sent, (unsigned)recv,
+               (unsigned long)(loss_permille / 10), (unsigned long)(loss_permille % 10));
+  if (recv > 0) {
+    p += sprintf(p, " rtt=%lu/%lu/%lu ms",
+                 pending_ping.rtt_min, pending_ping.rtt_sum / recv, pending_ping.rtt_max);
+    p += sprintf(p, " snr_rx=%.2f/%.2f/%.2f",
+                 pending_ping.lsnr_min / 4.0f, (pending_ping.lsnr_sum / (float)recv) / 4.0f, pending_ping.lsnr_max / 4.0f);
+    sprintf(p, " snr_tx=%.2f/%.2f/%.2f",
+            pending_ping.rsnr_min / 4.0f, (pending_ping.rsnr_sum / (float)recv) / 4.0f, pending_ping.rsnr_max / 4.0f);
+  }
+}
+
+// Sends one CLI-data datagram to the remote requester (a per-ping line or the summary).
+void MyMesh::sendRemotePingLine(bool summary) {
+  auto client = acl.getClient(pending_ping.requester.pub_key, PUB_KEY_SIZE);
+  if (client == NULL) {
+    endPingSession();
+    return;
+  }
+
+  uint8_t temp[166];
+  char* reply = (char*)&temp[5];
+  reply[0] = 0;
+  if (pending_ping.cli_prefix[0]) {
+    strcpy(reply, pending_ping.cli_prefix);
+    reply += strlen(reply);
+  }
+  if (summary) {
+    formatPingSummary(reply);
+  } else {
+    formatPingLine(reply);
+  }
+
+  int text_len = strlen((char*)&temp[5]);
+  uint32_t timestamp = getRTCClock()->getCurrentTimeUnique();
+  memcpy(temp, &timestamp, 4);
+  temp[4] = (TXT_TYPE_CLI_DATA << 2);
+
+  auto pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, client->id, client->shared_secret, temp, 5 + text_len);
+  if (pkt) {
+    if (client->out_path_len == OUT_PATH_UNKNOWN) {
+      sendFlood(pkt, CLI_REPLY_DELAY_MILLIS, pending_ping.requester_path_hash_size);
+    } else {
+      sendDirect(pkt, client->out_path, client->out_path_len, CLI_REPLY_DELAY_MILLIS);
+    }
+  }
+}
+
+// Drives a remote (async) session forward after one ping completes (success or timeout).
+void MyMesh::completePingAndAdvance() {
+  accumulatePingStats();
+  sendRemotePingLine(false);   // independent per-ping result
+
+  if (pending_ping.seq < pending_ping.count) {
+    pending_ping.next_at = futureMillis(PING_INTERVAL_MILLIS);  // pace the next ping
+  } else {
+    sendRemotePingLine(true);  // global summary
+    endPingSession();
+  }
+}
+
+void MyMesh::endPingSession() {
+  pending_ping.session_active = false;
+  pending_ping.active = false;
+  pending_ping.reply_remote = false;
+  pending_ping.next_at = 0;
+  pending_ping.cli_prefix[0] = 0;
+}
+
+// Local serial driver: blocks, printing each ping as it completes, and returns the summary in `reply`.
+void MyMesh::runLocalPingSession(char* reply) {
+  char line[120];
+  for (;;) {
+    // wait for the current in-flight ping to resolve or time out
+    while (pending_ping.active && !millisHasNowPassed(pending_ping.expiry_at)) {
+      loop();
+      delay(1);
+    }
+    if (pending_ping.active) {  // timed out (no trace response arrived)
+      pending_ping.success = false;
+      pending_ping.active = false;
+    }
+    accumulatePingStats();
+
+    if (pending_ping.count > 1) {  // print each ping independently; single ping keeps legacy single-line reply
+      formatPingLine(line);
+      Serial.print("  -> "); Serial.println(line);
+    }
+
+    if (pending_ping.seq >= pending_ping.count) break;
+
+    // pace the next ping (keep servicing the mesh while we wait)
+    unsigned long fire_at = futureMillis(PING_INTERVAL_MILLIS);
+    while (!millisHasNowPassed(fire_at)) {
+      loop();
+      delay(1);
+    }
+
+    char err[40];
+    if (!firePing(err)) {  // packet pool momentarily empty: stop and summarise what we have
+      Serial.print("  -> "); Serial.println(err);
+      break;
+    }
+  }
+
+  if (pending_ping.count > 1) {
+    formatPingSummary(reply);
+  } else {
+    formatPingLine(reply);  // legacy single-ping reply
+  }
+  endPingSession();
 }
 
 uint8_t MyMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood) {
@@ -640,6 +939,36 @@ void MyMesh::getPeerSharedSecret(uint8_t *dest_secret, int peer_idx) {
   }
 }
 
+void MyMesh::onTraceRecv(mesh::Packet* packet, uint32_t tag, uint32_t auth_code, uint8_t flags,
+                         const uint8_t* path_snrs, const uint8_t* path_hashes, uint8_t path_len) {
+  (void)auth_code;
+
+  if (!pending_ping.active || tag != pending_ping.tag) {
+    return;
+  }
+
+  uint8_t path_sz = 1 << (flags & 0x03);
+  if (path_len < path_sz || (path_len % path_sz) != 0) {
+    return;
+  }
+
+  uint8_t hop_count = path_len / path_sz;
+  if (memcmp(path_hashes, pending_ping.target.pub_key, path_sz) != 0 || hop_count == 0) {
+    return;
+  }
+
+  pending_ping.success = true;
+  pending_ping.remote_snr = (int8_t)path_snrs[0];
+  pending_ping.local_snr = (int8_t)(packet->getSNR() * 4.0f);
+  pending_ping.last_rtt = millis() - pending_ping.started_at;
+  pending_ping.active = false;  // this in-flight ping is resolved
+
+  if (pending_ping.reply_remote) {
+    completePingAndAdvance();   // remote: accumulate, reply, fire next or summarise
+  }
+  // local: runLocalPingSession() drives the session forward
+}
+
 static bool isShare(const mesh::Packet *packet) {
   if (packet->hasTransportCodes()) {
     return packet->transport_codes[0] == 0 && packet->transport_codes[1] == 0;  // codes { 0, 0 } means 'send to nowhere'
@@ -739,7 +1068,11 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
       if (is_retry) {
         *reply = 0;
       } else {
+        active_cli_client = client;
+        active_cli_path_hash_size = packet->getPathHashSize();
         handleCommand(sender_timestamp, command, reply);
+        active_cli_client = NULL;
+        active_cli_path_hash_size = PATH_HASH_SIZE;
       }
       int text_len = strlen(reply);
       if (text_len > 0) {
@@ -883,6 +1216,9 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   set_radio_at = revert_radio_at = 0;
   _logging = false;
   region_load_active = false;
+  active_cli_client = NULL;
+  active_cli_path_hash_size = PATH_HASH_SIZE;
+  memset(&pending_ping, 0, sizeof(pending_ping));
   recv_pkt_region = NULL;
 
 #if MAX_NEIGHBOURS
@@ -1234,11 +1570,16 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 
   while (*command == ' ') command++; // skip leading spaces
 
+  char* reply_start = reply;
+  char cli_prefix[CommonCLI::MAX_CMD_PREFIX_LEN + 1];
+  cli_prefix[0] = 0;
   // Optional "<hex-token>|" prefix (for companion radio CLI). The token is not a
   // fixed 2 chars: mccli sends 2, other clients more, and a mis-parsed prefix makes
   // the whole command unrecognisable, so measure it instead of assuming.
   uint8_t prefix_len = CommonCLI::getCommandPrefixLen(command);
   if (prefix_len > 0) {
+    memcpy(cli_prefix, command, prefix_len);      // remembered for async replies (see 'ping')
+    cli_prefix[prefix_len] = 0;
     memcpy(reply, command, prefix_len);           // reflect the prefix back
     reply += prefix_len;
     command += prefix_len;
@@ -1287,6 +1628,31 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       sendNodeDiscoverReq();
       strcpy(reply, "OK - Discover sent");
     }
+  } else if (memcmp(command, "ping ", 5) == 0) {
+    char* arg = command + 5;
+    while (*arg == ' ') arg++;
+    // optional 2nd argument: number of pings to send
+    int count = 1;
+    char* sp = strchr(arg, ' ');
+    if (sp != NULL) {
+      *sp = 0;  // terminate the pubkey token
+      const char* cp = sp + 1;
+      while (*cp == ' ') cp++;
+      if (*cp) count = atoi(cp);
+    }
+    if (count < 1) count = 1;
+    if (count > PING_MAX_COUNT) count = PING_MAX_COUNT;
+
+    mesh::Identity target;
+    bool reply_remote = sender_timestamp != 0 && active_cli_client != NULL;
+    if (resolvePingTarget(arg, target, reply) &&
+        startPingSession(target, (uint16_t)count, reply_remote, cli_prefix, reply)) {
+      if (reply_remote) {
+        reply_start[0] = 0;          // results are sent asynchronously (per-ping lines + summary)
+      } else {
+        runLocalPingSession(reply);  // blocks, prints each ping, returns the summary
+      }
+    }
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
@@ -1298,6 +1664,22 @@ void MyMesh::loop() {
 #endif
 
   mesh::Mesh::loop();
+
+  // drive an in-progress remote (async) ping session
+  if (pending_ping.session_active && pending_ping.reply_remote) {
+    if (pending_ping.active) {
+      if (millisHasNowPassed(pending_ping.expiry_at)) {  // current ping timed out
+        pending_ping.success = false;
+        pending_ping.active = false;
+        completePingAndAdvance();
+      }
+    } else if (pending_ping.next_at && millisHasNowPassed(pending_ping.next_at)) {  // time to fire the next ping
+      pending_ping.next_at = 0;
+      if (!firePing(NULL)) {  // packet pool momentarily empty: retry after the pacing gap
+        pending_ping.next_at = futureMillis(PING_INTERVAL_MILLIS);
+      }
+    }
+  }
 
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
     mesh::Packet *pkt = createSelfAdvert();
