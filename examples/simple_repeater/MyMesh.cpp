@@ -120,6 +120,16 @@ static bool readPacketWireExact(mesh::Packet* dst, const uint8_t raw[], uint8_t 
 #define PING_MAX_COUNT               100   // max pings accepted by a single 'ping' command
 #define PING_INTERVAL_MILLIS         700   // pacing gap between consecutive pings (>= CLI_REPLY_DELAY_MILLIS so remote replies keep their order)
 
+// Route discovery reuses the standard encrypted anonymous-login -> PATH exchange. Intermediate
+// relays and the target need no trace-specific firmware; three unique floods can sample trees.
+#define TRACE_PROBE_INTERVAL_MILLIS       8000
+#define TRACE_REPLY_TIMEOUT_MILLIS       60000
+#define TRACE_SESSION_MAX_MILLIS         90000
+#define TRACE_LINE_DELAY_MILLIS            500
+#define TRACE_REPORT_MAX_MILLIS          60000
+#define TRACE_REPORT_RETRY_MILLIS          500
+#define TRACE_LOGIN_DATA_LEN               9
+
 static const char* skipCommandSpaces(const char* p) {
   while (*p == ' ') {
     p++;
@@ -183,6 +193,7 @@ mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
   } else {
     recv_pkt_region = NULL;
   }
+
   mesh::DispatcherAction action = Mesh::onRecvPacket(pkt);
 
 #if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
@@ -198,7 +209,7 @@ mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
 }
 
 // Nearest scheduled wake for the low-power idle: the earliest deadline among active
-// flood-retry slots and an in-progress ping session. Returns 0 when nothing is pending.
+// flood-retry slots and an in-progress ping or trace session. Returns 0 when nothing is pending.
 uint32_t MyMesh::nextAppWake(uint32_t now) const {
   uint32_t best = 0;
   (void)now;
@@ -214,6 +225,26 @@ uint32_t MyMesh::nextAppWake(uint32_t now) const {
   if (pending_ping.session_active) {
     uint32_t t = pending_ping.active ? pending_ping.expiry_at : pending_ping.next_at;
     if (t != 0 && (best == 0 || (int32_t)(t - best) < 0)) best = t;
+  }
+
+  if (pending_trace.session_active && pending_trace.phase == TRACE_PHASE_PROBE) {
+    uint32_t t = pending_trace.hard_deadline;
+    if (!pending_trace.tx_pending) {
+      uint32_t work = now;
+      if (pending_trace.next_probe < TRACE_DISCOVERY_PROBES) {
+        work = pending_trace.next_probe_at;
+      } else if (pending_trace.has_deadline) {
+        work = pending_trace.deadline;
+      }
+      if ((int32_t)(work - t) < 0) t = work;
+    }
+    if (t == 0) t = 1;   // nextAppWake() reserves zero for "no application deadline"
+    if (best == 0 || (int32_t)(t - best) < 0) best = t;
+  } else if (pending_trace.session_active && pending_trace.phase == TRACE_PHASE_REPORT) {
+    uint32_t t = pending_trace.next_report_at;
+    if ((int32_t)(pending_trace.report_deadline - t) < 0) t = pending_trace.report_deadline;
+    if (t == 0) t = 1;
+    if (best == 0 || (int32_t)(t - best) < 0) best = t;
   }
 
   return best;
@@ -277,9 +308,10 @@ void MyMesh::onFloodQueued(const mesh::Packet* packet, uint8_t priority, uint32_
 #if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
   // Track floods WE ORIGINATE (not just forwards) so that if no repeater is heard
   // relaying them within the confirm window, we retransmit up to FLOOD_RETRY_MAX_RETRANSMITS times.
-  // Adverts and PATH packets are excluded: adverts are periodic, PATH packets are low-priority helpers.
+  // Adverts and PATH packets are excluded, as are trace login probes (each is already unique).
   uint8_t type = packet->getPayloadType();
-  if (type == PAYLOAD_TYPE_ADVERT || type == PAYLOAD_TYPE_PATH) {
+  if (type == PAYLOAD_TYPE_ADVERT || type == PAYLOAD_TYPE_PATH
+      || isPendingTraceProbe(packet, true)) {
     return;
   }
   // Synthesise a DispatcherAction that trackFloodForward() expects:
@@ -358,10 +390,13 @@ void MyMesh::markFloodHeard(const mesh::Packet* pkt) {
     }
 
     bool heard_other_repeater = false;
-    if (pkt->path_len >= PATH_HASH_SIZE) {
-      uint8_t self_hash[PATH_HASH_SIZE];
-      self_id.copyHashTo(self_hash);
-      heard_other_repeater = memcmp(&pkt->path[pkt->path_len - PATH_HASH_SIZE], self_hash, PATH_HASH_SIZE) != 0;
+    uint8_t count = pkt->getPathHashCount();
+    uint8_t hash_size = pkt->getPathHashSize();
+    if (count > 0 && hash_size <= MAX_HASH_SIZE) {
+      uint8_t self_hash[MAX_HASH_SIZE];
+      self_id.copyHashTo(self_hash, hash_size);
+      const uint8_t* last = &pkt->path[(count - 1) * hash_size];
+      heard_other_repeater = memcmp(last, self_hash, hash_size) != 0;
     }
 
     if (heard_other_repeater) {
@@ -644,39 +679,49 @@ void MyMesh::formatPingSummary(char* out) const {
   }
 }
 
-// Sends one CLI-data datagram to the remote requester (a per-ping line or the summary).
-void MyMesh::sendRemotePingLine(bool summary) {
-  auto client = acl.getClient(pending_ping.requester.pub_key, PUB_KEY_SIZE);
-  if (client == NULL) {
-    endPingSession();
-    return;
-  }
+// Sends one asynchronous CLI-data datagram (a single result line) to a remote admin client.
+// Returns false if the requester is no longer known or the packet pool is momentarily full.
+bool MyMesh::sendRemoteCliLine(const mesh::Identity& requester, uint8_t path_hash_size,
+                               const char* cli_prefix, const char* text, uint32_t delay_millis,
+                               const TransportKey* scope) {
+  auto client = acl.getClient(requester.pub_key, PUB_KEY_SIZE);
+  if (client == NULL) return false;
 
   uint8_t temp[166];
   char* reply = (char*)&temp[5];
-  reply[0] = 0;
-  if (pending_ping.cli_prefix[0]) {
-    strcpy(reply, pending_ping.cli_prefix);
-    reply += strlen(reply);
-  }
-  if (summary) {
-    formatPingSummary(reply);
-  } else {
-    formatPingLine(reply);
-  }
+  StrHelper::strncpy(reply, cli_prefix ? cli_prefix : "", sizeof(temp) - 5);
+  StrHelper::strncpy(reply + strlen(reply), text, sizeof(temp) - 5 - strlen(reply));
 
-  int text_len = strlen((char*)&temp[5]);
+  int text_len = strlen(reply);
   uint32_t timestamp = getRTCClock()->getCurrentTimeUnique();
   memcpy(temp, &timestamp, 4);
   temp[4] = (TXT_TYPE_CLI_DATA << 2);
 
   auto pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, client->id, client->shared_secret, temp, 5 + text_len);
-  if (pkt) {
-    if (client->out_path_len == OUT_PATH_UNKNOWN) {
-      sendFlood(pkt, CLI_REPLY_DELAY_MILLIS, pending_ping.requester_path_hash_size);
+  if (pkt == NULL) return false;
+  if (client->out_path_len == OUT_PATH_UNKNOWN) {
+    if (scope) {
+      sendFloodScoped(*scope, pkt, delay_millis, path_hash_size);
     } else {
-      sendDirect(pkt, client->out_path, client->out_path_len, CLI_REPLY_DELAY_MILLIS);
+      sendFlood(pkt, delay_millis, path_hash_size);
     }
+  } else {
+    sendDirect(pkt, client->out_path, client->out_path_len, delay_millis);
+  }
+  return true;
+}
+
+// Sends one CLI-data datagram to the remote requester (a per-ping line or the summary).
+void MyMesh::sendRemotePingLine(bool summary) {
+  char text[160];
+  if (summary) {
+    formatPingSummary(text);
+  } else {
+    formatPingLine(text);
+  }
+  if (!sendRemoteCliLine(pending_ping.requester, pending_ping.requester_path_hash_size,
+                         pending_ping.cli_prefix, text, CLI_REPLY_DELAY_MILLIS)) {
+    endPingSession();
   }
 }
 
@@ -743,6 +788,492 @@ void MyMesh::runLocalPingSession(char* reply) {
     formatPingLine(reply);  // legacy single-ping reply
   }
   endPingSession();
+}
+
+/* ----------------------- trace (flood route discovery) ------------------ */
+
+void MyMesh::beginTraceSession(bool reply_remote, const char* cli_prefix) {
+  memset(&pending_trace, 0, sizeof(pending_trace));
+  pending_trace.session_active = true;
+  pending_trace.reply_remote = reply_remote;
+  pending_trace.started_at = millis();
+  pending_trace.hard_deadline = futureMillis(TRACE_SESSION_MAX_MILLIS);
+  pending_trace.requester = active_cli_client ? active_cli_client->id : self_id;
+  pending_trace.requester_path_hash_size = active_cli_path_hash_size > 0 ? active_cli_path_hash_size : PATH_HASH_SIZE;
+  if (reply_remote && recv_pkt_region && !recv_pkt_region->isWildcard()
+      && region_map.getTransportKeysFor(*recv_pkt_region, &pending_trace.requester_scope, 1) > 0) {
+    pending_trace.requester_scope_valid = true;
+  }
+  StrHelper::strncpy(pending_trace.cli_prefix, cli_prefix ? cli_prefix : "", sizeof(pending_trace.cli_prefix));
+}
+
+bool MyMesh::resolveTraceTarget(const char* destination, mesh::Identity& target, char* error_reply) {
+  while (*destination == ' ') destination++;
+  const char* end = destination + strlen(destination);
+  while (end > destination && end[-1] == ' ') end--;
+
+  size_t hex_len = end - destination;
+  if (hex_len < TRACE_MIN_PREFIX_SIZE * 2 || hex_len > PUB_KEY_SIZE * 2 || (hex_len & 1) != 0) {
+    strcpy(error_reply, "Err - target must be 4..64 even hex chars");
+    return false;
+  }
+  for (const char* p = destination; p < end; p++) {
+    if (!isHexChar(*p)) {
+      strcpy(error_reply, "Err - bad contact prefix/pubkey");
+      return false;
+    }
+  }
+
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  memcpy(hex, destination, hex_len);
+  hex[hex_len] = 0;
+  if (hex_len == PUB_KEY_SIZE * 2) {
+    if (!mesh::Utils::fromHex(target.pub_key, PUB_KEY_SIZE, hex)) {
+      strcpy(error_reply, "Err - bad pubkey");
+      return false;
+    }
+  } else {
+    uint8_t prefix[PUB_KEY_SIZE];
+    uint8_t prefix_len = hex_len / 2;
+    if (!mesh::Utils::fromHex(prefix, prefix_len, hex)) {
+      strcpy(error_reply, "Err - bad contact prefix");
+      return false;
+    }
+
+    int matches = 0;
+    for (int i = 0; i < acl.getNumClients(); i++) {
+      ClientInfo* client = acl.getClientByIdx(i);
+      if (client->id.isHashMatch(prefix, prefix_len)) {
+        target = client->id;
+        matches++;
+      }
+    }
+    if (matches == 0) {
+      strcpy(error_reply, "Err - unknown contact prefix");
+      return false;
+    }
+    if (matches > 1) {
+      strcpy(error_reply, "Err - ambiguous contact prefix");
+      return false;
+    }
+  }
+
+  if (target.matches(self_id)) {
+    strcpy(error_reply, "Err - cannot trace self");
+    return false;
+  }
+  return true;
+}
+
+bool MyMesh::startTraceSession(const char* destination, bool reply_remote, const char* cli_prefix,
+                               char* error_reply) {
+  if (pending_trace.session_active) {
+    strcpy(error_reply, "Err - trace busy");
+    return false;
+  }
+
+  mesh::Identity target;
+  if (!resolveTraceTarget(destination, target, error_reply)) return false;
+
+  beginTraceSession(reply_remote, cli_prefix);
+  pending_trace.target = target;
+  self_id.calcSharedSecret(pending_trace.target_secret, target);
+
+  char target_hex[TRACE_RESPONDER_HASH_SIZE * 2 + 1];
+  mesh::Utils::toHex(target_hex, target.pub_key, TRACE_RESPONDER_HASH_SIZE);
+  char line[128];
+  sprintf(line, "trace %s: flooding %u guest login probes", target_hex,
+          (unsigned)TRACE_DISCOVERY_PROBES);
+  bool start_notified = emitTraceProgress(line, true);
+  if (reply_remote) {
+    if (start_notified) error_reply[0] = 0;
+    else strcpy(error_reply, line);  // fall back to the normal synchronous CLI reply
+  }
+  sendNextTraceProbe();
+  return true;
+}
+
+mesh::Packet* MyMesh::createTraceDiscoveryProbe(uint32_t tag) {
+  // A simple_repeater reads its password at byte 4, which stays empty. A room server reads a
+  // sync_since value at bytes 4..7 and its password at byte 8: use a non-empty discriminator there
+  // (and a future sync timestamp) so it does not mistake trace for an empty-password full-history
+  // login. A room explicitly configured allow_read_only may still accept any password by policy.
+  uint8_t data[TRACE_LOGIN_DATA_LEN] = {0};
+  memcpy(data, &tag, sizeof(tag));
+  data[5] = data[6] = data[7] = 0xFF;
+  data[8] = 0x01;
+  return createAnonDatagram(PAYLOAD_TYPE_ANON_REQ, self_id, pending_trace.target,
+                            pending_trace.target_secret, data, sizeof(data));
+}
+
+bool MyMesh::isPendingTraceProbe(const mesh::Packet* packet, bool unsent_only) const {
+  if (!packet || !pending_trace.session_active || pending_trace.phase != TRACE_PHASE_PROBE
+      || !packet->isRouteFlood()) return false;
+  if (packet->getPayloadType() != PAYLOAD_TYPE_ANON_REQ) return false;
+
+  uint8_t packet_hash[MAX_HASH_SIZE];
+  packet->calculatePacketHash(packet_hash);
+  for (uint8_t i = 0; i < pending_trace.sent_count; i++) {
+    const TraceProbeRec& rec = pending_trace.sent[i];
+    if (rec.active && (!unsent_only || !rec.transmitted)
+        && memcmp(rec.packet_hash, packet_hash, MAX_HASH_SIZE) == 0) return true;
+  }
+  return false;
+}
+
+void MyMesh::recordTraceResponse(mesh::Packet* packet, const mesh::Identity& responder,
+                                 const uint8_t* out_path, uint8_t out_path_len) {
+  if (!mesh::Packet::isValidPathLen(out_path_len)
+      || !mesh::Packet::isValidPathLen(packet->path_len)) return;
+  uint8_t out_bytes = (out_path_len & 63) * ((out_path_len >> 6) + 1);
+  uint8_t back_bytes = packet->getPathByteLen();
+
+  pending_trace.responses_received++;
+  TraceResult* result = NULL;
+  for (uint8_t i = 0; i < pending_trace.routes_found; i++) {
+    TraceResult& candidate = pending_trace.results[i];
+    if (memcmp(candidate.responder, responder.pub_key, TRACE_RESPONDER_HASH_SIZE) == 0
+        && candidate.out_path_len == out_path_len && candidate.back_path_len == packet->path_len
+        && memcmp(candidate.out_path, out_path, out_bytes) == 0
+        && memcmp(candidate.back_path, packet->path, back_bytes) == 0) {
+      result = &candidate;
+      break;
+    }
+  }
+
+  if (result == NULL) {
+    if (pending_trace.routes_found >= TRACE_MAX_RESULTS) return;
+    result = &pending_trace.results[pending_trace.routes_found++];
+    memset(result, 0, sizeof(*result));
+    memcpy(result->responder, responder.pub_key, TRACE_RESPONDER_HASH_SIZE);
+    result->out_path_len = out_path_len;
+    memcpy(result->out_path, out_path, out_bytes);
+    result->back_path_len = packet->path_len;
+    memcpy(result->back_path, packet->path, back_bytes);
+  }
+
+  result->replies++;
+  result->last_snr = (int8_t)(packet->getSNR() * 4.0f);
+}
+
+void MyMesh::sendNextTraceProbe() {
+  while (pending_trace.next_probe < TRACE_DISCOVERY_PROBES) {
+    uint32_t tag = getRTCClock()->getCurrentTimeUnique();
+    mesh::Packet* packet = createTraceDiscoveryProbe(tag);
+    if (packet == NULL) {
+      pending_trace.pool_misses++;
+      pending_trace.phase = TRACE_PHASE_PROBE;
+      pending_trace.next_probe_at = futureMillis(1000);
+      return;
+    }
+
+    TraceProbeRec* rec = &pending_trace.sent[pending_trace.sent_count++];
+    memset(rec, 0, sizeof(*rec));
+    rec->active = true;
+    packet->calculatePacketHash(rec->packet_hash);
+    pending_trace.next_probe++;
+    pending_trace.phase = TRACE_PHASE_PROBE;
+    pending_trace.tx_pending = true;
+
+    uint8_t hash_size = _prefs.path_hash_mode + 1;
+    if (hash_size < 1 || hash_size > 3) hash_size = PATH_HASH_SIZE;
+    sendFloodScoped(default_scope, packet, 0, hash_size);
+    return;
+  }
+
+  if (!pending_trace.tx_pending && !pending_trace.has_deadline) finishTrace();
+}
+
+void MyMesh::noteTraceTx(mesh::Packet* packet, bool success) {
+  if (!isPendingTraceProbe(packet, false)) return;
+
+  uint8_t packet_hash[MAX_HASH_SIZE];
+  packet->calculatePacketHash(packet_hash);
+  TraceProbeRec* rec = NULL;
+  for (uint8_t i = 0; i < pending_trace.sent_count; i++) {
+    if (pending_trace.sent[i].active && !pending_trace.sent[i].transmitted
+        && memcmp(pending_trace.sent[i].packet_hash, packet_hash, MAX_HASH_SIZE) == 0) {
+      rec = &pending_trace.sent[i];
+      break;
+    }
+  }
+  if (rec == NULL) return;
+
+  pending_trace.tx_pending = false;
+  if (!success) {
+    // A radio failure did not put a discovery probe on air. Reuse this final slot so the
+    // command still attempts three actual floods, bounded by the session hard deadline.
+    memset(rec, 0, sizeof(*rec));
+    if (pending_trace.sent_count > 0) pending_trace.sent_count--;
+    if (pending_trace.next_probe > 0) pending_trace.next_probe--;
+    pending_trace.tx_failures++;
+    pending_trace.next_probe_at = futureMillis(1000);
+    return;
+  }
+
+  rec->transmitted = true;
+  rec->expires_at = futureMillis(TRACE_REPLY_TIMEOUT_MILLIS);
+  pending_trace.probes_sent++;
+  pending_trace.next_probe_at = futureMillis(TRACE_PROBE_INTERVAL_MILLIS);
+  if (!pending_trace.has_deadline || (int32_t)(rec->expires_at - pending_trace.deadline) > 0) {
+    pending_trace.deadline = rec->expires_at;
+    pending_trace.has_deadline = true;
+  }
+
+  char line[96];
+  sprintf(line, "guest login probe %u/%u sent",
+          (unsigned)pending_trace.probes_sent, (unsigned)TRACE_DISCOVERY_PROBES);
+  emitTraceProgress(line, false);
+}
+
+void MyMesh::cancelPendingTraceTx() {
+  if (!pending_trace.tx_pending) return;
+
+  TraceProbeRec* rec = NULL;
+  for (uint8_t i = 0; i < pending_trace.sent_count; i++) {
+    if (pending_trace.sent[i].active && !pending_trace.sent[i].transmitted) {
+      rec = &pending_trace.sent[i];
+      break;
+    }
+  }
+  if (rec) {
+    int count = _mgr->getOutboundTotal();
+    for (int i = 0; i < count; i++) {
+      mesh::Packet* queued = _mgr->getOutboundByIdx(i);
+      if (!queued || !queued->isRouteFlood()) continue;
+      if (queued->getPayloadType() != PAYLOAD_TYPE_ANON_REQ) continue;
+      uint8_t packet_hash[MAX_HASH_SIZE];
+      queued->calculatePacketHash(packet_hash);
+      if (memcmp(packet_hash, rec->packet_hash, MAX_HASH_SIZE) == 0) {
+        mesh::Packet* removed = _mgr->removeOutboundByIdx(i);
+        if (removed) releasePacket(removed);
+        break;
+      }
+    }
+    rec->active = false;
+  }
+  pending_trace.tx_pending = false;
+  pending_trace.tx_failures++;
+}
+
+void MyMesh::driveTrace() {
+  if (pending_trace.phase == TRACE_PHASE_REPORT) {
+    if (millisHasNowPassed(pending_trace.report_deadline)) {
+      sendRemoteCliLine(pending_trace.requester, pending_trace.requester_path_hash_size,
+                        pending_trace.cli_prefix, "Err - trace report incomplete (timeout)",
+                        CLI_REPLY_DELAY_MILLIS,
+                        pending_trace.requester_scope_valid ? &pending_trace.requester_scope : NULL);
+      endTraceSession();
+    } else if (millisHasNowPassed(pending_trace.next_report_at)) {
+      bool queued = sendNextTraceReportLine();
+      if (pending_trace.session_active && pending_trace.phase == TRACE_PHASE_REPORT) {
+        pending_trace.next_report_at = futureMillis(queued ? TRACE_LINE_DELAY_MILLIS
+                                                          : TRACE_REPORT_RETRY_MILLIS);
+      }
+    }
+    return;
+  }
+  if (pending_trace.phase != TRACE_PHASE_PROBE) return;
+
+  if (millisHasNowPassed(pending_trace.hard_deadline)) {
+    cancelPendingTraceTx();
+    finishTrace();
+    return;
+  }
+  if (pending_trace.tx_pending) return;
+  if (pending_trace.next_probe < TRACE_DISCOVERY_PROBES) {
+    if (millisHasNowPassed(pending_trace.next_probe_at)) sendNextTraceProbe();
+  } else if (!pending_trace.has_deadline || millisHasNowPassed(pending_trace.deadline)) {
+    finishTrace();
+  }
+}
+
+void MyMesh::finishTrace() {
+  pending_trace.elapsed_ms = millis() - pending_trace.started_at;
+  pending_trace.success = pending_trace.routes_found > 0;
+  if (!pending_trace.success) {
+    if (pending_trace.probes_sent == 0 && pending_trace.pool_misses > 0) {
+      pending_trace.fail = TRACE_FAIL_POOL;
+    } else if (pending_trace.probes_sent == 0 && pending_trace.tx_failures > 0) {
+      pending_trace.fail = TRACE_FAIL_TX;
+    } else {
+      pending_trace.fail = TRACE_FAIL_NO_ROUTE;
+    }
+  }
+  if (pending_trace.reply_remote) {
+    pending_trace.phase = TRACE_PHASE_REPORT;
+    pending_trace.report_candidate = pending_trace.report_part = pending_trace.report_path_pos = 0;
+    pending_trace.next_report_at = futureMillis(1);
+    pending_trace.report_deadline = futureMillis(TRACE_REPORT_MAX_MILLIS);
+  } else {
+    pending_trace.phase = TRACE_PHASE_DONE;
+  }
+}
+
+bool MyMesh::emitTraceProgress(const char* line, bool remote_too) {
+  if (!pending_trace.reply_remote) {
+    Serial.print("  -> ");
+    Serial.println(line);
+    return true;
+  } else if (remote_too) {
+    return sendRemoteCliLine(pending_trace.requester, pending_trace.requester_path_hash_size,
+                             pending_trace.cli_prefix, line, CLI_REPLY_DELAY_MILLIS,
+                             pending_trace.requester_scope_valid ? &pending_trace.requester_scope : NULL);
+  }
+  return true;
+}
+
+void MyMesh::formatTraceRouteHeader(char* out, const TraceResult& result, uint8_t route_no) const {
+  char responder[TRACE_RESPONDER_HASH_SIZE * 2 + 1];
+  mesh::Utils::toHex(responder, result.responder, TRACE_RESPONDER_HASH_SIZE);
+  sprintf(out, "route %u/%u node=%s replies=%u last_snr=%.2f",
+          (unsigned)route_no, (unsigned)pending_trace.routes_found, responder,
+          (unsigned)result.replies, result.last_snr / 4.0f);
+}
+
+uint8_t MyMesh::formatTracePathChunk(char* out, size_t out_sz, const TraceResult& result,
+                                     bool back, uint8_t start) const {
+  uint8_t path_len = back ? result.back_path_len : result.out_path_len;
+  const uint8_t* path = back ? result.back_path : result.out_path;
+  uint8_t count = path_len & 63;
+  uint8_t hash_size = (path_len >> 6) + 1;
+  char* p = out;
+  char* limit = out + out_sz - 8;
+  p += sprintf(p, "%s%s:", back ? "back" : "out", start ? "+" : " ");
+
+  if (count == 0) {
+    strcpy(p, " direct");
+    return 0;
+  }
+  uint8_t pos = start;
+  while (pos < count && p + 1 + hash_size * 2 < limit) {
+    *p++ = (pos == start) ? ' ' : '/';
+    mesh::Utils::toHex(p, &path[pos * hash_size], hash_size);
+    p += hash_size * 2;
+    pos++;
+  }
+  if (pos < count) strcpy(p, " ..");
+  else *p = 0;
+  return pos;
+}
+
+void MyMesh::formatTraceSummary(char* out) const {
+  if (pending_trace.success) {
+    sprintf(out, "%u routes replied, responses=%u probes=%u elapsed=%lus",
+            (unsigned)pending_trace.routes_found, (unsigned)pending_trace.responses_received,
+            (unsigned)pending_trace.probes_sent,
+            (unsigned long)(pending_trace.elapsed_ms / 1000));
+  } else if (pending_trace.fail == TRACE_FAIL_POOL) {
+    sprintf(out, "Err - packet pool empty (%u attempts)", (unsigned)pending_trace.pool_misses);
+  } else if (pending_trace.fail == TRACE_FAIL_TX) {
+    sprintf(out, "Err - radio queue/send failed (%u attempts)", (unsigned)pending_trace.tx_failures);
+  } else {
+    sprintf(out, "no route found - target unreachable or guest login refused (%u probes)",
+            (unsigned)pending_trace.probes_sent);
+  }
+}
+
+void MyMesh::emitTraceLine(const char* line, char* reply) {
+  if (reply) {
+    strcpy(reply, line);
+  } else {
+    Serial.print("  -> ");
+    Serial.println(line);
+  }
+}
+
+bool MyMesh::sendNextTraceReportLine() {
+  char line[140];
+  if (pending_trace.success && pending_trace.report_candidate < pending_trace.routes_found) {
+    const TraceResult& result = pending_trace.results[pending_trace.report_candidate];
+    uint8_t next_pos = pending_trace.report_path_pos;
+    if (pending_trace.report_part == 0) {
+      formatTraceRouteHeader(line, result, pending_trace.report_candidate + 1);
+    } else {
+      next_pos = formatTracePathChunk(line, sizeof(line), result,
+                                     pending_trace.report_part == 2,
+                                     pending_trace.report_path_pos);
+    }
+
+    if (!sendRemoteCliLine(pending_trace.requester, pending_trace.requester_path_hash_size,
+                           pending_trace.cli_prefix, line, CLI_REPLY_DELAY_MILLIS,
+                           pending_trace.requester_scope_valid ? &pending_trace.requester_scope : NULL)) {
+      return false;
+    }
+
+    if (pending_trace.report_part == 0) {
+      pending_trace.report_part = 1;
+      pending_trace.report_path_pos = 0;
+    } else {
+      uint8_t path_len = pending_trace.report_part == 2 ? result.back_path_len : result.out_path_len;
+      uint8_t count = path_len & 63;
+      if (next_pos >= count) {
+        pending_trace.report_path_pos = 0;
+        if (pending_trace.report_part == 1) pending_trace.report_part = 2;
+        else {
+          pending_trace.report_part = 0;
+          pending_trace.report_candidate++;
+        }
+      } else {
+        pending_trace.report_path_pos = next_pos;
+      }
+    }
+    return true;
+  }
+
+  formatTraceSummary(line);
+  if (!sendRemoteCliLine(pending_trace.requester, pending_trace.requester_path_hash_size,
+                         pending_trace.cli_prefix, line, CLI_REPLY_DELAY_MILLIS,
+                         pending_trace.requester_scope_valid ? &pending_trace.requester_scope : NULL)) {
+    return false;
+  }
+  endTraceSession();
+  return true;
+}
+
+void MyMesh::reportTrace(char* reply) {
+  char line[140];
+  if (pending_trace.success) {
+    for (uint8_t i = 0; i < pending_trace.routes_found; i++) {
+      const TraceResult& result = pending_trace.results[i];
+      formatTraceRouteHeader(line, result, i + 1);
+      emitTraceLine(line, NULL);
+
+      for (uint8_t leg = 0; leg < 2; leg++) {
+        uint8_t path_len = leg ? result.back_path_len : result.out_path_len;
+        uint8_t count = path_len & 63;
+        uint8_t pos = 0;
+        do {
+          uint8_t next = formatTracePathChunk(line, sizeof(line), result, leg != 0, pos);
+          emitTraceLine(line, NULL);
+          if (next == pos && count > 0) break;
+          pos = next;
+        } while (pos < count);
+      }
+    }
+  }
+  formatTraceSummary(line);
+  emitTraceLine(line, reply);
+}
+
+void MyMesh::endTraceSession() {
+  memset(pending_trace.target_secret, 0, sizeof(pending_trace.target_secret));
+  memset(pending_trace.sent, 0, sizeof(pending_trace.sent));
+  pending_trace.session_active = false;
+  pending_trace.reply_remote = false;
+  pending_trace.phase = TRACE_PHASE_IDLE;
+  pending_trace.cli_prefix[0] = 0;
+}
+
+void MyMesh::runLocalTraceSession(char* reply) {
+  while (pending_trace.phase == TRACE_PHASE_PROBE) {
+    driveTrace();
+    if (pending_trace.phase != TRACE_PHASE_PROBE) break;
+    loop();
+    delay(1);
+  }
+  reportTrace(reply);
+  endTraceSession();
 }
 
 uint8_t MyMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood) {
@@ -1183,6 +1714,8 @@ void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
 }
 
 void MyMesh::logTx(mesh::Packet *pkt, int len) {
+  noteTraceTx(pkt, true);
+
 #ifdef WITH_BRIDGE
   if (_prefs.bridge_pkt_src == 0) {
     bridge.sendPacket(pkt);
@@ -1208,6 +1741,8 @@ void MyMesh::logTx(mesh::Packet *pkt, int len) {
 }
 
 void MyMesh::logTxFail(mesh::Packet *pkt, int len) {
+  noteTraceTx(pkt, false);
+
   if (_logging) {
     File f = openAppend(PACKET_LOG_FILE);
     if (f) {
@@ -1277,20 +1812,38 @@ void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const m
 
 int MyMesh::searchPeersByHash(const uint8_t *hash) {
   int n = 0;
+  bool target_is_in_acl = false;
   for (int i = 0; i < acl.getNumClients(); i++) {
-    if (acl.getClientByIdx(i)->id.isHashMatch(hash)) {
-      matching_peer_indexes[n++] = i; // store the INDEXES of matching contacts (for subsequent 'peer' methods)
+    if (pending_trace.session_active && acl.getClientByIdx(i)->id.matches(pending_trace.target)) {
+      target_is_in_acl = true;
     }
+    if (acl.getClientByIdx(i)->id.isHashMatch(hash)) {
+      if (n < MAX_CLIENTS) {
+        matching_peer_indexes[n++] = i; // store the INDEXES of matching contacts (for subsequent 'peer' methods)
+      }
+    }
+  }
+
+  // A full public key is enough for this source to derive ECDH without persisting/evicting an
+  // ACL entry. The target independently applies its existing ACL/guest login policy.
+  if (pending_trace.session_active && pending_trace.phase == TRACE_PHASE_PROBE
+      && !target_is_in_acl && pending_trace.target.isHashMatch(hash)
+      && n < MAX_CLIENTS + 1) {
+    matching_peer_indexes[n++] = TRACE_TRANSIENT_PEER_INDEX;
   }
   return n;
 }
 
 void MyMesh::getPeerSharedSecret(uint8_t *dest_secret, int peer_idx) {
   int i = matching_peer_indexes[peer_idx];
-  if (i >= 0 && i < acl.getNumClients()) {
+  if (i == TRACE_TRANSIENT_PEER_INDEX && pending_trace.session_active
+      && pending_trace.phase == TRACE_PHASE_PROBE) {
+    memcpy(dest_secret, pending_trace.target_secret, PUB_KEY_SIZE);
+  } else if (i >= 0 && i < acl.getNumClients()) {
     // lookup pre-calculated shared_secret
     memcpy(dest_secret, acl.getClientByIdx(i)->shared_secret, PUB_KEY_SIZE);
   } else {
+    memset(dest_secret, 0, PUB_KEY_SIZE);
     MESH_DEBUG_PRINTLN("getPeerSharedSecret: Invalid peer idx: %d", i);
   }
 }
@@ -1298,33 +1851,31 @@ void MyMesh::getPeerSharedSecret(uint8_t *dest_secret, int peer_idx) {
 void MyMesh::onTraceRecv(mesh::Packet* packet, uint32_t tag, uint32_t auth_code, uint8_t flags,
                          const uint8_t* path_snrs, const uint8_t* path_hashes, uint8_t path_len) {
   (void)auth_code;
+  if (pending_ping.active && tag == pending_ping.tag) {
+    uint8_t path_sz = 1 << (flags & 0x03);
+    if (path_len < path_sz || (path_len % path_sz) != 0) {
+      return;
+    }
 
-  if (!pending_ping.active || tag != pending_ping.tag) {
+    uint8_t hop_count = path_len / path_sz;
+    if (memcmp(path_hashes, pending_ping.target.pub_key, path_sz) != 0 || hop_count == 0) {
+      return;
+    }
+
+    pending_ping.success = true;
+    pending_ping.remote_snr = (int8_t)path_snrs[0];
+    pending_ping.local_snr = (int8_t)(packet->getSNR() * 4.0f);
+    pending_ping.last_rtt = millis() - pending_ping.started_at;
+    pending_ping.active = false;  // this in-flight ping is resolved
+
+    if (pending_ping.reply_remote) {
+      completePingAndAdvance();   // remote: accumulate, reply, fire next or summarise
+    }
+    // local: runLocalPingSession() drives the session forward
     return;
   }
 
-  uint8_t path_sz = 1 << (flags & 0x03);
-  if (path_len < path_sz || (path_len % path_sz) != 0) {
-    return;
-  }
-
-  uint8_t hop_count = path_len / path_sz;
-  if (memcmp(path_hashes, pending_ping.target.pub_key, path_sz) != 0 || hop_count == 0) {
-    return;
-  }
-
-  pending_ping.success = true;
-  pending_ping.remote_snr = (int8_t)path_snrs[0];
-  pending_ping.local_snr = (int8_t)(packet->getSNR() * 4.0f);
-  pending_ping.last_rtt = millis() - pending_ping.started_at;
-  pending_ping.active = false;  // this in-flight ping is resolved
-
-  if (pending_ping.reply_remote) {
-    completePingAndAdvance();   // remote: accumulate, reply, fire next or summarise
-  }
-  // local: runLocalPingSession() drives the session forward
 }
-
 static bool isShare(const mesh::Packet *packet) {
   if (packet->hasTransportCodes()) {
     return packet->transport_codes[0] == 0 && packet->transport_codes[1] == 0;  // codes { 0, 0 } means 'send to nowhere'
@@ -1462,16 +2013,68 @@ bool MyMesh::onPeerPathRecv(mesh::Packet *packet, int sender_idx, const uint8_t 
                             uint8_t path_len, uint8_t extra_type, uint8_t *extra, uint8_t extra_len) {
   // TODO: prevent replay attacks
   int i = matching_peer_indexes[sender_idx];
+  ClientInfo* client = NULL;
+  mesh::Identity responder;
 
-  if (i >= 0 && i < acl.getNumClients()) { // get from our known_clients table (sender SHOULD already be known in this context)
-    MESH_DEBUG_PRINTLN("PATH to client, path_len=%d", (uint32_t)path_len);
-    auto client = acl.getClientByIdx(i);
-
-    // store a copy of path, for sendDirect()
-    client->out_path_len = mesh::Packet::copyPath(client->out_path, path, path_len);
-    client->last_activity = getRTCClock()->getCurrentTime();
+  if (i == TRACE_TRANSIENT_PEER_INDEX && pending_trace.session_active
+      && pending_trace.phase == TRACE_PHASE_PROBE) {
+    responder = pending_trace.target;
+  } else if (i >= 0 && i < acl.getNumClients()) {
+    client = acl.getClientByIdx(i);
+    responder = client->id;
   } else {
     MESH_DEBUG_PRINTLN("onPeerPathRecv: invalid peer idx: %d", i);
+    return false;
+  }
+
+  if (pending_trace.session_active && pending_trace.phase == TRACE_PHASE_PROBE
+      && packet->isRouteFlood() && responder.matches(pending_trace.target)
+      && extra_type == PAYLOAD_TYPE_RESPONSE) {
+    // A login response is authenticated by the PATH ECDH/MAC, but unlike a telemetry response it
+    // does not reflect our request timestamp. Recognize both the current response layout and the
+    // old "OK" marker, then consume the oldest outstanding login probe. The route is still exact;
+    // only a per-probe RTT would be ambiguous, so trace deliberately does not report one.
+    // The official companion keys only on byte 4. Older targets used byte 5 for a non-zero
+    // keep-alive interval, so it must not be constrained here.
+    bool login_ok = extra_len >= 5 && extra[4] == RESP_SERVER_LOGIN_OK;
+    bool legacy_login_ok = extra_len >= 6 && extra[4] == 'O' && extra[5] == 'K';
+    TraceProbeRec* rec = NULL;
+    if (login_ok || legacy_login_ok) {
+      uint8_t response_hash[MAX_HASH_SIZE];
+      packet->calculatePacketHash(response_hash);
+      bool already_seen = false;
+      for (uint8_t j = 0; j < pending_trace.sent_count; j++) {
+        if (pending_trace.sent[j].response_seen
+            && memcmp(pending_trace.sent[j].response_hash, response_hash, MAX_HASH_SIZE) == 0) {
+          already_seen = true;
+          break;
+        }
+      }
+      if (!already_seen) {
+        for (uint8_t j = 0; j < pending_trace.sent_count; j++) {
+          if (pending_trace.sent[j].active && pending_trace.sent[j].transmitted
+              && !millisHasNowPassed(pending_trace.sent[j].expires_at)) {
+            rec = &pending_trace.sent[j];
+            memcpy(rec->response_hash, response_hash, MAX_HASH_SIZE);
+            rec->response_seen = true;
+            break;
+          }
+        }
+      }
+      if (rec) {
+        recordTraceResponse(packet, responder, path, path_len);
+        rec->active = false;  // one useful PATH per unique login flood
+        // Restore the target's source route, which its flood login deliberately invalidated.
+        return true;  // Mesh sends the standard reciprocal PATH directly along the outward path
+      }
+      return false;  // duplicate/stale login response during this discovery window
+    }
+  }
+
+  if (client) {
+    MESH_DEBUG_PRINTLN("PATH to client, path_len=%d", (uint32_t)path_len);
+    client->out_path_len = mesh::Packet::copyPath(client->out_path, path, path_len);
+    client->last_activity = getRTCClock()->getCurrentTime();
   }
 
   // NOTE: no reciprocal path send!!
@@ -1576,12 +2179,12 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   active_cli_path_hash_size = PATH_HASH_SIZE;
   clearFloodRetryState();
   memset(&pending_ping, 0, sizeof(pending_ping));
+  memset(&pending_trace, 0, sizeof(pending_trace));
   recv_pkt_region = NULL;
 
 #if MAX_NEIGHBOURS
   memset(neighbours, 0, sizeof(neighbours));
 #endif
-
   // defaults
   _prefs.airtime_factor = 1.0;
   _prefs.rx_delay_base = 0.0f;   // turn off by default, was 10.0;
@@ -2039,6 +2642,20 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
         runLocalPingSession(reply);  // blocks, prints each ping, returns the summary
       }
     }
+  } else if (strcmp(command, "trace") == 0) {
+    strcpy(reply, "Err - need contact prefix or full pubkey");
+  } else if (memcmp(command, "trace ", 6) == 0) {
+    char* arg = command + 6;
+    while (*arg == ' ') arg++;
+
+    bool reply_remote = sender_timestamp != 0 && active_cli_client != NULL;
+    if (startTraceSession(arg, reply_remote, cli_prefix, reply)) {
+      if (reply_remote) {
+        if (reply[0] == 0) reply_start[0] = 0;  // start line was queued asynchronously
+      } else {
+        runLocalTraceSession(reply);  // blocks, prints the route, returns the summary
+      }
+    }
   } else if (memcmp(command, "set flood.maxretry ", 19) == 0) {
     int val = atoi(command + 19);
     if (val < 1 || val > 10) {
@@ -2090,6 +2707,11 @@ void MyMesh::loop() {
     }
   }
 
+  // drive an in-progress remote (async) trace session; a local one is driven by its own loop
+  if (pending_trace.session_active && pending_trace.reply_remote) {
+    driveTrace();
+  }
+
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
     mesh::Packet *pkt = createSelfAdvert();
     uint32_t delay_millis = 0;
@@ -2130,6 +2752,7 @@ void MyMesh::loop() {
 
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
+  if (pending_ping.session_active || pending_trace.session_active) return true;
 #if defined(WITH_BRIDGE)
   if (bridge.isRunning()) return true;  // bridge needs WiFi radio, can't sleep
 #endif

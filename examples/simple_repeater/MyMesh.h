@@ -98,6 +98,89 @@ struct PendingPing {
   int8_t local_snr;          // multiplied by 4
 };
 
+#define TRACE_MIN_PREFIX_SIZE        2
+#define TRACE_RESPONDER_HASH_SIZE    6
+#define TRACE_DISCOVERY_PROBES       3
+#define TRACE_MAX_RESULTS            TRACE_DISCOVERY_PROBES
+#define TRACE_TRANSIENT_PEER_INDEX  -1
+
+#define TRACE_PHASE_IDLE        0
+#define TRACE_PHASE_PROBE       1   // flood discovery probes are being sent/collected
+#define TRACE_PHASE_DONE        2
+#define TRACE_PHASE_REPORT      3   // remote result lines are being queued one at a time
+
+#define TRACE_FAIL_NONE         0
+#define TRACE_FAIL_NO_ROUTE     1   // no authenticated PATH response arrived during the window
+#define TRACE_FAIL_POOL         2
+#define TRACE_FAIL_TX           3   // local radio queue timeout or physical send failure
+
+// One unique legacy blank-login flood probe. The encrypted payload hash identifies the queued
+// packet; the PATH response itself does not reflect the request tag.
+struct TraceProbeRec {
+  uint8_t packet_hash[MAX_HASH_SIZE];
+  uint8_t response_hash[MAX_HASH_SIZE];
+  unsigned long expires_at;
+  bool active;
+  bool transmitted;             // expires_at is armed by logTx(), not queue time
+  bool response_seen;            // rejects the same PATH again after seen-table eviction
+};
+
+// One real request/response path pair. Both path_len values use MeshCore's packed normal
+// flood descriptor and the byte arrays contain relay hashes only (not either endpoint).
+struct TraceResult {
+  uint8_t responder[TRACE_RESPONDER_HASH_SIZE];
+  uint8_t out_path_len;
+  uint8_t out_path[MAX_PATH_SIZE];
+  uint8_t back_path_len;
+  uint8_t back_path[MAX_PATH_SIZE];
+  uint8_t replies;
+  int8_t last_snr;               // x4, final response link into this node
+};
+
+// A trace session discovers routes without knowing any relay in advance. Three standard blank
+// login ANON_REQ floods each provoke a PATH on a compatible target. Every PATH embeds the request's
+// outward path, and its own packet.path supplies the observed return.
+struct PendingTrace {
+  bool session_active;
+  uint8_t phase;                 // TRACE_PHASE_*
+  uint8_t fail;                  // TRACE_FAIL_*, when the session ends without a result
+  bool reply_remote;             // results go to a remote admin client (async) vs local serial (blocking)
+  bool success;
+  mesh::Identity target;
+  uint8_t target_secret[PUB_KEY_SIZE];
+  mesh::Identity requester;
+  uint8_t requester_path_hash_size;
+  TransportKey requester_scope;
+  bool requester_scope_valid;
+  char cli_prefix[10];
+
+  TraceResult results[TRACE_MAX_RESULTS];
+  uint8_t routes_found;
+  uint8_t responses_received;
+
+  // --- three unique flood probes, paced from actual radio transmission ---
+  uint8_t next_probe;
+  uint8_t probes_sent;
+  unsigned long next_probe_at;
+  unsigned long deadline;        // when the last probe still in flight gives up
+  bool has_deadline;              // deadline may legitimately equal zero at millis() wrap
+  unsigned long hard_deadline;   // bounds queue congestion and the complete probe phase
+  bool tx_pending;                // exactly one discovery probe is queued but not yet transmitted
+  TraceProbeRec sent[TRACE_DISCOVERY_PROBES];
+  uint8_t sent_count;
+  uint8_t pool_misses;
+  uint8_t tx_failures;
+  unsigned long started_at;
+  uint32_t elapsed_ms;           // frozen when probing ends; excludes paced remote reporting
+
+  // --- paced remote report; lines are generated from results[] and retried on pool pressure ---
+  uint8_t report_candidate;
+  uint8_t report_part;
+  uint8_t report_path_pos;
+  unsigned long next_report_at;
+  unsigned long report_deadline;
+};
+
 #ifndef FIRMWARE_BUILD_DATE
   #define FIRMWARE_BUILD_DATE   "9 Aug 2026"
 #endif
@@ -155,13 +238,15 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   NeighbourInfo neighbours[MAX_NEIGHBOURS];
 #endif
   PendingPing pending_ping;
+  PendingTrace pending_trace;
   CayenneLPP telemetry;
   unsigned long set_radio_at, revert_radio_at;
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;
   uint8_t pending_cr;
-  int  matching_peer_indexes[MAX_CLIENTS];
+  // One extra slot lets a full-key trace target act as a transient peer without changing the ACL.
+  int  matching_peer_indexes[MAX_CLIENTS + 1];
   ClientInfo* active_cli_client;
   uint8_t active_cli_path_hash_size;
   FloodRetryEntry _flood_retry[8];
@@ -194,6 +279,30 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void runLocalPingSession(char* reply);
   void formatPingLine(char* out) const;
   void formatPingSummary(char* out) const;
+  bool sendRemoteCliLine(const mesh::Identity& requester, uint8_t path_hash_size, const char* cli_prefix,
+                         const char* text, uint32_t delay_millis, const TransportKey* scope = NULL);
+  void beginTraceSession(bool reply_remote, const char* cli_prefix);
+  bool resolveTraceTarget(const char* destination, mesh::Identity& target, char* error_reply);
+  bool startTraceSession(const char* destination, bool reply_remote, const char* cli_prefix, char* error_reply);
+  mesh::Packet* createTraceDiscoveryProbe(uint32_t tag);
+  bool isPendingTraceProbe(const mesh::Packet* packet, bool unsent_only) const;
+  void recordTraceResponse(mesh::Packet* packet, const mesh::Identity& responder,
+                           const uint8_t* out_path, uint8_t out_path_len);
+  void driveTrace();
+  void sendNextTraceProbe();
+  void noteTraceTx(mesh::Packet* packet, bool success);
+  void cancelPendingTraceTx();
+  void finishTrace();
+  bool emitTraceProgress(const char* line, bool remote_too);
+  void formatTraceRouteHeader(char* out, const TraceResult& result, uint8_t route_no) const;
+  uint8_t formatTracePathChunk(char* out, size_t out_sz, const TraceResult& result,
+                               bool back, uint8_t start) const;
+  void formatTraceSummary(char* out) const;
+  void emitTraceLine(const char* line, char* reply);
+  bool sendNextTraceReportLine();
+  void reportTrace(char* reply);
+  void endTraceSession();
+  void runLocalTraceSession(char* reply);
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);

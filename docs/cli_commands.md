@@ -147,6 +147,60 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 
 ---
 
+### Discover flood routes to a repeater (Repeater Only)
+
+**Usage:**
+
+- `trace <contact_prefix_or_pubkey>`
+
+**Parameters:**
+
+- `contact_prefix_or_pubkey`: an even-length hexadecimal contact prefix (4 to 62 characters), or a complete 64-character public key
+
+For a prefix, exactly one entry in the repeater's local client/contact ACL must match. A complete public key can be supplied directly and does not need to be stored in the source ACL.
+
+`trace` does not require a cached route or knowledge of the intermediate relays. It sends three independent blank-login `ANON_REQ` packets as standard route floods. Existing relays append their routing hashes. A compatible target that accepts the login returns a standard `PATH` flood: its encrypted body contains the outward path received by the target, while the response packet records the return path. The login exchange is the probe itself, so no separate manual login is required.
+
+```
+> trace 1a2b
+  -> trace 1a2b7c9d1234: flooding 3 guest login probes
+  -> guest login probe 1/3 sent
+  -> guest login probe 2/3 sent
+  -> guest login probe 3/3 sent
+  -> route 1/2 node=1a2b7c9d1234 replies=2 last_snr=-6.50
+  -> out : 7a31/98fe
+  -> back: 2bc0
+  -> route 2/2 node=1a2b7c9d1234 replies=1 last_snr=-8.25
+  -> out : direct
+  -> back: direct
+2 routes replied, responses=3 probes=3 elapsed=76s
+```
+
+- `node` is the first six bytes of the resolved target public key.
+- `out` lists the relays traversed by the request.
+- `back` lists the relays traversed by the response.
+- The local and target endpoints are not included. `direct` means that no relay was recorded on that leg.
+- Long paths continue on `out+:` or `back+:` lines.
+- `last_snr` is measured locally on the retained response's final link. Per-hop SNR is not available.
+- `responses` counts authenticated login `PATH` replies received during the trace window. Identical outward/return-path pairs are deduplicated.
+- Login replies do not reflect the probe identifier, so this command deliberately does not report a potentially misleading per-probe RTT.
+
+**Timing:** Probes are scheduled eight seconds apart from their actual radio transmissions. The collection window remains open until 60 seconds after the last transmitted probe, so an uncongested trace normally completes about 76 seconds after the first transmission. The complete discovery phase has a hard 90-second limit.
+
+**Multiple routes:** Each flood is first-copy-wins and normally produces at most one outward/return path pair. The three unique probes may follow different propagation trees, so the command reports every distinct pair that answered during the collection window. This is sampling, not an exhaustive topology scan.
+
+**Compatibility and authorization:** Only the source repeater needs this `trace` command. Intermediate relays and a `simple_repeater` target use the existing MeshCore anonymous-login/`PATH` behavior and require no trace-specific firmware. On a target with a normal non-empty admin password, the blank login is accepted when either the target already has the source repeater's identity in its ACL (guest, read-only, or admin) or its guest password is blank. Therefore an unknown source can trace a repeater with open guest access without logging in first. If guest access is protected and the source is not already known by the target, the refusal is silent and the command times out with no route. Supplying the target's complete public key lets the source derive the ECDH secret; it does not bypass a closed guest policy. Other target roles are not supported by this command: the probe contains a room-login discriminator to avoid an accidental full-history room synchronization, and sensors do not admit an unknown source with a blank password. A room configured to accept every password as read-only may still accept the probe according to its existing policy.
+
+On `simple_repeater`, accepting an unknown source as guest creates a RAM-only guest ACL entry. It is not saved, but if the target's ACL is full, adding it can evict an existing entry (the eviction logic prefers the least-active non-admin entry). If the source is unknown and the target's admin password itself is blank, its normal login rules grant admin instead; `trace` does not override that configuration. Each accepted response sends the standard reciprocal `PATH`, restoring the route cache that a flood login invalidates.
+
+**Path hashes:** Relay hash width follows `path.hash.mode`: values `0`, `1`, and `2` use one-, two-, and three-byte hashes respectively. Short hashes can collide and therefore do not prove a relay's full identity.
+
+**Security limitations:** The request and the embedded outward path use the existing ECDH/MAC protection. A current or legacy authenticated login-success marker is required before a reply is collected, and duplicate response payloads are rejected locally. The login response does not echo the request tag, so a different genuine login response from the target arriving during the active window cannot be tied cryptographically to one particular probe. The packet-level return path is observed from the response flood and is not covered by the encrypted body. Route hashes remain routing hints rather than cryptographic identities.
+
+**Remote use:** Probes use the source repeater's default flood scope. A local serial invocation waits while continuing to service the mesh. A remote admin invocation reports asynchronously in its recognized incoming scope; if that scope is unavailable, it uses the requester's cached direct path or an unscoped flood. Result lines are paced and retried under packet-pool pressure, with a 60-second reporting limit.
+
+---
+
 ## Statistics
 
 ### Clear Stats
