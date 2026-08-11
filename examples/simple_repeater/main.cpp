@@ -1,6 +1,9 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
-
+#ifdef MLK_PIN_SERIAL_RX
+// Boards that route the repeater console to a UART instead of USB CDC.
+#define Serial Serial2
+#endif
 #include "MyMesh.h"
 
 #ifdef DISPLAY_CLASS
@@ -27,8 +30,18 @@ static char command[160];
 static char ethernet_command[160];
 #endif
 
+// Suppress the echo of a command that is about to detach USB: printing to a
+// detached CDC endpoint blocks until it times out.
+static bool isUsbOffCommand(const char *cmd) {
+  while (*cmd == ' ') cmd++;
+  if (strlen(cmd) > 3 && cmd[2] == '|') cmd += 3;   // optional 'xx|' CLI prefix
+  while (*cmd == ' ') cmd++;
+  return strcmp(cmd, "usb off") == 0;
+}
+
 // For power saving
-unsigned long POWERSAVING_FIRSTSLEEP_SECS = 120; // The first sleep (if enabled) from boot
+static unsigned long lastActive = 0;        // last time there was work to do
+static unsigned long nextSleepinSecs = 60;  // first low-power entry is 1 minute after boot
 
 #if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_)
 static unsigned long userBtnDownAt = 0;
@@ -36,6 +49,10 @@ static unsigned long userBtnDownAt = 0;
 #endif
 
 void setup() {
+#ifdef MLK_PIN_SERIAL_RX
+  Serial.setRX(MLK_PIN_SERIAL_RX);
+  Serial.setTX(MLK_PIN_SERIAL_TX);
+#endif
   Serial.begin(115200);
   delay(1000);
 
@@ -134,25 +151,29 @@ void loop() {
     }
     if (c == '\r') break;
   }
-  if (len == sizeof(command)-1) {  // command buffer full
-    command[sizeof(command)-1] = '\r';
+  if (len == sizeof(command)-1) {  // command buffer full: force end-of-line at the last
+    command[sizeof(command)-2] = '\r';  // data slot, keeping the '\0' at [size-1] intact
   }
 
   if (len > 0 && command[len - 1] == '\r') {  // received complete line
     Serial.print('\n');
     command[len - 1] = 0;  // replace newline with C string null terminator
+    bool is_usb_off = isUsbOffCommand(command);
     char reply[160];
     reply[0] = 0;
 #ifdef ETHERNET_ENABLED
     if (!ethernet_handle_command(command, reply)) {
       the_mesh.handleCommand(0, command, reply);
     }
-#else
-    the_mesh.handleCommand(0, command, reply);  // NOTE: there is no sender_timestamp via serial!
-#endif
     if (reply[0]) {
       Serial.print("  -> "); Serial.println(reply);
     }
+#else
+    the_mesh.handleCommand(0, command, reply);  // NOTE: there is no sender_timestamp via serial!
+    if (reply[0] && !is_usb_off) {   // USB is already detached, do not block on the echo
+      Serial.print("  -> "); Serial.println(reply);
+    }
+#endif
 
     command[0] = 0;  // reset command buffer
   }
@@ -195,12 +216,19 @@ void loop() {
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.loop();
 #endif
-  if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
+  if (the_mesh.getNodePrefs()->powersaving_enabled) {
 #if defined(NRF52_PLATFORM)
-    board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
+    if (!the_mesh.hasPendingWork()) {
+      board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
+    }
 #else
-    if (the_mesh.millisHasNowPassed(POWERSAVING_FIRSTSLEEP_SECS * 1000)) { // To check if it is time to sleep
-      board.sleep(30); // Sleep. Wake up after a while or when receiving a LoRa packet
+    if (the_mesh.hasPendingWork()) {
+      lastActive = millis();   // keep postponing while work is pending
+    } else if (the_mesh.millisHasNowPassed(lastActive + nextSleepinSecs * 1000)) {
+      board.sleep(30);     // boards with no wake timer ignore 'secs': they drop to the low
+                           // clock / USB-off profile and keep receiving. See WaveshareBoard::sleep().
+      lastActive = millis();
+      nextSleepinSecs = 5; // re-evaluate 5s after each low-power entry
     }
 #endif
   }
