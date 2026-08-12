@@ -122,6 +122,11 @@ TASKS = [
      "Builds the environments the integration is proven against. A clean merge "
      "proves nothing - rerere replays wrong resolutions as happily as right ones."),
 
+    ("stack-push", _restack("push"),
+     "5. Push to origin",
+     "Force-pushes the seven branches and patch_public. Shows what moves and asks "
+     "first. It cannot tell whether you ran step 4 - if you did not, say no."),
+
     ("stack-tests", _run_tools_tests,
      "Run tools unit tests",
      "The Python tests carried by tools/companion-tools."),
