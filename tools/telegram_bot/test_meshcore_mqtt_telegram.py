@@ -7,9 +7,6 @@ import types
 import unittest
 from pathlib import Path
 
-from cryptography.hazmat.primitives.ciphers import Cipher
-from cryptography.hazmat.primitives.ciphers import algorithms, modes
-
 
 try:
     import paho.mqtt.client  # noqa: F401
@@ -29,6 +26,12 @@ except ModuleNotFoundError:
 try:
     from Crypto.Cipher import AES  # noqa: F401
 except ModuleNotFoundError:
+    # pycryptodome is what the bot itself uses (see requirements.txt). Only when it
+    # is missing do we fall back to 'cryptography', so importing it at module level
+    # would make a fallback into a hard dependency of the whole test file.
+    from cryptography.hazmat.primitives.ciphers import Cipher
+    from cryptography.hazmat.primitives.ciphers import algorithms, modes
+
     class _AesEcbCipher:
         def __init__(self, key: bytes):
             self._cipher = Cipher(algorithms.AES(key), modes.ECB())
