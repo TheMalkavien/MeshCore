@@ -316,14 +316,28 @@ replay of a resolution recorded on someone's laptop.
 CI never rebases and never pushes. A rebase needs judgement and a force push;
 that stays local.
 
-> **The nightly run will not fire yet.** GitHub only honours `schedule:` for
-> workflow files on the repository's **default branch**, which here is `main`.
-> The workflow currently lives on `packaging/mlk-defaults`, so only its `push`
-> and `workflow_dispatch` triggers work. To get the nightly, either put a copy of
-> the workflow on `main`, or make `patch_public` the default branch.
->
-> GitHub also disables scheduled workflows after 60 days without repository
-> activity — re-arm from the Actions tab with *Run workflow*.
+### Why `patch_public` is the fork's default branch
+
+GitHub only honours `schedule:` for workflow files on the repository's **default
+branch**. The workflow is authored on `packaging/mlk-defaults` and reaches
+`patch_public` through the integration merge, so making `patch_public` the
+default is what arms the nightly run. It also means a clone of the fork lands on
+the firmware you actually ship, which is the point of the fork.
+
+Two consequences of that choice, neither serious:
+
+- The default branch gets **force-pushed** at every `integrate`. Anyone who
+  cloned needs `git fetch && git reset --hard origin/patch_public` rather than a
+  plain `git pull`. On a personal fork that is fine.
+- Opening a PR **to upstream** pre-fills the head branch with the fork's default,
+  i.e. `patch_public` — which is never what you want. Switch it to the feature
+  branch in the PR form.
+
+`github-pages.yml` is unaffected: it only triggers on push to `main`.
+
+> GitHub disables scheduled workflows after 60 days without repository activity.
+> If the fork goes quiet the nightly stops silently — re-arm it from the Actions
+> tab with *Run workflow*.
 
 ---
 
