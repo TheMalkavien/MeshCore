@@ -79,12 +79,42 @@ themselves. It is all-or-nothing: let the script do all seven, or none.
 
 ## 3. From VSCode
 
-Nothing to install. Git Bash ships with Git for Windows and the tasks pin it
-explicitly, so your terminal can stay on PowerShell. The script re-execs itself
-from a copy outside the working tree, so it works from any branch even though it
-only exists on `packaging/mlk-defaults`.
+Nothing to install. Git Bash ships with Git for Windows and both task runners
+below pin it explicitly, so your terminal can stay on PowerShell. The script
+re-execs itself from a copy outside the working tree, so it works from any
+branch even though it only exists on `packaging/mlk-defaults`.
 
-`Ctrl+Shift+P` → **Tasks: Run Task** →
+### PlatformIO — Project Tasks
+
+The PlatformIO sidebar → **Project Tasks** → environment **`stack`** → group
+**Custom**:
+
+```
+stack
+└─ Custom
+   ├─ 1. Check (read-only)
+   ├─ 2. Rebase onto upstream
+   ├─ 3. Regenerate patch_public
+   ├─ 4. Build integration
+   └─ Run tools unit tests
+```
+
+`stack` is a dummy environment declared at the top of the root `platformio.ini`.
+It builds no firmware; PlatformIO has no project-level custom task list, so a
+custom target has to belong to *some* environment. Being in the root file rather
+than in a `variants/*/platformio.ini` puts it at the head of the list instead of
+somewhere among the 500-odd board environments.
+
+Equivalent from a terminal: `pio run -e stack -t stack-check` (or
+`-t stack-rebase`, `-t stack-integrate`, `-t stack-build`, `-t stack-tests`).
+
+The tests target deliberately runs under a Python *outside* PlatformIO's own
+venv: the bot's dependencies belong in your environment, not in PlatformIO's.
+If it reports a missing module it prints the `pip install` line to fix it.
+
+### Plain VSCode tasks
+
+Same commands without PlatformIO — `Ctrl+Shift+P` → **Tasks: Run Task** →
 
 | task | what it does | destructive? |
 |---|---|---|

@@ -132,7 +132,12 @@ do_integrate() {
       "$(git log -1 --format=%s "$INTEGRATION" | cut -c1-60)"
     if [ -z "${RESTACK_YES:-}" ]; then
       printf '  continue? [y/N] '
-      read -r answer </dev/tty || answer=n
+      # /dev/tty when there is one (a task runner may not give us one), else stdin.
+      if [ -r /dev/tty ]; then
+        read -r answer </dev/tty || answer=n
+      else
+        read -r answer || answer=n
+      fi
       case "$answer" in [yY]*) ;; *) echo "  aborted"; exit 1 ;; esac
     fi
   fi
