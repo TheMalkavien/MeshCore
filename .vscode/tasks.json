@@ -47,6 +47,13 @@
       "problemMatcher": "$gcc"
     },
     {
+      "label": "Stack: push to origin",
+      "detail": "Force-pushes the seven branches and patch_public. Asks first, and cannot tell whether you built - if you did not, say no.",
+      "type": "shell",
+      "command": "./tools/restack.sh push",
+      "problemMatcher": []
+    },
+    {
       "label": "Stack: update from upstream (full)",
       "detail": "check, rebase, regenerate, build. Stops at the first failure.",
       "type": "shell",

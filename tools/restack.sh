@@ -6,7 +6,8 @@
 #   ./tools/restack.sh check       what would move, and whether the merge still applies cleanly
 #   ./tools/restack.sh rebase      restack every branch onto its parent
 #   ./tools/restack.sh integrate   regenerate the integration branch from the stack
-#   ./tools/restack.sh all         rebase, then integrate
+#   ./tools/restack.sh push        force-push the whole set to origin (asks first)
+#   ./tools/restack.sh all         rebase, then integrate - never push
 #
 # The integration branch is REGENERATED, never merged into incrementally: its
 # history is disposable, the branches are the source of truth. Dropping a feature
@@ -76,6 +77,24 @@ require_clean_tree() {
 branch_of() { echo "${1%%:*}" | xargs; }
 parent_of() { echo "${1##*:}" | xargs; }
 
+# Asks unless RESTACK_YES is set. Reads /dev/tty when there is one (a task runner
+# does not always give you one), else stdin.
+confirm() {
+  [ -n "${RESTACK_YES:-}" ] && return 0
+  printf '  %s [y/N] ' "$1"
+  local answer=""
+  # Prefer the terminal, so a piped stdin cannot answer for you. Falling back to
+  # stdin covers task runners that give no tty. Anything but an explicit yes -
+  # empty line, EOF, no input at all - aborts.
+  # 2>/dev/null comes first on purpose: redirections apply left to right, so it
+  # has to be in place before the /dev/tty open is attempted, or the failure
+  # message escapes to the real stderr.
+  if ! read -r answer 2>/dev/null </dev/tty; then
+    read -r answer 2>/dev/null || answer=""
+  fi
+  case "$answer" in [yY]*) return 0 ;; *) echo "  aborted"; exit 1 ;; esac
+}
+
 record_refs() {
   say "current tips (recover with: git branch -f <branch> <sha>)"
   for b in "${MERGE_ORDER[@]}"; do
@@ -130,16 +149,7 @@ do_integrate() {
     printf '  %s is at %s (%s)\n' "$INTEGRATION" \
       "$(git rev-parse --short "$INTEGRATION")" \
       "$(git log -1 --format=%s "$INTEGRATION" | cut -c1-60)"
-    if [ -z "${RESTACK_YES:-}" ]; then
-      printf '  continue? [y/N] '
-      # /dev/tty when there is one (a task runner may not give us one), else stdin.
-      if [ -r /dev/tty ]; then
-        read -r answer </dev/tty || answer=n
-      else
-        read -r answer || answer=n
-      fi
-      case "$answer" in [yY]*) ;; *) echo "  aborted"; exit 1 ;; esac
-    fi
+    confirm "continue?"
   fi
   local tmp="refs/heads/_restack_tmp"
   git branch -f _restack_tmp "$BASE" >/dev/null
@@ -165,6 +175,47 @@ do_integrate() {
   echo "  NOTE: this rewrites $INTEGRATION. Branches that descend from it"
   echo "        (mqtt_espnow_multibridge, HTv4LowPower, ...) need re-basing too."
   echo "  NOTE: nothing is pushed, and nothing is built. Build before you trust it."
+}
+
+# Publishes the whole set. Deliberately NOT part of 'all': a push is the one step
+# that cannot be undone for anyone who has already pulled, and it only makes sense
+# once the integration has been built - which this cannot know.
+do_push() {
+  require_clean_tree
+  git fetch origin --quiet
+
+  local refs=("${MERGE_ORDER[@]}" "$INTEGRATION")
+  local changed=0 b local_sha remote_sha
+
+  say "to push to origin"
+  for b in "${refs[@]}"; do
+    local_sha=$(git rev-parse --short "$b")
+    if git rev-parse --verify --quiet "origin/$b" >/dev/null; then
+      remote_sha=$(git rev-parse --short "origin/$b")
+    else
+      remote_sha=""
+    fi
+    if [ -z "$remote_sha" ]; then
+      printf '  %-34s %s  (new branch)\n' "$b" "$local_sha"; changed=1
+    elif [ "$local_sha" = "$remote_sha" ]; then
+      printf '  %-34s %s  unchanged\n' "$b" "$local_sha"
+    else
+      printf '  %-34s %s -> %s  (force)\n' "$b" "$remote_sha" "$local_sha"; changed=1
+    fi
+  done
+
+  if [ "$changed" -eq 0 ]; then
+    echo
+    echo "  nothing to push"
+    return 0
+  fi
+
+  echo
+  echo "  This rewrites published history. Anyone who cloned needs a reset, not a pull."
+  echo "  It also cannot tell whether you have BUILT the integration. If you have not, stop."
+  echo
+  confirm "push?"
+  git push --force-with-lease origin "${refs[@]}"
 }
 
 # Read-only: does each branch still apply, and does the whole set still merge?
@@ -203,6 +254,7 @@ case "${1:-check}" in
   check)     do_check ;;
   rebase)    do_rebase ;;
   integrate) do_integrate ;;
-  all)       do_rebase; do_integrate ;;
+  push)      do_push ;;
+  all)       do_rebase; do_integrate ;;   # deliberately no push - see do_push()
   *)         sed -n '3,18p' "$0"; exit 1 ;;
 esac

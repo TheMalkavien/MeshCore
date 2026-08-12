@@ -221,16 +221,23 @@ git checkout feature/repeater-flood-retry
 
 ### Pushing
 
-All seven branches were rewritten, so they need a force push. Use
-`--force-with-lease`, never plain `--force`: it refuses if someone (or another
-machine of yours) pushed in the meantime.
-
 ```bash
-git push --force-with-lease origin \
-  feature/core-enhancements feature/repeater-ping feature/repeater-flood-retry \
-  feature/rp2040-lowpower feature/lora-ota tools/companion-tools \
-  packaging/mlk-defaults patch_public
+./tools/restack.sh push
 ```
+
+All seven branches were rewritten, so this is a force push. It lists what moves,
+warns that it cannot tell whether you built, and asks before doing anything. It
+uses `--force-with-lease`, never plain `--force`: that refuses if someone (or
+another machine of yours) pushed in the meantime.
+
+**Push all of them, not just `patch_public`.** The branches are the source of
+truth; leaving them behind on origin gives you an up-to-date integration sitting
+on stale branches, and the next `check` from another machine starts from the
+wrong place. That is why `push` takes the whole set rather than a branch name.
+
+It is deliberately **not** part of `all`. A push is the one step that cannot be
+undone for anyone who has already pulled, and it only makes sense once the
+integration has been built — which the script has no way to know.
 
 ---
 
