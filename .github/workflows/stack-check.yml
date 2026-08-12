@@ -152,5 +152,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      # The bot's own dependencies, so the tests run against what actually ships
+      # rather than against a fallback path.
+      - run: pip install -r tools/telegram_bot/requirements.txt
       - run: python -m unittest discover -s tools -p 'test_*.py' -t tools -v
       - run: python -m unittest discover -s tools/telegram_bot -p 'test_*.py' -t tools/telegram_bot -v
