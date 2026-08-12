@@ -1,5 +1,6 @@
 #include "EnvironmentSensorManager.h"
 #include <Wire.h>
+#include <stdlib.h>
 
 #if ENV_INCLUDE_GPS
   #if defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
@@ -22,15 +23,20 @@
     #define GPS_SLEEP_BETWEEN_UPDATES 0
   #endif
 
+  // The signed-delta deadline comparison is unambiguous for delays below
+  // INT32_MAX milliseconds. Keep the public setting deliberately narrower and
+  // aligned with the companion preference limit (24 hours).
+  #ifndef GPS_MAX_UPDATE_INTERVAL_SEC
+    #define GPS_MAX_UPDATE_INTERVAL_SEC 86400UL
+  #endif
+  static_assert(GPS_MAX_UPDATE_INTERVAL_SEC <= (INT32_MAX / 1000UL),
+      "GPS update interval must stay below the signed millis() deadline range");
+
   #if GPS_FORCE_COLD_RESET_ON_INTERVAL
     #define GPS_INTERVAL_START_MODE "cold"
   #else
     #define GPS_INTERVAL_START_MODE "hot"
   #endif
-
-static inline bool isTimeReached(uint32_t now_ms, uint32_t target_ms) {
-  return (int32_t)(now_ms - target_ms) >= 0;
-}
 
   #if defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
 static esp_pm_lock_handle_t s_gps_no_light_sleep_lock = nullptr;
@@ -656,6 +662,15 @@ bool EnvironmentSensorManager::begin() {
   #endif
   #endif
 
+  // Persistent/board-managed GPS variants may have enabled the receiver during
+  // their initialization. Give them the same immediate first-fix semantics as
+  // a GPS enabled later through setSettingValue().
+  #if ENV_INCLUDE_GPS
+  if (gps_active) {
+    gps_update_schedule.scheduleNow(millis());
+  }
+  #endif
+
   #if ENV_PIN_SDA && ENV_PIN_SCL
     #ifdef NRF52_PLATFORM
   Wire1.setPins(ENV_PIN_SDA, ENV_PIN_SCL);
@@ -756,8 +771,37 @@ bool EnvironmentSensorManager::setSettingValue(const char* name, const char* val
     return true;
   }
   if (strcmp(name, "gps_interval") == 0) {
-    uint32_t interval_seconds = atoi(value);
-    gps_update_interval_sec = interval_seconds > 0 ? interval_seconds : 1;
+    if (value == nullptr || value[0] == '\0' || value[0] == '-') {
+      return false;
+    }
+
+    char* end = nullptr;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || parsed > GPS_MAX_UPDATE_INTERVAL_SEC) {
+      return false;
+    }
+
+    gps_update_interval_sec = static_cast<uint32_t>(parsed);
+
+    // Zero deliberately cancels automatic repeats. A fix already in progress
+    // is allowed to finish; endGPSFixWindow() will leave it unscheduled.
+    const uint32_t now_ms = millis();
+    if (!gps_active) {
+      gps_update_schedule.cancel();
+    } else if (gps_update_interval_sec == 0) {
+      // Keep an already-due initial acquisition, but cancel every future
+      // periodic deadline. This makes zero a true one-shot setting.
+      if (!gps_update_schedule.isDue(now_ms)) {
+        gps_update_schedule.cancel();
+      }
+    } else if (!gps_fix_window_active) {
+      // applyGpsPrefs() enables GPS before applying its interval. Preserve the
+      // already-due first fix instead of postponing it by a full interval;
+      // future/absent periodic deadlines are safely re-based from now.
+      if (!gps_update_schedule.isDue(now_ms)) {
+        gps_update_schedule.scheduleAfter(now_ms, gps_update_interval_sec);
+      }
+    }
     return true;
   }
   #endif
@@ -993,13 +1037,13 @@ void EnvironmentSensorManager::endGPSFixWindow(bool fixed) {
 }
 
 bool EnvironmentSensorManager::isGPSFixWindowExpired(uint32_t now_ms) const {
-  return isTimeReached(now_ms, gps_fix_window_deadline_ms);
+  return GPSUpdateSchedule::timeReached(now_ms, gps_fix_window_deadline_ms);
 }
 
 void EnvironmentSensorManager::start_gps() {
   gps_active = true;
   gps_fix_window_active = false;
-  next_gps_update_ms = 0;
+  gps_update_schedule.scheduleNow(millis());
 
   #if defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
     setGPSPMLightSleep(true);
@@ -1029,6 +1073,7 @@ void EnvironmentSensorManager::start_gps() {
 void EnvironmentSensorManager::stop_gps() {
   gps_active = false;
   gps_fix_window_active = false;
+  gps_update_schedule.cancel();
 
   #if defined(ESP_PLATFORM) && defined(CONFIG_PM_ENABLE)
     setGPSPMLightSleep(true);
@@ -1050,38 +1095,6 @@ void EnvironmentSensorManager::stop_gps() {
 
 #if ENV_INCLUDE_GPS || defined(ENV_INCLUDE_BME680_BSEC)
 void EnvironmentSensorManager::loop() {
-  #if ENV_INCLUDE_GPS
-  _location->loop();
-  const uint32_t now_ms = millis();
-
-  bool gps_ready = gps_active;
-
-#ifdef RAK_WISBLOCK_GPS
-  gps_ready = gps_ready && (i2cGPSFlag || serialGPSFlag);
-#endif
-
-  if (gps_ready && gps_fix_window_active) {
-    if (_location->isValid()) {
-      updateLocationFromFix();
-      endGPSFixWindow(true);
-      next_gps_update_ms = now_ms + (gps_update_interval_sec * 1000UL);
-    } else if (isGPSFixWindowExpired(now_ms)) {
-      endGPSFixWindow(false);
-      next_gps_update_ms = now_ms + (gps_update_interval_sec * 1000UL);
-    }
-  } else if (gps_ready && isTimeReached(now_ms, next_gps_update_ms)) {
-#if GPS_SLEEP_BETWEEN_UPDATES
-    beginGPSFixWindow();
-#else
-    if (_location->isValid()) {
-      updateLocationFromFix();
-      next_gps_update_ms = now_ms + (gps_update_interval_sec * 1000UL);
-    } else {
-      beginGPSFixWindow();
-    }
-#endif
-  }
-  #endif
   #if ENV_INCLUDE_BME680_BSEC
   if (bsec_active && bsec_iaq.run()) {
     uint8_t prev_accuracy = bsec_accuracy;
@@ -1104,5 +1117,51 @@ void EnvironmentSensorManager::loop() {
     }
   }
   #endif  // ENV_INCLUDE_BME680_BSEC
+
+  #if ENV_INCLUDE_GPS
+  _location->loop();
+  uint32_t now_ms = millis();
+
+  if (!gps_active) {
+    return;
+  }
+
+#ifdef RAK_WISBLOCK_GPS
+  if (!(i2cGPSFlag || serialGPSFlag)) {
+    return;
+  }
+#endif
+
+  if (gps_fix_window_active) {
+    if (_location->isValid()) {
+      updateLocationFromFix();
+      endGPSFixWindow(true);
+      gps_update_schedule.scheduleAfter(now_ms, gps_update_interval_sec);
+    } else if (isGPSFixWindowExpired(now_ms)) {
+      endGPSFixWindow(false);
+      gps_update_schedule.scheduleAfter(now_ms, gps_update_interval_sec);
+    }
+    return;
+  }
+
+  if (!gps_update_schedule.isDue(now_ms)) {
+    return;
+  }
+  // Consume before starting work. The acquisition completion path explicitly
+  // schedules the next cycle, or leaves it empty for one-shot interval zero.
+  gps_update_schedule.consume();
+
+#if GPS_SLEEP_BETWEEN_UPDATES
+  beginGPSFixWindow();
+  return;
+#endif
+
+  if (_location->isValid()) {
+    updateLocationFromFix();
+    gps_update_schedule.scheduleAfter(now_ms, gps_update_interval_sec);
+  } else {
+    beginGPSFixWindow();
+  }
+  #endif
 }
 #endif // ENV_INCLUDE_GPS || ENV_INCLUDE_BME680_BSEC

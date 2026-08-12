@@ -2,6 +2,7 @@
 
 #include <Mesh.h>
 #include <helpers/SensorManager.h>
+#include <helpers/sensors/GPSUpdateSchedule.h>
 #include <helpers/sensors/LocationProvider.h>
 
 class EnvironmentSensorManager : public SensorManager {
@@ -21,11 +22,12 @@ protected:
 
   bool     gps_detected = false;
   bool     gps_active = false;
-  uint32_t gps_update_interval_sec = 1;
+  // Zero means one acquisition after GPS is enabled, with no automatic repeat.
+  uint32_t gps_update_interval_sec = 0;
 
   #if ENV_INCLUDE_GPS
   LocationProvider* _location;
-  uint32_t next_gps_update_ms = 0;
+  GPSUpdateSchedule gps_update_schedule;
   bool gps_fix_window_active = false;
   uint32_t gps_fix_window_deadline_ms = 0;
   void start_gps();

@@ -2,6 +2,8 @@
 
 #include <Arduino.h> // needed for PlatformIO
 #include <Mesh.h>
+#include <helpers/radiolib/RXPowerSaving.h>
+
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -863,6 +865,115 @@ uint32_t MyMesh::calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8_t
 
 void MyMesh::onSendTimeout() {}
 
+namespace {
+constexpr uint32_t PENDING_RESPONSE_GRACE_MS = 5000UL;
+constexpr uint32_t PENDING_RESPONSE_MAX_MS = 60UL * 60UL * 1000UL;
+
+#if defined(RXPS_DEFAULT_ENABLED) && RXPS_DEFAULT_ENABLED && !defined(WITH_SX1262_RX_POWER_SAVING)
+#error "RXPS_DEFAULT_ENABLED requires WITH_SX1262_RX_POWER_SAVING"
+#endif
+
+#if defined(RXPS_DEFAULT_LEVEL)
+constexpr uint8_t RXPS_COMPANION_DEFAULT_LEVEL = RXPS_DEFAULT_LEVEL;
+#else
+constexpr uint8_t RXPS_COMPANION_DEFAULT_LEVEL = meshcore::rxps::BALANCED_LEVEL;
+#endif
+
+#if defined(RXPS_DEFAULT_PREAMBLE)
+constexpr uint8_t RXPS_COMPANION_DEFAULT_PREAMBLE = RXPS_DEFAULT_PREAMBLE;
+#else
+constexpr uint8_t RXPS_COMPANION_DEFAULT_PREAMBLE = meshcore::rxps::BALANCED_PREAMBLE;
+#endif
+
+static_assert(RXPS_COMPANION_DEFAULT_LEVEL >= meshcore::rxps::MIN_LEVEL &&
+                  RXPS_COMPANION_DEFAULT_LEVEL <= meshcore::rxps::MAX_LEVEL,
+              "RXPS_DEFAULT_LEVEL must be between 1 and 10");
+static_assert(RXPS_COMPANION_DEFAULT_PREAMBLE == 16 || RXPS_COMPANION_DEFAULT_PREAMBLE == 32,
+              "RXPS_DEFAULT_PREAMBLE must be 16 or 32");
+
+#if defined(RXPS_DEFAULT_ENABLED)
+constexpr uint8_t RXPS_COMPANION_DEFAULT_ENABLED = RXPS_DEFAULT_ENABLED ? 1 : 0;
+#else
+constexpr uint8_t RXPS_COMPANION_DEFAULT_ENABLED = 0;
+#endif
+
+// External FEM receive-path LNA. Boards without one report canControlLoRaFemLna()
+// == false and the preference is inert. On the Heltec V4.3 the KCT8103L LNA costs
+// roughly 6 mA of continuous RX current, which is why LoRaFEMControl has always
+// come up in bypass on this firmware. Default to that existing behaviour so
+// adding the preference cannot silently raise consumption; builds that would
+// rather trade current for sensitivity set RADIO_FEM_RXGAIN_DEFAULT=1.
+#if defined(RADIO_FEM_RXGAIN_DEFAULT)
+constexpr uint8_t FEM_RXGAIN_COMPANION_DEFAULT = RADIO_FEM_RXGAIN_DEFAULT ? 1 : 0;
+#else
+// Preserve the upstream companion default outside explicitly tuned low-power
+// profiles. Those profiles set RADIO_FEM_RXGAIN_DEFAULT=0 themselves.
+constexpr uint8_t FEM_RXGAIN_COMPANION_DEFAULT = 1;
+#endif
+} // namespace
+
+void MyMesh::armPendingReqTimeout(uint32_t estimated_timeout_ms) {
+  uint32_t wait_ms = estimated_timeout_ms;
+  if (wait_ms > PENDING_RESPONSE_MAX_MS - PENDING_RESPONSE_GRACE_MS) {
+    wait_ms = PENDING_RESPONSE_MAX_MS;
+  } else {
+    wait_ms += PENDING_RESPONSE_GRACE_MS;
+  }
+  pending_req_expiry_ms = millis() + wait_ms;
+  // Zero is reserved for "not armed" and is otherwise possible at millis wrap.
+  if (pending_req_expiry_ms == 0) pending_req_expiry_ms = 1;
+}
+
+void MyMesh::expirePendingReqs() {
+  if (!hasPendingReqs()) {
+    pending_req_expiry_ms = 0;
+    return;
+  }
+
+  // A response can no longer be delivered once the companion disconnects.
+  // Also bound stale tags so they cannot match an unrelated much-later reply.
+  if ((_serial && !_serial->isConnected()) ||
+      (pending_req_expiry_ms != 0 && (int32_t)(millis() - pending_req_expiry_ms) >= 0)) {
+    clearPendingReqs();
+  }
+}
+
+bool MyMesh::applyRxPowerSavingPrefs() {
+  uint32_t rx_us = meshcore::rxps::DEFAULT_RX_US;
+  uint32_t sleep_us = meshcore::rxps::DEFAULT_SLEEP_US;
+
+  if (_prefs.rx_ps_enabled &&
+      !meshcore::rxps::calculateLevel(_prefs.rx_ps_level, _prefs.sf, _prefs.bw,
+                                     _prefs.rx_ps_preamble, &rx_us, &sleep_us)) {
+    MESH_DEBUG_PRINTLN("RXPS: invalid profile level=%u preamble=%u sf=%u bw=%d",
+                       (unsigned)_prefs.rx_ps_level, (unsigned)_prefs.rx_ps_preamble,
+                       (unsigned)_prefs.sf, (int)_prefs.bw);
+    return false;
+  }
+
+  const bool ok = radio_driver.setRxPowerSaving(_prefs.rx_ps_enabled != 0, rx_us, sleep_us);
+  MESH_DEBUG_PRINTLN("RXPS: %s level=%u preamble=%u timings=%lu/%lu us (%s)",
+                     _prefs.rx_ps_enabled ? "on" : "off", (unsigned)_prefs.rx_ps_level,
+                     (unsigned)_prefs.rx_ps_preamble, (unsigned long)rx_us,
+                     (unsigned long)sleep_us, ok ? "applied" : "unsupported; continuous RX fallback");
+#if defined(HELTEC_LORA_V4)
+  if (_prefs.rx_ps_enabled) {
+    MESH_DEBUG_PRINTLN("RXPS: SX1262 only; the external Heltec FEM/LNA is not duty-cycled");
+  }
+#endif
+  return ok;
+}
+
+bool MyMesh::applyFemRxGainPrefs() {
+  if (!board.canControlLoRaFemLna()) return false;
+
+  const bool want = _prefs.radio_fem_rxgain != 0;
+  const bool ok = board.setLoRaFemLnaEnabled(want);
+  MESH_DEBUG_PRINTLN("FEM RX gain: %s (%s)", want ? "on" : "bypass",
+                     ok ? "applied" : "rejected by board");
+  return ok;
+}
+
 MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store, AbstractUITask* ui)
     : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables),
       _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _ui(ui), _iter(0) {
@@ -888,7 +999,10 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   _prefs.tx_power_dbm = LORA_TX_POWER;
   _prefs.gps_enabled = 0;       // GPS disabled by default
   _prefs.gps_interval = 0;      // No automatic GPS updates by default
-  _prefs.radio_fem_rxgain = 1;
+  _prefs.rx_ps_enabled = RXPS_COMPANION_DEFAULT_ENABLED;
+  _prefs.rx_ps_level = RXPS_COMPANION_DEFAULT_LEVEL;
+  _prefs.rx_ps_preamble = RXPS_COMPANION_DEFAULT_PREAMBLE;
+  _prefs.radio_fem_rxgain = FEM_RXGAIN_COMPANION_DEFAULT;
   _prefs.radio_fem_txgain = 0;
   //_prefs.rx_delay_base = 10.0f;  enable once new algo fixed
   _prefs.setRepeatEn(false);
@@ -950,6 +1064,40 @@ void MyMesh::begin(bool has_display) {
   _prefs.tx_power_dbm = constrain(_prefs.tx_power_dbm, -9, MAX_LORA_TX_POWER);
   _prefs.gps_enabled = constrain(_prefs.gps_enabled, 0, 1);  // Ensure boolean 0 or 1
   _prefs.gps_interval = constrain(_prefs.gps_interval, 0, 86400);  // Max 24 hours
+  _prefs.rx_boosted_gain = constrain(_prefs.rx_boosted_gain, 0, 1);
+  _prefs.rx_ps_enabled = constrain(_prefs.rx_ps_enabled, 0, 1);
+  if (_prefs.rx_ps_level < meshcore::rxps::MIN_LEVEL ||
+      _prefs.rx_ps_level > meshcore::rxps::MAX_LEVEL) {
+    _prefs.rx_ps_level = RXPS_COMPANION_DEFAULT_LEVEL;
+  }
+  if (_prefs.rx_ps_preamble != 16 && _prefs.rx_ps_preamble != 32) {
+    _prefs.rx_ps_preamble = RXPS_COMPANION_DEFAULT_PREAMBLE;
+  }
+  _prefs.radio_fem_rxgain = constrain(_prefs.radio_fem_rxgain, 0, 1);
+
+  // One-shot, append-only prefs migrations. Each step runs at most once and
+  // subsequent boots preserve every user choice, because the version is then
+  // current.
+  if (_prefs.prefs_format_version < 1) {
+    // v0 -> v1: old Heltec V4 low-power images had RX boosted gain enabled in
+    // their persisted file, overriding the newer build default.
+#if defined(HELTEC_V4_LOW_POWER_PROFILE)
+    _prefs.rx_boosted_gain = 0;
+#endif
+  }
+  if (_prefs.prefs_format_version < 2) {
+    // v1 -> v2: radio_fem_rxgain was appended, and RXPS moved from "always off
+    // on upgrade" to "adopt the build default". Both are receive-path changes,
+    // so they are applied together, once, and remain user-overridable after.
+    _prefs.rx_ps_enabled = RXPS_COMPANION_DEFAULT_ENABLED;
+    _prefs.rx_ps_level = RXPS_COMPANION_DEFAULT_LEVEL;
+    _prefs.rx_ps_preamble = RXPS_COMPANION_DEFAULT_PREAMBLE;
+    _prefs.radio_fem_rxgain = FEM_RXGAIN_COMPANION_DEFAULT;
+  }
+  if (_prefs.prefs_format_version < COMPANION_PREFS_FORMAT_VERSION) {
+    _prefs.prefs_format_version = COMPANION_PREFS_FORMAT_VERSION;
+    savePrefs();
+  }
 #ifdef BLE_PIN_CODE // 123456 by default
   if (_prefs.ble_pin == 0) {
 #ifdef DISPLAY_CLASS
@@ -978,8 +1126,9 @@ void MyMesh::begin(bool has_display) {
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
-  board.setLoRaFemLnaEnabled(_prefs.radio_fem_rxgain);
+  applyFemRxGainPrefs();
   board.setLoRaFemPaGainEnabled(_prefs.radio_fem_txgain);
+  applyRxPowerSavingPrefs();
   board.setAdcMultiplier(_prefs.adc_multiplier);  // re-apply saved ADC multiplier (0 = board default)
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
                      radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
@@ -1406,6 +1555,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       savePrefs();
 
       radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+      applyRxPowerSavingPrefs(); // level timings depend on SF and bandwidth
       MESH_DEBUG_PRINTLN("OK: CMD_SET_RADIO_PARAMS: f=%d, bw=%d, sf=%d, cr=%d", freq, bw, (uint32_t)sf,
                          (uint32_t)cr);
 
@@ -1541,6 +1691,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       } else {
         clearPendingReqs();
         memcpy(&pending_login, recipient->id.pub_key, 4); // match this to onContactResponse()
+        armPendingReqTimeout(est_timeout);
         out_frame[0] = RESP_CODE_SENT;
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &pending_login, 4);
@@ -1572,6 +1723,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       } else {
         clearPendingReqs();
         pending_req = tag; // match this to onContactResponse()
+        armPendingReqTimeout(est_timeout);
         out_frame[0] = RESP_CODE_SENT;
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &tag, 4);
@@ -1593,6 +1745,7 @@ void MyMesh::handleCmdFrame(size_t len) {
         clearPendingReqs();
         // FUTURE:  pending_status = tag;  // match this in onContactResponse()
         memcpy(&pending_status, recipient->id.pub_key, 4); // legacy matching scheme
+        armPendingReqTimeout(est_timeout);
         out_frame[0] = RESP_CODE_SENT;
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &tag, 4);
@@ -1622,6 +1775,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       } else {
         clearPendingReqs();
         pending_discovery = tag; // match this in onContactResponse()
+        armPendingReqTimeout(est_timeout);
         out_frame[0] = RESP_CODE_SENT;
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &tag, 4);
@@ -1642,6 +1796,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       } else {
         clearPendingReqs();
         pending_telemetry = tag; // match this in onContactResponse()
+        armPendingReqTimeout(est_timeout);
         out_frame[0] = RESP_CODE_SENT;
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &tag, 4);
@@ -1683,6 +1838,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       } else {
         clearPendingReqs();
         pending_req = tag; // match this in onContactResponse()
+        armPendingReqTimeout(est_timeout);
         out_frame[0] = RESP_CODE_SENT;
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &tag, 4);
@@ -1817,6 +1973,25 @@ void MyMesh::handleCmdFrame(size_t len) {
       strcpy(dp, sensors.getSettingValue(i));
       dp = strchr(dp, 0);
     }
+    if (radio_driver.supportsRxPowerSaving()) {
+      const size_t used = dp - (char *)&out_frame[1];
+      const size_t capacity = sizeof(out_frame) - 1;
+      if (used < capacity) {
+        const int written = snprintf(dp, capacity - used, "%srxps:%u,rxps_level:%u,rxps_preamble:%u",
+                                     used ? "," : "", (unsigned)_prefs.rx_ps_enabled,
+                                     (unsigned)_prefs.rx_ps_level, (unsigned)_prefs.rx_ps_preamble);
+        if (written > 0 && (size_t)written < capacity - used) dp += written;
+      }
+    }
+    if (board.canControlLoRaFemLna()) {
+      const size_t used = dp - (char *)&out_frame[1];
+      const size_t capacity = sizeof(out_frame) - 1;
+      if (used < capacity) {
+        const int written = snprintf(dp, capacity - used, "%sfem_rxgain:%u", used ? "," : "",
+                                     (unsigned)_prefs.radio_fem_rxgain);
+        if (written > 0 && (size_t)written < capacity - used) dp += written;
+      }
+    }
     _serial->writeFrame(out_frame, dp - (char *)out_frame);
   } else if (cmd_frame[0] == CMD_SET_CUSTOM_VAR && len >= 4) {
     cmd_frame[len] = 0;
@@ -1824,8 +1999,68 @@ void MyMesh::handleCmdFrame(size_t len) {
     char *np = strchr(sp, ':'); // look for separator char
     if (np) {
       *np++ = 0; // modify 'cmd_frame', replace ':' with null
-      bool success = sensors.setSettingValue(sp, np);
+      bool success = false;
+      bool save_radio_prefs = false;
+      if (strcmp(sp, "rxps") == 0 || strcmp(sp, "rxps_level") == 0 ||
+          strcmp(sp, "rxps_preamble") == 0) {
+        const uint8_t previous_enabled = _prefs.rx_ps_enabled;
+        const uint8_t previous_level = _prefs.rx_ps_level;
+        const uint8_t previous_preamble = _prefs.rx_ps_preamble;
+
+        if (strcmp(sp, "rxps") == 0) {
+          if (strcmp(np, "1") == 0 || strcmp(np, "on") == 0) {
+            _prefs.rx_ps_enabled = 1;
+            success = true;
+          } else if (strcmp(np, "0") == 0 || strcmp(np, "off") == 0) {
+            _prefs.rx_ps_enabled = 0;
+            success = true;
+          }
+        } else if (strcmp(sp, "rxps_level") == 0) {
+          const int level = atoi(np);
+          if (level >= meshcore::rxps::MIN_LEVEL && level <= meshcore::rxps::MAX_LEVEL) {
+            _prefs.rx_ps_level = (uint8_t)level;
+            success = true;
+          }
+        } else {
+          const int preamble = atoi(np);
+          if (preamble == 16 || preamble == 32) {
+            _prefs.rx_ps_preamble = (uint8_t)preamble;
+            success = true;
+          }
+        }
+
+        if (success && applyRxPowerSavingPrefs()) {
+          save_radio_prefs = true;
+        } else {
+          _prefs.rx_ps_enabled = previous_enabled;
+          _prefs.rx_ps_level = previous_level;
+          _prefs.rx_ps_preamble = previous_preamble;
+          applyRxPowerSavingPrefs();
+          success = false;
+        }
+      } else if (strcmp(sp, "fem_rxgain") == 0) {
+        const uint8_t previous = _prefs.radio_fem_rxgain;
+
+        if (strcmp(np, "1") == 0 || strcmp(np, "on") == 0) {
+          _prefs.radio_fem_rxgain = 1;
+          success = true;
+        } else if (strcmp(np, "0") == 0 || strcmp(np, "off") == 0) {
+          _prefs.radio_fem_rxgain = 0;
+          success = true;
+        }
+
+        if (success && applyFemRxGainPrefs()) {
+          save_radio_prefs = true;
+        } else {
+          _prefs.radio_fem_rxgain = previous;
+          applyFemRxGainPrefs();
+          success = false;
+        }
+      } else {
+        success = sensors.setSettingValue(sp, np);
+      }
       if (success) {
+        if (save_radio_prefs) savePrefs();
         #if ENV_INCLUDE_GPS == 1
         // Update node preferences for GPS settings
         if (strcmp(sp, "gps") == 0) {
@@ -2053,8 +2288,89 @@ void MyMesh::checkCLIRescueCmd() {
         _prefs.ble_pin = atoi(&config[4]);
         savePrefs();
         Serial.printf("  > pin is now %06d\n", _prefs.ble_pin);
+      } else if (memcmp(config, "rxps ", 5) == 0) {
+        const uint8_t previous_enabled = _prefs.rx_ps_enabled;
+        const uint8_t previous_level = _prefs.rx_ps_level;
+        const uint8_t previous_preamble = _prefs.rx_ps_preamble;
+        const char *arg = &config[5];
+        bool valid = true;
+
+        if (strcmp(arg, "off") == 0) {
+          _prefs.rx_ps_enabled = 0;
+        } else if (strcmp(arg, "on") == 0) {
+          _prefs.rx_ps_enabled = 1;
+        } else {
+          int level = 0;
+          int preamble = _prefs.rx_ps_preamble;
+          const int count = sscanf(arg, "%d %d", &level, &preamble);
+          valid = count >= 1 && level >= meshcore::rxps::MIN_LEVEL &&
+                  level <= meshcore::rxps::MAX_LEVEL && (preamble == 16 || preamble == 32);
+          if (valid) {
+            _prefs.rx_ps_enabled = 1;
+            _prefs.rx_ps_level = (uint8_t)level;
+            _prefs.rx_ps_preamble = (uint8_t)preamble;
+          }
+        }
+
+        if (!valid) {
+          Serial.println("  Error: use 'set rxps off|on|<level 1..10> [16|32]'");
+        } else if (applyRxPowerSavingPrefs()) {
+          savePrefs();
+          Serial.printf("  > rxps %s, level %u, preamble %u\n", _prefs.rx_ps_enabled ? "on" : "off",
+                        (unsigned)_prefs.rx_ps_level, (unsigned)_prefs.rx_ps_preamble);
+        } else {
+          _prefs.rx_ps_enabled = previous_enabled;
+          _prefs.rx_ps_level = previous_level;
+          _prefs.rx_ps_preamble = previous_preamble;
+          applyRxPowerSavingPrefs();
+          Serial.println("  Error: RX duty-cycle unsupported; continuous RX kept");
+        }
+      } else if (memcmp(config, "fem_rxgain ", 11) == 0) {
+        const uint8_t previous = _prefs.radio_fem_rxgain;
+        const char *arg = &config[11];
+        bool valid = true;
+
+        if (strcmp(arg, "off") == 0) {
+          _prefs.radio_fem_rxgain = 0;
+        } else if (strcmp(arg, "on") == 0) {
+          _prefs.radio_fem_rxgain = 1;
+        } else {
+          valid = false;
+        }
+
+        if (!valid) {
+          Serial.println("  Error: use 'set fem_rxgain on|off'");
+        } else if (applyFemRxGainPrefs()) {
+          savePrefs();
+          Serial.printf("  > fem_rxgain %s\n", _prefs.radio_fem_rxgain ? "on" : "off");
+        } else {
+          _prefs.radio_fem_rxgain = previous;
+          Serial.println("  Error: this board has no controllable FEM LNA");
+        }
       } else {
         Serial.printf("  Error: unknown config: %s\n", config);
+      }
+    } else if (strcmp(cli_command, "get rxps") == 0) {
+      uint32_t rx_us = 0;
+      uint32_t sleep_us = 0;
+      meshcore::rxps::calculateLevel(_prefs.rx_ps_level, _prefs.sf, _prefs.bw,
+                                    _prefs.rx_ps_preamble, &rx_us, &sleep_us);
+      Serial.printf("  > rxps %s, level %u, preamble %u, %lu/%lu us, armed=%s, wd=%lu/%lu\n",
+                    _prefs.rx_ps_enabled ? "on" : "off", (unsigned)_prefs.rx_ps_level,
+                    (unsigned)_prefs.rx_ps_preamble, (unsigned long)rx_us, (unsigned long)sleep_us,
+                    radio_driver.isRxPowerSavingArmed() ? "yes" : "no",
+                    (unsigned long)radio_driver.getRxPsWatchdogSoftCount(),
+                    (unsigned long)radio_driver.getRxPsWatchdogHardCount());
+#if defined(HELTEC_LORA_V4)
+      Serial.println("  > note: RXPS cycles the SX1262 only; the external FEM/LNA remains in its selected mode");
+#endif
+    } else if (strcmp(cli_command, "get fem_rxgain") == 0) {
+      if (board.canControlLoRaFemLna()) {
+        Serial.printf("  > fem_rxgain %s (board reports %s)\n",
+                      _prefs.radio_fem_rxgain ? "on" : "off",
+                      board.isLoRaFemLnaEnabled() ? "on" : "off");
+      } else {
+        Serial.println("  > fem_rxgain unsupported on this board");
       }
     } else if (strcmp(cli_command, "rebuild") == 0) {
       bool success = _store->formatFileSystem();
@@ -2236,9 +2552,8 @@ bool MyMesh::hasPendingWork() const {
   // (CMD_SYNC_NEXT_MESSAGE). When the phone is disconnected these frames can
   // never be delivered, so they must NOT keep the loop "busy" and block sleep.
   if (_serial && _serial->isConnected() && offline_queue_len > 0) return true;
-  // A deferred contacts save does not require "busy" pacing; allow idle/sleep
-  // between checks and commit only when the deadline is reached in loop().
-  if (pending_login || pending_status || pending_telemetry || pending_discovery || pending_req) return true;
+  // Waiting for a remote response is radio-idle work: DIO1 wakes us when it
+  // arrives, and expirePendingReqs() bounds stale request tags independently.
   if (_serial && _serial->isWriteBusy()) return true;
   return false;
 }
@@ -2251,6 +2566,8 @@ void MyMesh::loop() {
   } else {
     checkSerialInterface();
   }
+
+  expirePendingReqs();
 
   // is there are pending dirty contacts write needed?
   if (dirty_contacts_expiry && millisHasNowPassed(dirty_contacts_expiry)) {

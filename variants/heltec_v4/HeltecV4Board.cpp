@@ -1,4 +1,16 @@
 #include "HeltecV4Board.h"
+#include <driver/gpio.h>
+
+#if defined(CONFIG_PM_SLP_DISABLE_GPIO) && CONFIG_PM_SLP_DISABLE_GPIO
+static void configureSleepOutputPin(int pin) {
+  const gpio_num_t gpio = (gpio_num_t)pin;
+  // Select an explicit driven sleep state for the few controls that must not
+  // float. The actual HIGH/LOW value follows the normal GPIO output register.
+  (void)gpio_sleep_set_direction(gpio, GPIO_MODE_OUTPUT);
+  (void)gpio_sleep_set_pull_mode(gpio, GPIO_FLOATING);
+  (void)gpio_sleep_sel_en(gpio);
+}
+#endif
 
 static inline void biasInputPin(int pin, uint8_t mode) {
   if (pin < 0) return;
@@ -132,6 +144,17 @@ void HeltecV4Board::configureLowPowerPins() {
   biasInputPin(PIN_USER_BTN, INPUT_PULLUP);
 #endif
 
+#if defined(CONFIG_PM_SLP_DISABLE_GPIO) && CONFIG_PM_SLP_DISABLE_GPIO
+  // The IDF low-power profile isolates every GPIO by default. Keep the radio
+  // deselected and out of reset, keep the battery divider disabled, and retain
+  // the detected V4.2/V4.3 FEM state while automatic light sleep is active.
+  // All other pads continue to use the global disabled/floating sleep state.
+  configureSleepOutputPin(P_LORA_NSS);
+  configureSleepOutputPin(P_LORA_RESET);
+  configureSleepOutputPin(PIN_ADC_CTRL);
+  loRaFEMControl.configureLightSleepPins();
+#endif
+
   // Optional user-defined unused GPIO list (bias to GND). Keep this list
   // conservative: FEM, display and radio pins must never be listed here.
   // Example build_flags:
@@ -201,12 +224,16 @@ void HeltecV4Board::begin() {
 }
 
 void HeltecV4Board::onBeforeTransmit(void) {
-  digitalWrite(P_LORA_TX_LED, HIGH); // turn TX LED on
+#if !defined(DISABLE_TX_LED) || (DISABLE_TX_LED == 0)
+  digitalWrite(P_LORA_TX_LED, HIGH);
+#endif
   loRaFEMControl.setTxModeEnable();
 }
 
 void HeltecV4Board::onAfterTransmit(void) {
-  digitalWrite(P_LORA_TX_LED, LOW); // turn TX LED off
+#if !defined(DISABLE_TX_LED) || (DISABLE_TX_LED == 0)
+  digitalWrite(P_LORA_TX_LED, LOW);
+#endif
   loRaFEMControl.setRxModeEnable();
 }
 

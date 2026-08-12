@@ -233,11 +233,19 @@ void DataStore::loadPrefsInt(const char *filename, NodePrefs& _prefs) {
     file.read((uint8_t *)&_prefs.buzzer_quiet, sizeof(_prefs.buzzer_quiet));               // 84
     file.read((uint8_t *)&_prefs.gps_enabled, sizeof(_prefs.gps_enabled));                 // 85
     file.read((uint8_t *)&_prefs.gps_interval, sizeof(_prefs.gps_interval));               // 86
-    file.read((uint8_t *)&_prefs.autoadd_config, sizeof(_prefs.autoadd_config));           // 87
-    file.read((uint8_t *)&_prefs.autoadd_max_hops, sizeof(_prefs.autoadd_max_hops));       // 88
-    file.read((uint8_t *)&_prefs.rx_boosted_gain, sizeof(_prefs.rx_boosted_gain));         // 89
-    file.read((uint8_t *)_prefs.default_scope_name, sizeof(_prefs.default_scope_name));    // 90
-    file.read((uint8_t *)_prefs.default_scope_key, sizeof(_prefs.default_scope_key));     // 121
+    file.read((uint8_t *)&_prefs.autoadd_config, sizeof(_prefs.autoadd_config));           // 90
+    file.read((uint8_t *)&_prefs.autoadd_max_hops, sizeof(_prefs.autoadd_max_hops));       // 91
+    file.read((uint8_t *)&_prefs.rx_boosted_gain, sizeof(_prefs.rx_boosted_gain));         // 92
+    file.read((uint8_t *)_prefs.default_scope_name, sizeof(_prefs.default_scope_name));    // 93
+    file.read((uint8_t *)_prefs.default_scope_key, sizeof(_prefs.default_scope_key));      // 124
+    // Appended fields: an old file ends at 140, so force version 0 before the
+    // read while leaving RXPS values at the safe defaults set by MyMesh.
+    _prefs.prefs_format_version = 0;
+    file.read((uint8_t *)&_prefs.prefs_format_version, sizeof(_prefs.prefs_format_version)); // 140
+    file.read((uint8_t *)&_prefs.rx_ps_enabled, sizeof(_prefs.rx_ps_enabled));               // 141
+    file.read((uint8_t *)&_prefs.rx_ps_level, sizeof(_prefs.rx_ps_level));                   // 142
+    file.read((uint8_t *)&_prefs.rx_ps_preamble, sizeof(_prefs.rx_ps_preamble));             // 143
+    file.read((uint8_t *)&_prefs.radio_fem_rxgain, sizeof(_prefs.radio_fem_rxgain));         // 144
 
     // migrate old fields
     _prefs.setRepeatEn(_prefs._client_repeat != 0);

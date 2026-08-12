@@ -11,6 +11,7 @@
     #include <driver/rtc_io.h>
     #if defined(CONFIG_IDF_TARGET_ESP32S3)
       #include <soc/soc.h>
+      #include <soc/gpio_struct.h>
       #include <soc/usb_serial_jtag_reg.h>
       #include <soc/rtc_cntl_reg.h>
     #endif
@@ -231,6 +232,78 @@ static TaskHandle_t g_main_loop_task = NULL;
 static volatile uint32_t g_button_irq_count = 0;
 #endif
 
+#if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32S3)
+// gpio_wakeup_enable() deliberately changes the regular GPIO interrupt to a
+// level interrupt.  A level interrupt is required to wake from light sleep,
+// but SX1262 DIO1 remains high until the IRQ is serviced, so leaving it armed
+// would continuously re-enter the ISR.  The ISR disables the GPIO interrupt
+// with a single IRAM-safe register write.  The loop normally re-arms it after
+// the line is inactive, while an unlatched active level is delivered once.
+#if defined(P_LORA_DIO_1)
+static volatile bool g_lora_gpio_wake_armed = false;
+static volatile bool g_lora_active_level_latched = false;
+#endif
+#if defined(PIN_USER_BTN)
+static volatile bool g_button_gpio_wake_armed = false;
+static volatile bool g_button_active_level_latched = false;
+#endif
+
+static inline void IRAM_ATTR disableGPIOInterruptFromISR(gpio_num_t pin) {
+  // gpio_intr_disable() is not IRAM_ATTR in IDF 4.4.  This hook may run while
+  // the flash cache is disabled, so use the equivalent S3 GPIO register write.
+  GPIO.pin[(uint32_t)pin].int_ena = 0;
+}
+
+static bool armLevelWakeSafely(gpio_num_t pin, int active_level,
+                               gpio_int_type_t wake_type,
+                               gpio_int_type_t normal_type,
+                               volatile bool* armed,
+                               volatile bool* active_level_latched) {
+  if (*armed) return true;
+
+  // Switch atomically enough that an edge between the level check and enable
+  // is still observed: once wake_type is installed, an already-active level
+  // immediately raises the GPIO interrupt.
+  (void)gpio_intr_disable(pin);
+  (void)gpio_wakeup_disable(pin);
+  (void)gpio_set_intr_type(pin, normal_type);
+
+  const bool active = gpio_get_level(pin) == active_level;
+  if (active && *active_level_latched) {
+    // This level already ran its ISR and is still being serviced. Keep its
+    // interrupt disabled until the peripheral/button releases the line.
+    return false;
+  }
+  if (!active) *active_level_latched = false;
+
+  // Normally this arms an inactive line. If an unlatched level became active
+  // inside the switch window, enabling the level interrupt below immediately
+  // runs its ISR exactly once, so the edge cannot be lost.
+  *armed = true;
+  if (gpio_wakeup_enable(pin, wake_type) != ESP_OK) {
+    *armed = false;
+    (void)gpio_set_intr_type(pin, normal_type);
+  }
+  (void)gpio_intr_enable(pin);
+  return *armed;
+}
+
+static void armEventDrivenWakeSources(void) {
+#if defined(P_LORA_DIO_1)
+  (void)armLevelWakeSafely((gpio_num_t)P_LORA_DIO_1, HIGH,
+                           GPIO_INTR_HIGH_LEVEL, GPIO_INTR_POSEDGE,
+                           &g_lora_gpio_wake_armed,
+                           &g_lora_active_level_latched);
+#endif
+#if defined(PIN_USER_BTN)
+  (void)armLevelWakeSafely((gpio_num_t)PIN_USER_BTN, LOW,
+                           GPIO_INTR_LOW_LEVEL, GPIO_INTR_ANYEDGE,
+                           &g_button_gpio_wake_armed,
+                           &g_button_active_level_latched);
+#endif
+}
+#endif
+
 // Resume the loop from thread context (called by the BLE RX callback; overrides
 // the weak no-op in SerialBLEInterface.cpp).
 extern "C" void meshcore_wake_main_loop(void) {
@@ -250,11 +323,25 @@ static void IRAM_ATTR notifyMainLoopFromISR(void) {
 // IRAM_ATTR is mandatory: setFlag() runs from IRAM, and this may fire while the
 // flash cache is disabled (e.g. during a contacts save).
 extern "C" void IRAM_ATTR meshcore_on_lora_dio1_irq(void) {
+#if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32S3) && defined(P_LORA_DIO_1)
+  g_lora_active_level_latched = true;
+  if (g_lora_gpio_wake_armed) {
+    g_lora_gpio_wake_armed = false;
+    disableGPIOInterruptFromISR((gpio_num_t)P_LORA_DIO_1);
+  }
+#endif
   notifyMainLoopFromISR();
 }
 
 #if defined(PIN_USER_BTN)
 static void IRAM_ATTR onUserButtonEdge(void) {
+#if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32S3)
+  g_button_active_level_latched = true;
+  if (g_button_gpio_wake_armed) {
+    g_button_gpio_wake_armed = false;
+    disableGPIOInterruptFromISR((gpio_num_t)PIN_USER_BTN);
+  }
+#endif
   ++g_button_irq_count;
   notifyMainLoopFromISR();
 }
@@ -263,11 +350,9 @@ static void IRAM_ATTR onUserButtonEdge(void) {
 static void configureEventDrivenWakeSources(void) {
 #if defined(ESP_PLATFORM)
   // CONFIG_PM_SLP_DISABLE_GPIO isolates GPIOs during automatic light sleep.
-  // Keep event pins on their active configuration so their normal GPIO ISRs
-  // can wake the CPU. Do NOT use gpio_wakeup_enable() here: on ESP32-S3 it
-  // rewrites the pin interrupt type to HIGH/LOW level. For DIO1 that replaces
-  // RadioLib's rising-edge IRQ and causes an ISR storm while SX1262 DIO1 stays
-  // high at TX/RX completion.
+  // gpio_wakeup_enable() exempts event pins from that isolation and makes them
+  // real automatic-light-sleep wake sources.  The ISR/re-arm handshake above
+  // safely handles the level interrupt required by the ESP32-S3 wake hardware.
 #if defined(P_LORA_DIO_1)
   gpio_sleep_sel_dis((gpio_num_t)P_LORA_DIO_1);
 #endif
@@ -275,6 +360,11 @@ static void configureEventDrivenWakeSources(void) {
   pinMode(PIN_USER_BTN, INPUT_PULLUP);
   gpio_sleep_sel_dis((gpio_num_t)PIN_USER_BTN);
   attachInterrupt(digitalPinToInterrupt(PIN_USER_BTN), onUserButtonEdge, CHANGE);
+#endif
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  if (esp_sleep_enable_gpio_wakeup() == ESP_OK) {
+    armEventDrivenWakeSources();
+  }
 #endif
 #endif
 }
@@ -428,6 +518,7 @@ void setup() {
   board.onBootComplete();
 }
 
+
 void loop() {
   the_mesh.loop();
   interface_manager.loop();
@@ -461,7 +552,8 @@ void loop() {
   // capped deadline. With CONFIG_PM + tickless idle the SoC auto light-sleeps
   // during the wait; a genuine event resumes us immediately -> low power without
   // losing reactivity.
-  const bool busy = the_mesh.hasPendingWork() || interface_manager.isWriteBusy();
+  const bool busy = the_mesh.hasPendingWork() || interface_manager.isWriteBusy() ||
+                    radio_driver.isRxPowerSavingMaintenanceActive();
   bool gps_streaming = false;
   #if ENV_INCLUDE_GPS
     #if GPS_SLEEP_BETWEEN_UPDATES
@@ -494,13 +586,20 @@ void loop() {
     wait_ms = EVENT_LOOP_CONNECTED_MAX_MS;
   }
 #endif
+#if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32S3)
+  // RadioLib has consumed a completed IRQ by now and the button may have been
+  // released. Re-arm only inactive lines immediately before blocking so an
+  // event during tickless automatic light sleep wakes this task via its ISR.
+  armEventDrivenWakeSources();
+#endif
   const TickType_t ticks = pdMS_TO_TICKS(wait_ms);
   ulTaskNotifyTake(pdTRUE, ticks ? ticks : 1);           // cleared/short-circuited by any wake notification
 #elif defined(ESP32)
   // Preserve the legacy pacing for ESP32 companion profiles that do not opt in
   // to the event-driven low-power loop.
   const bool link_connected = interface_manager.isConnected();
-  const bool busy = the_mesh.hasPendingWork() || interface_manager.isWriteBusy();
+  const bool busy = the_mesh.hasPendingWork() || interface_manager.isWriteBusy() ||
+                    radio_driver.isRxPowerSavingMaintenanceActive();
 #if defined(BLE_PIN_CODE)
   const bool allow_manual_sleep = false;
 #else

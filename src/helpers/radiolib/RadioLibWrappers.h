@@ -2,6 +2,7 @@
 
 #include <Mesh.h>
 #include <RadioLib.h>
+#include "RXPowerSaving.h"
 
 #ifdef USE_CC310_HW_CRYPTO
 #include <Adafruit_nRFCrypto.h>
@@ -17,28 +18,97 @@ protected:
   mesh::MainBoard* _board;
   uint32_t n_recv, n_sent, n_recv_errors;
   int16_t _noise_floor, _threshold;
+  float _last_rssi, _last_snr;
   bool _cad_enabled;
   uint16_t _num_floor_samples;
   int32_t _floor_sample_sum;
   uint8_t _preamble_sf;
 
+  bool _rx_ps_enabled;
+  bool _rx_ps_armed;
+  bool _rx_hold_continuous;
+  uint32_t _rx_ps_rx_us;
+  uint32_t _rx_ps_sleep_us;
+
+  // A healthy SX1262 duty cycle produces BUSY transitions. The watchdog first
+  // performs a soft re-arm, then a hardware radio reset if the waveform stays
+  // stuck or receive mode repeatedly fails to start.
+  bool _wd_last_busy;
+  uint8_t _wd_stage;
+  uint8_t _wd_strikes;
+  uint8_t _startrx_fails;
+  unsigned long _wd_last_transition;
+  unsigned long _wd_stuck_thresh;
+  unsigned long _wd_observe_until;
+  uint32_t _wd_observe_ms;
+  uint32_t n_wd_soft, n_wd_hard;
+
+  // Runtime values reapplied after a watchdog hard reset.
+  float _cur_freq, _cur_bw;
+  uint8_t _cur_sf, _cur_cr;
+  int8_t _cur_dbm;
+  bool _params_valid, _dbm_valid;
+
+  // Duty-cycled RX cannot provide a trustworthy instantaneous noise floor
+  // during its sleep windows, so calibration briefly switches to continuous RX.
+  bool _nf_calib_active;
+  unsigned long _nf_last_calib;
+  unsigned long _nf_calib_deadline;
+  unsigned long _nf_sample_from;
+
   void idle();
   void startRecv();
+  void rxPsWatchdogCheck();
+  void noiseFloorCalibCheck();
+  void endNoiseFloorCalib(unsigned long now);
+  // The measured floor is only ever consumed by the int.thresh branch of
+  // isChannelActive(). With that threshold disabled (the companion default,
+  // which relies on hardware CAD instead) the periodic RXPS calibration window
+  // would drop to continuous RX and hold the main loop at its busy poll rate
+  // once a minute to produce a number nothing reads.
+  bool needsNoiseFloor() const { return _threshold != 0; }
+  void prepareForRadioConfig();
+  void cacheParams(float freq, float bw, uint8_t sf, uint8_t cr) {
+    _cur_freq = freq;
+    _cur_bw = bw;
+    _cur_sf = sf;
+    _cur_cr = cr;
+    _params_valid = true;
+  }
+  virtual int startReceiveMode();
+  virtual void stopReceiveDutyCycle();
+  virtual bool isPacketReady();
+  virtual bool isChipBusy() { return false; }
+  virtual bool radioDeepInit() { return false; }
   float packetScoreInt(float snr, int sf, int packet_len);
   virtual bool isReceivingPacket() =0;
   virtual void doResetAGC();
 
 public:
-  RadioLibWrapper(PhysicalLayer& radio, mesh::MainBoard& board) : _radio(&radio), _board(&board), _preamble_sf(0) { n_recv = n_sent = 0; }
+  RadioLibWrapper(PhysicalLayer& radio, mesh::MainBoard& board)
+      : _radio(&radio), _board(&board), _preamble_sf(0), _rx_ps_enabled(false), _rx_ps_armed(false),
+        _rx_hold_continuous(false), _rx_ps_rx_us(meshcore::rxps::DEFAULT_RX_US),
+        _rx_ps_sleep_us(meshcore::rxps::DEFAULT_SLEEP_US), _wd_last_busy(false), _wd_stage(0),
+        _wd_strikes(0), _startrx_fails(0), _wd_last_transition(0), _wd_stuck_thresh(0),
+        _wd_observe_until(0), _wd_observe_ms(0), _cur_freq(0), _cur_bw(0), _cur_sf(0), _cur_cr(0),
+        _cur_dbm(0), _params_valid(false), _dbm_valid(false), _nf_calib_active(false),
+        _nf_last_calib(0), _nf_calib_deadline(0), _nf_sample_from(0) {
+    n_recv = n_sent = n_recv_errors = n_wd_soft = n_wd_hard = 0;
+    _last_rssi = _last_snr = 0;
+  }
 
   void begin() override;
   virtual void powerOff() { _radio->sleep(); }
   int recvRaw(uint8_t* bytes, int sz) override;
+  void onReceiveProcessed() override;
   uint32_t getEstAirtimeFor(int len_bytes) override;
   bool startSendRaw(const uint8_t* bytes, int len) override;
   bool isSendComplete() override;
   void onSendFinished() override;
   bool isInRecvMode() const override;
+  bool supportsRxPowerSaving() const override { return false; }
+  bool setRxPowerSaving(bool enabled, uint32_t rx_us, uint32_t sleep_us) override;
+  bool prepareForSleep();
   bool isChannelActive();
 
   bool isReceiving() override {
@@ -68,10 +138,22 @@ public:
   uint32_t getPacketsRecv() const { return n_recv; }
   uint32_t getPacketsRecvErrors() const { return n_recv_errors; }
   uint32_t getPacketsSent() const { return n_sent; }
-  void resetStats() { n_recv = n_sent = n_recv_errors = 0; }
+  uint32_t getRxPsWatchdogSoftCount() const override { return n_wd_soft; }
+  uint32_t getRxPsWatchdogHardCount() const override { return n_wd_hard; }
+  bool isRxPowerSavingEnabled() const override { return _rx_ps_enabled; }
+  bool isRxPowerSavingArmed() const override { return _rx_ps_armed; }
+  bool isRxPowerSavingMaintenanceActive() const override {
+    return _nf_calib_active || _wd_observe_until != 0;
+  }
+  bool isWatchdogObserving() const { return _wd_observe_until != 0; }
+  bool isCalibratingNoiseFloor() const { return _nf_calib_active; }
+  void resetStats() { n_recv = n_sent = n_recv_errors = n_wd_soft = n_wd_hard = 0; }
 
-  virtual float getLastRSSI() const override;
-  virtual float getLastSNR() const override;
+  // final: these must return the metadata cached by recvRaw() before the RX
+  // re-arm. A subclass reading the chip live would report the wrong packet's
+  // SNR/RSSI whenever RX duty-cycle power saving is armed.
+  float getLastRSSI() const override final;
+  float getLastSNR() const override final;
 
   float packetScore(float snr, int packet_len) override { return packetScoreInt(snr, 10, packet_len); }  // assume sf=10
 

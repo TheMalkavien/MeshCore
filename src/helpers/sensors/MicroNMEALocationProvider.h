@@ -4,8 +4,9 @@
 #include <MicroNMEA.h>
 #include <RTClib.h>
 #include <helpers/RefCountedDigitalPin.h>
-#if defined(ESP_PLATFORM) && defined(CONFIG_PM_SLP_DISABLE_GPIO)
+#if defined(ESP_PLATFORM)
     #include <driver/gpio.h>
+    #include <esp_system.h>
 #endif
 
 #ifndef GPS_EN
@@ -66,6 +67,13 @@
     #define GPS_USE_SLEEP_PIN_FOR_STOP 0
 #endif
 
+#ifndef GPS_HOLD_CONTROL_PINS_IN_DEEP_SLEEP
+    // Boards using a dedicated GNSS wake/sleep pin usually keep the main rail
+    // powered for hot starts. Retain those control levels when the ESP enters
+    // deep sleep; other boards keep their existing stop() behaviour.
+    #define GPS_HOLD_CONTROL_PINS_IN_DEEP_SLEEP GPS_USE_SLEEP_PIN_FOR_STOP
+#endif
+
 class MicroNMEALocationProvider : public LocationProvider {
     char _nmeaBuffer[100];
     MicroNMEA nmea;
@@ -81,33 +89,99 @@ class MicroNMEALocationProvider : public LocationProvider {
     unsigned long _last_time_sync = 0;
     static const unsigned long TIME_SYNC_INTERVAL = 1800000; // Re-sync every 30 minutes
     bool _started = false;
+#if defined(ESP_PLATFORM) && GPS_HOLD_CONTROL_PINS_IN_DEEP_SLEEP
+    bool _deep_sleep_holds_armed = false;
+#endif
+
+    bool usesSleepPinForStop() const {
+#if GPS_USE_SLEEP_PIN_FOR_STOP
+        return _pin_sleep != -1 && _peripher_power == NULL;
+#else
+        return false;
+#endif
+    }
+
+    void configureControlPin(int pin, int level) {
+        if (pin == -1) {
+            return;
+        }
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, level);
+    }
+
+    void configureControlState(bool awake) {
+        configureControlPin(_pin_reset, !GPS_RESET_ACTIVE);
+        configureControlPin(_pin_sleep, awake ? PIN_GPS_SLEEP_ACTIVE : !PIN_GPS_SLEEP_ACTIVE);
+
+        if (_pin_en != -1) {
+            const int en_level = (awake || usesSleepPinForStop())
+                ? GPS_EN_ACTIVE : !GPS_EN_ACTIVE;
+            configureControlPin(_pin_en, en_level);
+        }
+
+        configureControlPin(PIN_GPS_BACKUP, PIN_GPS_BACKUP_ACTIVE);
+    }
+
+    void configureInitialControlState() {
+        // Preserve the legacy powered-off/reset-held boot state for providers
+        // without a dedicated sleep pin. The hot-standby path must instead keep
+        // reset released so an ESP deep-sleep cycle does not force a cold start.
+        configureControlPin(_pin_reset,
+            usesSleepPinForStop() ? !GPS_RESET_ACTIVE : GPS_RESET_ACTIVE);
+        configureControlPin(_pin_sleep, !PIN_GPS_SLEEP_ACTIVE);
+        configureControlPin(_pin_en,
+            usesSleepPinForStop() ? GPS_EN_ACTIVE : !GPS_EN_ACTIVE);
+        configureControlPin(PIN_GPS_BACKUP, PIN_GPS_BACKUP_ACTIVE);
+    }
+
+#if defined(ESP_PLATFORM) && GPS_HOLD_CONTROL_PINS_IN_DEEP_SLEEP
+    void releaseControlPinHold(int pin) {
+        if (pin != -1) {
+            (void)gpio_hold_dis((gpio_num_t)pin);
+        }
+    }
+
+    void releaseDeepSleepControlHolds(bool woke_from_deep_sleep = false) {
+        releaseControlPinHold(_pin_en);
+        releaseControlPinHold(_pin_reset);
+        releaseControlPinHold(_pin_sleep);
+        releaseControlPinHold(PIN_GPS_BACKUP);
+
+        if (_deep_sleep_holds_armed || woke_from_deep_sleep) {
+            gpio_deep_sleep_hold_dis();
+            _deep_sleep_holds_armed = false;
+        }
+    }
+
+    void armControlPinHold(int pin) {
+        if (pin != -1) {
+            (void)gpio_hold_en((gpio_num_t)pin);
+        }
+    }
+
+    void armDeepSleepControlHolds() {
+        armControlPinHold(_pin_en);
+        armControlPinHold(_pin_reset);
+        armControlPinHold(_pin_sleep);
+        armControlPinHold(PIN_GPS_BACKUP);
+        gpio_deep_sleep_hold_en();
+        _deep_sleep_holds_armed = true;
+    }
+#endif
 
 public :
     MicroNMEALocationProvider(Stream& ser, mesh::RTCClock* clock = NULL, int pin_reset = GPS_RESET, int pin_en = GPS_EN, RefCountedDigitalPin* peripher_power=NULL, int pin_sleep = GPS_SLEEP_PIN) :
     nmea(_nmeaBuffer, sizeof(_nmeaBuffer)), _clock(clock), _gps_serial(&ser), _peripher_power(peripher_power), _pin_reset(pin_reset), _pin_en(pin_en), _pin_sleep(pin_sleep) {
-        if (_pin_reset != -1) {
-            pinMode(_pin_reset, OUTPUT);
-            digitalWrite(_pin_reset, GPS_RESET_ACTIVE);
-        }
-        if (_pin_en != -1) {
-            pinMode(_pin_en, OUTPUT);
-            digitalWrite(_pin_en, !GPS_EN_ACTIVE);
-        }
-        if (_pin_sleep != -1) {
-            pinMode(_pin_sleep, OUTPUT);
-            digitalWrite(_pin_sleep, !PIN_GPS_SLEEP_ACTIVE);
-        }
+#if defined(ESP_PLATFORM) && GPS_HOLD_CONTROL_PINS_IN_DEEP_SLEEP
+        const bool woke_from_deep_sleep = esp_reset_reason() == ESP_RST_DEEPSLEEP;
+#endif
 
-        if (PIN_GPS_BACKUP != -1) {
-            pinMode(PIN_GPS_BACKUP, OUTPUT);
-            digitalWrite(PIN_GPS_BACKUP, PIN_GPS_BACKUP_ACTIVE);
-        }
+        // Configure the desired standby state before releasing a retained pad,
+        // avoiding an EN/WAKEUP glitch after a deep-sleep reset.
+        configureInitialControlState();
 
-#if GPS_USE_SLEEP_PIN_FOR_STOP
-        // Keep GNSS main rail on when sleep pin mode is available.
-        if (_pin_sleep != -1 && _peripher_power == NULL && _pin_en != -1) {
-            digitalWrite(_pin_en, GPS_EN_ACTIVE);
-        }
+#if defined(ESP_PLATFORM) && GPS_HOLD_CONTROL_PINS_IN_DEEP_SLEEP
+        releaseDeepSleepControlHolds(woke_from_deep_sleep);
 #endif
 
 #if defined(ESP_PLATFORM) && defined(CONFIG_PM_SLP_DISABLE_GPIO)
@@ -143,15 +217,10 @@ public :
             return;
         }
         claim();
-        if (_pin_en != -1) {
-            digitalWrite(_pin_en, GPS_EN_ACTIVE);
-        }
-        if (_pin_sleep != -1) {
-            digitalWrite(_pin_sleep, PIN_GPS_SLEEP_ACTIVE);
-        }
-        if (_pin_reset != -1) {
-            digitalWrite(_pin_reset, !GPS_RESET_ACTIVE);
-        }
+        configureControlState(true);
+#if defined(ESP_PLATFORM) && GPS_HOLD_CONTROL_PINS_IN_DEEP_SLEEP
+        releaseDeepSleepControlHolds();
+#endif
         _started = true;
     }
 
@@ -168,27 +237,27 @@ public :
             return;
         }
 
-        bool use_sleep_pin_mode = false;
-#if GPS_USE_SLEEP_PIN_FOR_STOP
-        use_sleep_pin_mode = (_pin_sleep != -1 && _peripher_power == NULL);
-#endif
-
-        if (use_sleep_pin_mode) {
-            digitalWrite(_pin_sleep, !PIN_GPS_SLEEP_ACTIVE);
-        } else if (_pin_en != -1) {
-            digitalWrite(_pin_en, !GPS_EN_ACTIVE);
-        }
+        configureControlState(false);
         release();
         _started = false;
     }
 
-    bool isEnabled() override {
-        bool use_sleep_pin_mode = false;
-#if GPS_USE_SLEEP_PIN_FOR_STOP
-        use_sleep_pin_mode = (_pin_sleep != -1 && _peripher_power == NULL);
-#endif
+    void prepareForDeepSleep() override {
+        stop();
 
-        if (use_sleep_pin_mode) {
+#if defined(ESP_PLATFORM) && GPS_HOLD_CONTROL_PINS_IN_DEEP_SLEEP
+        if (usesSleepPinForStop()) {
+            // stop() is idempotent and may have returned because a one-shot fix
+            // was already sleeping. Reassert the intended standby levels before
+            // latching them for the whole MCU deep-sleep interval.
+            configureControlState(false);
+            armDeepSleepControlHolds();
+        }
+#endif
+    }
+
+    bool isEnabled() override {
+        if (usesSleepPinForStop()) {
             return _started;
         }
 
@@ -215,10 +284,19 @@ public :
     long satellitesCount() override { return nmea.getNumSatellites(); }
     bool isValid() override { return nmea.isValid(); }
 
-    long getTimestamp() override { 
+    long getTimestamp() override {
         DateTime dt(nmea.getYear(), nmea.getMonth(),nmea.getDay(),nmea.getHour(),nmea.getMinute(),nmea.getSecond());
         return dt.unixtime();
-    } 
+    }
+
+    // A fix can be reported valid from GGA before the RMC date field has been
+    // parsed, and some receivers emit a rollover-corrupted year. Pushing either
+    // into the RTC is worse than keeping the current time. This deliberately
+    // does not gate isValid(): the position fix must not wait on a lagging RMC.
+    bool hasSaneTimestamp() {
+        const uint16_t year = nmea.getYear();
+        return year >= 2024 && year < 2100;
+    }
 
     void sendSentence(const char *sentence) override {
         nmea.sendSentence(*_gps_serial, sentence);
@@ -242,7 +320,7 @@ public :
             if (!_time_sync_needed && _clock != NULL && (millis() - _last_time_sync) > TIME_SYNC_INTERVAL) {
                 _time_sync_needed = true;
             }
-            if (_time_sync_needed && time_valid > 2) {
+            if (_time_sync_needed && time_valid > 2 && hasSaneTimestamp()) {
                 if (_clock != NULL) {
                     _clock->setCurrentTime(getTimestamp());
                     _time_sync_needed = false;

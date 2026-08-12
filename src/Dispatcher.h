@@ -31,6 +31,9 @@ public:
   */
   virtual int recvRaw(uint8_t* bytes, int sz) = 0;
 
+  /** Called after the received packet and its radio metadata have been processed. */
+  virtual void onReceiveProcessed() { }
+
   /**
    * \returns  estimated transmit air-time needed for packet of 'len_bytes', in milliseconds.
   */
@@ -78,6 +81,20 @@ public:
 
   virtual float getLastRSSI() const { return 0; }
   virtual float getLastSNR() const { return 0; }
+
+  // Optional SX126x receive duty-cycle controls. Non-supporting radios keep
+  // continuous RX and report failure only when enabling is requested.
+  virtual bool supportsRxPowerSaving() const { return false; }
+  virtual bool setRxPowerSaving(bool enabled, uint32_t rx_us, uint32_t sleep_us) {
+    (void)rx_us;
+    (void)sleep_us;
+    return !enabled;
+  }
+  virtual bool isRxPowerSavingEnabled() const { return false; }
+  virtual bool isRxPowerSavingArmed() const { return false; }
+  virtual bool isRxPowerSavingMaintenanceActive() const { return false; }
+  virtual uint32_t getRxPsWatchdogSoftCount() const { return 0; }
+  virtual uint32_t getRxPsWatchdogHardCount() const { return 0; }
 };
 
 /**

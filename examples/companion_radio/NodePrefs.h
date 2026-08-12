@@ -9,6 +9,11 @@
 #define ADVERT_LOC_NONE       0
 #define ADVERT_LOC_SHARE      1
 
+// Persisted preference schema used for one-shot receive-path migrations.
+// 1 = RXPS fields introduced.
+// 2 = FEM RX gain introduced and RXPS/FEM build defaults adopted once.
+#define COMPANION_PREFS_FORMAT_VERSION 2
+
 class NodePrefs : public ConfigSerializer {  // persisted to file
 public:
   float airtime_factor = 0;
@@ -36,6 +41,10 @@ public:
   uint8_t radio_fem_rxgain = 0; // external LoRa FEM RX gain (LNA)
   uint8_t radio_fem_txgain = 0; // external LoRa FEM TX gain (low by default)
   float adc_multiplier = 0;     // battery ADC multiplier override (0 = board default); not persisted
+  uint8_t prefs_format_version = 0;
+  uint8_t rx_ps_enabled = 0;    // SX1262 RX duty-cycle mode
+  uint8_t rx_ps_level = 0;      // 1=safest/least saving, 10=most aggressive
+  uint8_t rx_ps_preamble = 0;   // expected sender preamble: 16 or 32 symbols
   uint8_t _client_repeat = 0;  // DEPRECATED -> use repeat.disable_fwd
   uint8_t path_hash_mode = 0;    // which path mode to use when sending
   uint8_t autoadd_max_hops = 0;  // 0 = no limit, 1 = direct (0 hops), N = up to N-1 hops (max 64)
@@ -53,10 +62,13 @@ private:
       //def("cad", _parent->cad_enabled);
       //def("int_thr", _parent->interference_threshold);
       def("rxgain", _parent->rx_boosted_gain);
-    #if 0
-      // NOTE: these cannot be set (yet) so don't load/save until we can.
-      //       also, fem_rxgain WAS mapped to wrong JSON property previously
+      def("rxps", _parent->rx_ps_enabled);
+      def("rxps_level", _parent->rx_ps_level);
+      def("rxps_preamble", _parent->rx_ps_preamble);
+      // RX gain is runtime-settable through the companion custom-variable API.
       def("fem_rxgain", _parent->radio_fem_rxgain);
+    #if 0
+      // TX gain is not runtime-settable yet, so do not load/save it.
       def("fem_txgain", _parent->radio_fem_txgain);
     #endif
       def("tx", _parent->tx_power_dbm);
@@ -123,6 +135,7 @@ private:
 
 protected:
   void structure() override {
+    def("prefs_ver", prefs_format_version);
     def("name", node_name, sizeof(node_name));
     //def("adv_int", advert_interval);
     //def("f_adv_int", flood_advert_interval);

@@ -988,3 +988,79 @@ def on_notification_received(data):
 - **Messages not received**: Poll `GET_MESSAGE` command periodically
 - **Duplicate messages**: Implement message deduplication using timestamp/content as a unique id
 - **Message truncation**: Send long messages as separate shorter messages
+
+---
+
+## SX1262 RX Duty-Cycle Power Saving
+
+Heltec V4 companion builds compiled with `WITH_SX1262_RX_POWER_SAVING=1` use
+SX1262 `RxDutyCycle` reception. The `heltec_v4_companion_radio_ble_idf`
+low-power profile enables it by default (`RXPS_DEFAULT_ENABLED=1`), which cuts
+the receiver duty cycle to roughly 61% at the default level.
+
+The default profile is level 5 with an expected sender preamble of 16 symbols.
+It can be changed at build time with `RXPS_DEFAULT_LEVEL=<1..10>` and
+`RXPS_DEFAULT_PREAMBLE=<16|32>`, or turned off entirely with
+`RXPS_DEFAULT_ENABLED=0`.
+
+Preference files written by an earlier build are migrated once, at the first
+boot on prefs format version 2, and adopt these build defaults. Every later
+boot preserves whatever the user selected at runtime.
+
+- Level 1 is the safest setting: longest listening window, shortest sleep and
+  therefore the smallest power saving.
+- Higher levels progressively shorten listening and lengthen sleep.
+- Level 10 is the most aggressive setting: largest power saving and highest
+  risk of missing a packet.
+
+The persisted setting can be inspected or changed from the serial rescue CLI:
+
+```text
+get rxps
+set rxps off
+set rxps on
+set rxps 5 16
+```
+
+It is also available through the existing companion custom-variable commands as
+`rxps` (`0`/`1`), `rxps_level` (`1`..`10`) and `rxps_preamble` (`16`/`32`).
+This is the normal runtime control path for low-power builds whose serial console
+is disabled.
+
+Changing frequency, bandwidth or spreading factor recalculates the selected
+level automatically. If the radio rejects duty-cycle mode, firmware reports the
+failure and remains in continuous RX. Watchdog soft/hard recovery counters are
+included in `get rxps` output.
+
+RXPS cycles only the SX1262. It does not switch the Heltec external FEM/LNA,
+which is controlled separately (see below). Longer peer preambles improve RXPS
+reliability but increase transmit airtime; validate packet loss on the intended
+mesh before selecting a more aggressive level.
+
+---
+
+## External FEM Receive-Path Gain
+
+Boards with a switchable front-end LNA (Heltec V4.3 / KCT8103L, V4.2 / GC1109,
+T096, Tracker V2) expose it as the persisted `radio_fem_rxgain` preference. On
+the V4.3 the LNA costs about 6 mA of continuous receive current, so the
+companion firmware defaults to bypass; `RADIO_FEM_RXGAIN_DEFAULT=1` ships with
+it enabled instead.
+
+Runtime control mirrors RXPS. Serial rescue CLI:
+
+```text
+get fem_rxgain
+set fem_rxgain on
+set fem_rxgain off
+```
+
+Companion custom variable: `fem_rxgain` (`0`/`1`, also accepts `on`/`off`). The
+variable is only advertised by `CMD_GET_CUSTOM_VARS` on boards that report a
+controllable LNA, and a set request that the board rejects leaves the previous
+value in place. This is the normal control path for low-power builds whose
+serial console is disabled.
+
+This is the same setting the repeater and room-server firmwares expose through
+the `radio.fem.rxgain` CLI command; it is separate from `radio.rxgain`, which
+controls the SX126x on-chip boosted-gain mode.

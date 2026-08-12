@@ -1,7 +1,20 @@
 #include "LoRaFEMControl.h"
+#include <driver/gpio.h>
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
 #include <Arduino.h>
+
+#if defined(CONFIG_PM_SLP_DISABLE_GPIO) && CONFIG_PM_SLP_DISABLE_GPIO
+static void configureFEMSleepOutput(int pin)
+{
+    const gpio_num_t gpio = (gpio_num_t)pin;
+    // CONFIG_PM_SLP_DISABLE_GPIO selects each pad's sleep configuration. Keep
+    // only the FEM control outputs driven; all unrelated GPIOs remain isolated.
+    (void)gpio_sleep_set_direction(gpio, GPIO_MODE_OUTPUT);
+    (void)gpio_sleep_set_pull_mode(gpio, GPIO_FLOATING);
+    (void)gpio_sleep_sel_en(gpio);
+}
+#endif
 
 void LoRaFEMControl::init(void)
 {
@@ -100,6 +113,24 @@ void LoRaFEMControl::setRxModeEnableWhenMCUSleep(void)
         }
         rtc_gpio_hold_en((gpio_num_t)P_LORA_KCT8103L_PA_CTX);
     }
+}
+
+void LoRaFEMControl::configureLightSleepPins(void)
+{
+#if defined(CONFIG_PM_SLP_DISABLE_GPIO) && CONFIG_PM_SLP_DISABLE_GPIO
+    // Sleep output data comes from the normal GPIO output register, so mode
+    // changes made by setTxModeEnable()/setRxModeEnable() are reflected without
+    // rewriting the sleep configuration. This covers both Heltec V4.2 (GC1109)
+    // and V4.3 (KCT8103L) while preserving isolation on unused pads.
+    configureFEMSleepOutput(P_LORA_PA_POWER);
+    if (fem_type == GC1109_PA) {
+        configureFEMSleepOutput(P_LORA_GC1109_PA_EN);
+        configureFEMSleepOutput(P_LORA_GC1109_PA_TX_EN);
+    } else if (fem_type == KCT8103L_PA) {
+        configureFEMSleepOutput(P_LORA_KCT8103L_PA_CSD);
+        configureFEMSleepOutput(P_LORA_KCT8103L_PA_CTX);
+    }
+#endif
 }
 
 void LoRaFEMControl::setLNAEnable(bool enabled)

@@ -163,6 +163,7 @@ protected:
 
   void clearPendingReqs() {
     pending_login = pending_status = pending_telemetry = pending_discovery = pending_req = 0;
+    pending_req_expiry_ms = 0;
   }
 
 public:
@@ -201,6 +202,13 @@ private:
   void checkCLIRescueCmd();
   void checkSerialInterface();
   bool isValidClientRepeatFreq(uint32_t f) const;
+  bool applyRxPowerSavingPrefs();
+  bool applyFemRxGainPrefs();
+  bool hasPendingReqs() const {
+    return pending_login || pending_status || pending_telemetry || pending_discovery || pending_req;
+  }
+  void armPendingReqTimeout(uint32_t estimated_timeout_ms);
+  void expirePendingReqs();
 
   // helpers, short-cuts
   void saveChannels() { _store->saveChannels(this); }
@@ -212,6 +220,7 @@ private:
   uint32_t pending_status;
   uint32_t pending_telemetry, pending_discovery;   // pending _TELEMETRY_REQ
   uint32_t pending_req;   // pending _BINARY_REQ
+  uint32_t pending_req_expiry_ms;
   BaseSerialInterface *_serial;
   AbstractUITask* _ui;
 

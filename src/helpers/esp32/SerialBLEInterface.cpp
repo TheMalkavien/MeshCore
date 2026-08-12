@@ -97,7 +97,9 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
   pServer->getAdvertising()->addServiceUUID(SERVICE_UUID);
 
 #if defined(ESP_PLATFORM) && defined(CONFIG_BT_CTRL_MODEM_SLEEP)
-  // Let the BT controller use modem sleep when idle.
+  // Let the BT controller use modem sleep when idle. Until it does, the
+  // controller holds an ESP_PM_APB_FREQ_MAX lock, which pins the CPU clock and
+  // blocks automatic light sleep.
   (void)esp_bt_sleep_enable();
 #endif
 }
@@ -124,6 +126,15 @@ bool SerialBLEInterface::onSecurityRequest() {
 }
 
 void SerialBLEInterface::onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) {
+  // A disconnect may race with the asynchronous security callback while BLE
+  // is being switched off from the UI.  Never resurrect the logical link (or
+  // request new parameters) once disable() has started.
+  if (!_isEnabled) {
+    deviceConnected = false;
+    _conn_params_pending = false;
+    return;
+  }
+
   if (cmpl.success) {
     BLE_DEBUG_PRINTLN(" - SecurityCallback - Authentication Success");
     deviceConnected = true;
@@ -159,6 +170,10 @@ void SerialBLEInterface::onConnect(BLEServer* pServer) {
 
 void SerialBLEInterface::onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) {
   BLE_DEBUG_PRINTLN("onConnect(), conn_id=%d, mtu=%d", param->connect.conn_id, pServer->getPeerMTU(param->connect.conn_id));
+  if (!_isEnabled) {
+    pServer->disconnect(param->connect.conn_id);
+    return;
+  }
   last_conn_id = param->connect.conn_id;
   memcpy(_pending_bda, param->connect.remote_bda, sizeof(_pending_bda));
   _conn_params_pending = true;
@@ -186,6 +201,8 @@ void SerialBLEInterface::onDisconnect(BLEServer* pServer) {
 // -------- BLECharacteristicCallbacks methods
 
 void SerialBLEInterface::onWrite(BLECharacteristic* pCharacteristic, esp_ble_gatts_cb_param_t* param) {
+  if (!_isEnabled) return;
+
   uint8_t* rxValue = pCharacteristic->getData();
   int len = pCharacteristic->getLength();
 
@@ -210,7 +227,7 @@ void SerialBLEInterface::clearBuffers() {
   send_queue_len = 0;
 }
 
-void SerialBLEInterface::enable() { 
+void SerialBLEInterface::enable() {
   if (_isEnabled) return;
 
   _isEnabled = true;
@@ -249,14 +266,18 @@ void SerialBLEInterface::startAdvertising(bool fast) {
 #endif
 
 void SerialBLEInterface::disable() {
+  if (!_isEnabled) return;
   _isEnabled = false;
 
   BLE_DEBUG_PRINTLN("SerialBLEInterface::disable");
 
   pServer->getAdvertising()->stop();
-  pServer->disconnect(last_conn_id);
+  if (pServer->getConnectedCount() > 0) {
+    pServer->disconnect(last_conn_id);
+  }
   pService->stop();
   oldDeviceConnected = deviceConnected = false;
+  _conn_params_pending = false;
   adv_restart_time = 0;
 #if defined(BLE_ADAPTIVE_ADVERTISING)
   adv_fast_until = 0;
@@ -285,10 +306,12 @@ size_t SerialBLEInterface::writeFrame(const uint8_t src[], size_t len) {
 }
 
 bool SerialBLEInterface::isWriteBusy() const {
+  if (!_isEnabled) return false;
   return millis() < _last_write + BLE_WRITE_MIN_INTERVAL;   // still too soon to start another write?
 }
 
 size_t SerialBLEInterface::checkRecvFrame(uint8_t dest[]) {
+  if (!_isEnabled) return 0;
   if (send_queue_len > 0   // first, check send queue
     && millis() >= _last_write + BLE_WRITE_MIN_INTERVAL    // space the writes apart
   ) {
@@ -362,5 +385,5 @@ size_t SerialBLEInterface::checkRecvFrame(uint8_t dest[]) {
 }
 
 bool SerialBLEInterface::isConnected() const {
-  return deviceConnected;  //pServer != NULL && pServer->getConnectedCount() > 0;
+  return _isEnabled && deviceConnected;  //pServer != NULL && pServer->getConnectedCount() > 0;
 }

@@ -35,6 +35,7 @@
   #define UI_HOME_REFRESH_MILLIS 15000
 #endif
 
+
 #if UI_HAS_JOYSTICK
   #define PRESS_LABEL "press Enter"
 #else
@@ -630,6 +631,7 @@ void UITask::showAlert(const char* text, int duration_millis) {
   strcpy(_alert, text);
   _alert_expiry = millis() + duration_millis;
 }
+
 
 void UITask::notify(UIEventType t) {
 #if defined(PIN_BUZZER)

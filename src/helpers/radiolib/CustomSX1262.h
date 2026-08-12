@@ -75,7 +75,7 @@ class CustomSX1262 : public SX1262 {
       setDio2AsRfSwitch(SX126X_DIO2_AS_RF_SWITCH);
   #endif
   #ifdef SX126X_RX_BOOSTED_GAIN
-      setRxBoostedGainMode(SX126X_RX_BOOSTED_GAIN);
+      setRxBoostedGainModeRetained(SX126X_RX_BOOSTED_GAIN);
   #endif
   #if defined(SX126X_RXEN) || defined(SX126X_TXEN)
     #ifndef SX126X_RXEN
@@ -100,12 +100,38 @@ class CustomSX1262 : public SX1262 {
       return true;  // success
     }
 
+    // Persist register 0x08AC across warm sleep/RxDutyCycle. SX1262 datasheet
+    // section 9.6 requires the retention list at 0x029F..0x02A1 to contain the
+    // RX gain register address. RadioLib 7.7+ also does this internally, but
+    // writing it explicitly keeps the contract clear and covers older 7.x.
+    int16_t setRxBoostedGainModeRetained(bool enabled) {
+      int16_t status = SX1262::setRxBoostedGainMode(enabled);
+      RADIOLIB_ASSERT(status);
+
+      constexpr uint16_t RX_GAIN_RETENTION_0 = 0x029F;
+      constexpr uint16_t RX_GAIN_REGISTER = 0x08AC;
+      const uint8_t retention[] = {
+          0x01,
+          (uint8_t)((RX_GAIN_REGISTER >> 8) & 0xFF),
+          (uint8_t)(RX_GAIN_REGISTER & 0xFF),
+      };
+      return writeRegister(RX_GAIN_RETENTION_0, retention, sizeof(retention));
+    }
+
+    // BUSY high means the chip is in an RxDutyCycle sleep/transition window.
+    // Avoid issuing SPI transactions until the next listening window.
+    bool isChipBusy() {
+      const uint32_t busy = this->mod->getGpio();
+      return busy != RADIOLIB_NC && this->mod->hal->digitalRead(busy);
+    }
+
     int16_t startReceive() override {
       // include the PREAMBLE_DETECTED irq bit in reported flags
       return SX1262::startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED), RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
     }
 
     bool isReceiving() {
+      if (isChipBusy()) return false;
       uint32_t irq = getIrqFlags();
       bool preamble = irq & RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED; // bit 2
       bool header   = irq & RADIOLIB_SX126X_IRQ_HEADER_VALID;      // bit 4
@@ -155,6 +181,21 @@ class CustomSX1262 : public SX1262 {
     void setMaxPayloadMillis(uint32_t payloadMillis) {
       _maxPayloadMillis = payloadMillis;
       MESH_DEBUG_PRINTLN("Set _maxPayloadMillis=%u", _maxPayloadMillis);
+    }
+
+    // Stop the RTC left running by RxDutyCycle. Without this errata sequence,
+    // a pending timeout event can silently abort the following RX, TX or CAD.
+    int16_t stopRTC() {
+      uint8_t rtc_stop = 0x00;
+      int16_t status = writeRegister(RADIOLIB_SX126X_REG_RTC_CTRL, &rtc_stop, 1);
+      RADIOLIB_ASSERT(status);
+
+      uint8_t rtc_event = 0;
+      status = readRegister(RADIOLIB_SX126X_REG_EVENT_MASK, &rtc_event, 1);
+      RADIOLIB_ASSERT(status);
+
+      rtc_event |= 0x02;
+      return writeRegister(RADIOLIB_SX126X_REG_EVENT_MASK, &rtc_event, 1);
     }
 
     bool getRxBoostedGainMode() {

@@ -20,6 +20,9 @@ public:
     virtual void reset() = 0;
     virtual void begin() = 0;
     virtual void stop() = 0;
+    // Called immediately before MCU deep sleep. Providers with GPIO-controlled
+    // power/standby pins can override this to retain a safe hardware state.
+    virtual void prepareForDeepSleep() { stop(); }
     virtual void loop() = 0;
     virtual bool isEnabled() = 0;
 };

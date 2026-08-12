@@ -68,7 +68,7 @@ void ESP32Board::enterDeepSleep(uint32_t secs, int wake_pin, int wake_level) {
 
   // Power off GPS if any
   if (sensors.getLocationProvider() != NULL) {
-    sensors.getLocationProvider()->stop();
+    sensors.getLocationProvider()->prepareForDeepSleep();
   }
 
   // Flush serial buffers

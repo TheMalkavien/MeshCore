@@ -11,6 +11,38 @@ static inline void keepPinActiveDuringSleep(int pin) {
 }
 #endif
 
+// Arduino's Wire.begin() enables the internal pull-ups on SDA/SCL. Those sit on
+// the always-on 3V3 rail, so once the panel rail is cut they keep trickling
+// current into the dead OLED through its ESD clamp diodes. Releasing them while
+// the panel is off removes that path; the bus is idle anyway, since the OLED is
+// the only device on it. Boards that share this bus with a device on a
+// different rail must leave OLED_RELEASE_BUS_WHEN_OFF at 0.
+#ifndef OLED_RELEASE_BUS_WHEN_OFF
+  #define OLED_RELEASE_BUS_WHEN_OFF 0
+#endif
+
+#if defined(ESP_PLATFORM) && OLED_RELEASE_BUS_WHEN_OFF && \
+    defined(PIN_BOARD_SDA) && defined(PIN_BOARD_SCL)
+static void setI2CBusIdlePullups(bool enabled) {
+  const gpio_num_t pins[] = {(gpio_num_t)PIN_BOARD_SDA, (gpio_num_t)PIN_BOARD_SCL};
+  for (gpio_num_t pin : pins) {
+    (void)gpio_set_pull_mode(pin, enabled ? GPIO_PULLUP_ONLY : GPIO_FLOATING);
+#if defined(CONFIG_PM_SLP_DISABLE_GPIO)
+    // While the panel is powered the pads must stay under normal control across
+    // automatic light sleep; once released, let the sleep isolation take over.
+    if (enabled) {
+      gpio_sleep_sel_dis(pin);
+    } else {
+      gpio_sleep_sel_en(pin);
+    }
+#endif
+  }
+}
+  #define I2C_BUS_IDLE_PULLUPS(en) setI2CBusIdlePullups(en)
+#else
+  #define I2C_BUS_IDLE_PULLUPS(en) ((void)0)
+#endif
+
 bool SSD1306Display::i2c_probe(TwoWire& wire, uint8_t addr) {
   wire.beginTransmission(addr);
   uint8_t error = wire.endTransmission();
@@ -62,7 +94,10 @@ bool SSD1306Display::begin() {
 
 void SSD1306Display::turnOn() {
   if (!_isOn) {
-    if (_peripher_power) _peripher_power->claim();
+    if (_peripher_power) {
+      _peripher_power->claim();
+      I2C_BUS_IDLE_PULLUPS(true);  // restore the bus before the first transaction
+    }
     _isOn = true;  // set before begin() to prevent double claim
     if (_peripher_power) begin();  // re-init display after power was cut
   }
@@ -79,9 +114,12 @@ void SSD1306Display::turnOff() {
   if (_isOn) {
     if (_peripher_power) {
 #if PIN_OLED_RESET >= 0
+      // Driven low, not floated: sinking into an unpowered panel costs nothing
+      // and holds it in reset.
       digitalWrite(PIN_OLED_RESET, LOW);
 #endif
       _peripher_power->release();
+      I2C_BUS_IDLE_PULLUPS(false);
     }
     _isOn = false;
   }
