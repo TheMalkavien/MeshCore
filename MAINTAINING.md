@@ -23,6 +23,12 @@ Three kinds of objects. Confusing them is the only way to get into trouble.
 away and rebuilt. That is what keeps its history readable, and what makes
 "ship without feature X" a one-line change instead of an archaeology exercise.
 
+> **There is no `dev` branch to update.** The local `dev` branch is a leftover,
+> hundreds of commits behind, and nothing in this workflow reads it. The stack is
+> built on `upstream/dev` — the *remote-tracking ref* — which `restack.sh`
+> refreshes itself with `git fetch upstream`. You never check it out, never merge
+> it, never pull it. Delete it if it bothers you.
+
 ### The stack
 
 ```
@@ -33,7 +39,7 @@ upstream/dev
      ├─ feature/rp2040-lowpower         low-power idle, clock/voltage profiles
      │   └─ feature/lora-ota               mesh OTA + web updater
      ├─ tools/companion-tools           Python proxies + Telegram bridge
-     └─ packaging/mlk-defaults          fork distribution defaults (merged last)
+     └─ packaging/mlk-defaults          fork distribution defaults + this tooling
 ```
 
 Most branches hang directly off `core-enhancements`. Two are stacked, and both
@@ -50,21 +56,44 @@ moving code around avoids a merge conflict — only stacking does.
 
 ---
 
-## 2. From VSCode
+## 2. The three rules
+
+Everything that has gone wrong with this stack traces back to breaking one of
+these.
+
+**Never `git pull` or `git merge upstream` into a stack branch.** Branches must
+stay linear on top of their parent. A merge commit inside one desynchronises the
+stack (that branch is up to date, the other six are not) and makes the next
+rebase drop the merge and replay badly. Updating from upstream is
+`./tools/restack.sh rebase`, applied to the *whole* stack, never to one branch.
+
+**Never rebase a branch by hand before running the script.** `restack.sh`
+computes every branch's old base from the state it finds. If you have already
+moved one, its old tip is no longer an ancestor of its children, the computed
+bases are wrong, and the parent's commits get replayed a second time on top of
+themselves. It is all-or-nothing: let the script do all seven, or none.
+
+**A clean merge proves nothing. Only a build does.** See §6.
+
+---
+
+## 3. From VSCode
 
 Nothing to install. Git Bash ships with Git for Windows and the tasks pin it
-explicitly, so your terminal can stay on PowerShell.
+explicitly, so your terminal can stay on PowerShell. The script re-execs itself
+from a copy outside the working tree, so it works from any branch even though it
+only exists on `packaging/mlk-defaults`.
 
 `Ctrl+Shift+P` → **Tasks: Run Task** →
 
 | task | what it does | destructive? |
 |---|---|---|
 | **Stack: check (read-only)** | how far behind upstream, and whether the 7 still merge | no |
-| **Stack: rebase onto upstream** | restacks every branch onto its parent | **rewrites branches** |
+| **Stack: rebase onto upstream** | restacks all seven onto their parents | **rewrites branches** |
 | **Stack: regenerate patch_public** | rebuilds the integration branch (asks first) | **rewrites `patch_public`** |
 | **Stack: build integration** | builds 5 environments | no |
 | **Stack: update from upstream (full)** | rebase + regenerate + build | **both of the above** |
-| **Stack: run tools unit tests** | the 11 Python tests | no |
+| **Stack: run tools unit tests** | the Python tests | no |
 
 Prefer a terminal? `Ctrl+ù`, pick the *Git Bash* profile, then `./tools/restack.sh check`.
 From PowerShell without switching shell:
@@ -75,18 +104,20 @@ From PowerShell without switching shell:
 
 ---
 
-## 3. Recipe: upstream has moved
+## 4. Recipe: upstream has moved
+
+This is the whole of it. There is no separate "update dev" step.
+
+```bash
+./tools/restack.sh check       # 1. read-only. Nothing is touched.
+./tools/restack.sh rebase      # 2. rewrites all seven branches
+./tools/restack.sh integrate   # 3. rebuilds patch_public (asks for confirmation)
+```
+then **Stack: build integration**, then push.
 
 Roughly monthly, or when upstream lands something you want. The nightly CI
 ([`.github/workflows/stack-check.yml`](.github/workflows/stack-check.yml)) tells
 you when you have drifted far enough to conflict.
-
-```bash
-./tools/restack.sh check       # 1. read-only. Nothing is touched.
-./tools/restack.sh rebase      # 2. rewrites the 7 branches
-./tools/restack.sh integrate   # 3. rebuilds patch_public (asks for confirmation)
-```
-then **Stack: build integration**, then push.
 
 ### Example — a clean run
 
@@ -94,44 +125,51 @@ then **Stack: build integration**, then push.
 $ ./tools/restack.sh check
 
 == behind upstream/dev
-  feature/core-enhancements          12 commits
-  feature/repeater-ping              12 commits
+  feature/core-enhancements          9 commits
+  feature/repeater-ping              9 commits
   ...
-== merge dry-run onto 9f2ab110
+== merge dry-run onto a4ab7f0e
   feature/core-enhancements          ok
-  feature/repeater-ping              ok
   ...
   clean - but rerere may have replayed a stale resolution. Build before trusting it.
+
+$ ./tools/restack.sh rebase
+
+== restacking onto a4ab7f0e
+  feature/core-enhancements          onto upstream/dev
+  feature/repeater-ping              onto feature/core-enhancements
+  feature/repeater-flood-retry       onto feature/repeater-ping
+  feature/rp2040-lowpower            onto feature/core-enhancements
+  feature/lora-ota                   onto feature/rp2040-lowpower
+  tools/companion-tools              onto feature/core-enhancements
+  packaging/mlk-defaults             onto feature/core-enhancements
 ```
 
 ### Example — a conflict during `rebase`
 
 ```
-$ ./tools/restack.sh rebase
+  feature/core-enhancements          conflict - resolve, then: git rebase --continue
 
-== restacking onto 9f2ab110
-  feature/core-enhancements          onto upstream/dev
-  feature/repeater-ping              conflict - resolve, then: git rebase --continue
-
-UU examples/simple_repeater/MyMesh.cpp
+UU src/MeshCore.h
 ```
 
 Upstream changed something your branch also touches. Fix it where it belongs —
 in the branch:
 
 ```bash
-code examples/simple_repeater/MyMesh.cpp   # resolve
-git add examples/simple_repeater/MyMesh.cpp
+code src/MeshCore.h              # resolve
+git add src/MeshCore.h
 git rebase --continue
-./tools/restack.sh rebase                  # re-run; branches already done are no-ops
+./tools/restack.sh rebase        # re-run; branches already done are skipped
 ```
+
+Re-running is safe: the script reports `already on <parent>` for anything whose
+old base is already the parent's tip, and moves on.
 
 ### Example — a conflict during `integrate`
 
 ```
-$ ./tools/restack.sh integrate
-
-== merging 7 branches onto 9f2ab110
+== merging 7 branches onto a4ab7f0e
   feature/core-enhancements          ok
   feature/repeater-ping              ok
   feature/repeater-flood-retry       conflict
@@ -153,7 +191,7 @@ git checkout feature/repeater-flood-retry
 
 ### Pushing
 
-The 7 branches were rewritten, so they need a force push. Use
+All seven branches were rewritten, so they need a force push. Use
 `--force-with-lease`, never plain `--force`: it refuses if someone (or another
 machine of yours) pushed in the meantime.
 
@@ -166,7 +204,7 @@ git push --force-with-lease origin \
 
 ---
 
-## 4. Recipe: you changed a feature
+## 5. Recipe: you changed a feature
 
 ### A branch with no children
 
@@ -194,13 +232,19 @@ git checkout feature/rp2040-lowpower
 ./tools/restack.sh rebase       # replays lora-ota onto the new lowpower
 ./tools/restack.sh integrate
 ```
-then build, then push both the branch and its children.
+then build, then push the branch, its children, and `patch_public`.
 
-> This is why `STACK` in the script names each branch's **immediate** parent
-> rather than the root of its chain. `git rebase <parent> <branch>` then replays
-> only the commits the branch owns, because the merge base is the parent's
-> previous tip. Naming the root instead would replay the whole chain and
-> silently drop the commit you just made to the link above.
+> **Why `--onto`.** `STACK` in the script names each branch's *immediate* parent,
+> and each branch is replayed with
+> `git rebase --onto <parent> <old base> <branch>`, where every old base is
+> captured **before anything moves**.
+>
+> The naive `git rebase <parent> <branch>` is wrong here. Once the parent has been
+> rebased, its previous tip is no longer an ancestor of the child, so git falls
+> back to a merge base further down — the old upstream — and replays *the
+> parent's commits too*, on top of the already-rebased parent. The symptom is
+> silent duplication: a declaration appearing two or three times, code that does
+> not compile, and not a single reported conflict.
 
 ### Ship without a feature
 
@@ -219,19 +263,30 @@ then add it in three places: `STACK` and `MERGE_ORDER` in the script, and the
 
 ---
 
-## 5. Two things that will bite you
+## 6. Three things that will bite you
 
 **`rerere` replays, it does not validate.** Git records your conflict
 resolutions and replays them automatically the next time the same conflict
 appears — which is exactly what you want when re-merging the same branches over
 and over. But it replays a *wrong* resolution just as happily as a right one.
-During the initial split it silently reinstated a resolution that had dropped a
-closing brace, and the merge still reported clean. **A clean `integrate` proves
-nothing. Only a build does.** If you ever suspect a stale resolution:
+
+This is not theoretical. It has happened twice on this stack: once reinstating a
+resolution that had dropped a closing brace, once producing a `MeshCore.h` with
+the same virtual declared three times. Both times the merge reported clean.
+
+Worse, `rerere.autoupdate=true` makes it *stage* the replayed resolution, so a
+rebase carries straight on without stopping. The script now forces
+`-c rerere.autoupdate=false` on its own rebases and merges, but if you rebase by
+hand, check your config:
 
 ```bash
-rm -rf .git/rr-cache
+git config --get rerere.autoupdate      # should be empty or false
+rm -rf .git/rr-cache                    # when you suspect a stale resolution
 ```
+
+**A clean `integrate` proves nothing. Only a build does.** That is why the build
+appears in every recipe above, and why CI builds the merged result rather than
+just checking that it merges.
 
 **Branches that descend from `patch_public` break at every regeneration.**
 `mqtt_espnow_multibridge` and `HTv4LowPower` were forked off it. Two options:
@@ -241,7 +296,7 @@ is the right answer; they almost certainly do not need OTA or ping.
 
 ---
 
-## 6. CI
+## 7. CI
 
 [`.github/workflows/stack-check.yml`](.github/workflows/stack-check.yml) runs on
 push to any of the 7 branches, **nightly**, and on demand. The nightly run is the
@@ -261,13 +316,18 @@ replay of a resolution recorded on someone's laptop.
 CI never rebases and never pushes. A rebase needs judgement and a force push;
 that stays local.
 
-> GitHub disables scheduled workflows on a repository after 60 days without
-> activity. If the fork goes quiet, the nightly run stops silently — re-arm it
-> from the Actions tab with *Run workflow*.
+> **The nightly run will not fire yet.** GitHub only honours `schedule:` for
+> workflow files on the repository's **default branch**, which here is `main`.
+> The workflow currently lives on `packaging/mlk-defaults`, so only its `push`
+> and `workflow_dispatch` triggers work. To get the nightly, either put a copy of
+> the workflow on `main`, or make `patch_public` the default branch.
+>
+> GitHub also disables scheduled workflows after 60 days without repository
+> activity — re-arm from the Actions tab with *Run workflow*.
 
 ---
 
-## 7. The real goal
+## 8. The real goal
 
 No tooling makes a 7-branch stack free to maintain. The only way to lower the
 cost is to make the stack **shorter**.
