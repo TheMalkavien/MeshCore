@@ -4,6 +4,7 @@
 #include "AdvertDataHelpers.h"
 #include "TxtDataHelpers.h"
 #include <RTClib.h>
+#include <ctype.h>
 
 #ifndef BRIDGE_MAX_BAUD
 #define BRIDGE_MAX_BAUD 115200
@@ -182,6 +183,19 @@ uint8_t CommonCLI::buildAdvertData(uint8_t node_type, uint8_t* app_data) {
     AdvertDataBuilder builder(node_type, _prefs->node_name, _prefs->node_lat, _prefs->node_lon);
     return builder.encodeTo(app_data);
   }
+}
+
+// NOTE: 'command' must already be trimmed of leading spaces; the returned count is
+// relative to the pointer given.
+uint8_t CommonCLI::getCommandPrefixLen(const char* command) {
+  if (command == NULL) return 0;
+
+  uint8_t n = 0;
+  while (n < MAX_CMD_PREFIX_LEN - 1 && isxdigit((unsigned char) command[n])) n++;
+
+  // A single hex char cannot be told apart from a real command, and the command
+  // itself must not be empty once the prefix is gone.
+  return (n >= 2 && command[n] == '|' && command[n+1] != 0) ? n + 1 : 0;
 }
 
 void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* reply) {
