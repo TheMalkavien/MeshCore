@@ -38,7 +38,14 @@ En mode `USB`, il tente :
 
 - **RP2040** (Waveshare RP2040-LoRa, Xiao RP2040, Pico W, RAK11310) : staging LittleFS, image appliquée au reboot par le bootloader arduino-pico (gzip natif).
 - **ESP32/S2/S3/C3** (Heltec V4/V3, Xiao S3/C3, ...) : écriture directe dans la partition OTA inactive (`Update.h`), bascule de partition de boot après vérification complète au `ota end`, décompression gzip en streaming via le ROM. Nécessite un schéma de partitions à deux slots OTA (cas des variants MeshCore ESP32 standard) et un firmware de cette branche déjà en place sur la cible.
-- Sur ESP32, `start ota` arme la session OTA mesh (l'ancien portail WiFi ElegantOTA reste disponible en compilant avec `-D WIFI_OTA_ON_START`).
+- Sur ESP32, l'OTA mesh est **opt-in** : la cible doit être compilée avec `-D MESH_LORA_OTA`. Sans ce flag, `start ota` garde son comportement d'origine (point d'accès WiFi + portail ElegantOTA) et les commandes `ota ...` répondent `Err - OTA unsupported`. À ajouter dans les `build_flags` de l'env PlatformIO de la cible, par exemple :
+
+```ini
+[env:heltec_v4_repeater]
+build_flags =
+  ...
+  -D MESH_LORA_OTA
+```
 
 ## Limitations connues
 

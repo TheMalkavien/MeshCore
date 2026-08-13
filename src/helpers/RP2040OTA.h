@@ -38,6 +38,7 @@ private:
   uint16_t _ack_every_chunks;
   uint16_t _chunks_since_ack;
   uint32_t _last_activity_millis;
+  uint32_t _awaiting_reboot_since;  // image staged, waiting for the reboot command (0 = no)
   uint8_t *_stage;
   size_t _stage_size;
   size_t _stage_base;

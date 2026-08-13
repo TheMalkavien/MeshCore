@@ -15,13 +15,17 @@
 #include "soc/rtc.h"
 #include "esp_system.h"
 #include <driver/rtc_io.h>
+#ifdef MESH_LORA_OTA
 #include <helpers/ESP32OTA.h>
+#endif
 
 class ESP32Board : public mesh::MainBoard {
 protected:
   uint8_t startup_reason;
   bool inhibit_sleep = false;
+#ifdef MESH_LORA_OTA
   ESP32OTAController ota;
+#endif
   static inline portMUX_TYPE sleepMux = portMUX_INITIALIZER_UNLOCKED;
 
 public:
@@ -73,9 +77,10 @@ public:
   }
 
   void sleep(uint32_t secs) override {
-    // Skip if not allow to sleep. An armed/active mesh OTA session also
-    // inhibits sleep: light sleep between chunk bursts adds wake latency and
-    // loses packets mid-transfer.
+    // Skip if not allow to sleep. On MESH_LORA_OTA builds an armed/active mesh
+    // OTA session also inhibits sleep: light sleep between chunk bursts adds
+    // wake latency and loses packets mid-transfer. (isOTASessionActive() is a
+    // no-op returning false on builds without the mesh OTA controller.)
     if (inhibit_sleep || isOTASessionActive()) {
       delay(1); // Give MCU to OTA to run
       return;
@@ -159,6 +164,7 @@ public:
   }
 
   bool startOTAUpdate(const char* id, char reply[]) override;
+#ifdef MESH_LORA_OTA
   bool handleOTACommand(const char* command, char reply[]) override {
     return ota.handleCommand(command, reply);
   }
@@ -166,6 +172,7 @@ public:
     return ota.handleBinaryCommand(opcode, payload, payload_len, reply);
   }
   bool isOTASessionActive() const override { return ota.isSleepInhibited(); }
+#endif
 
   void setInhibitSleep(bool inhibit) {
     inhibit_sleep = inhibit;
