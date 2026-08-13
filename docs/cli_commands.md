@@ -87,9 +87,9 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 **Usage:**
 - `start ota`
 
-**Note:** On boards that implement mesh OTA (RP2040 variants, ESP32), this arms an OTA session that then accepts the `ota ...` transfer commands below, over LoRa or over a serial/companion link.
+**Note:** On boards that implement mesh OTA (RP2040 variants, and ESP32 built with `-D MESH_LORA_OTA`), this arms an OTA session that then accepts the `ota ...` transfer commands below, over LoRa or over a serial/companion link.
 
-**Note:** On ESP32 this replaces the legacy behaviour of spawning a WiFi access point with an ElegantOTA web portal. Build with `-D WIFI_OTA_ON_START` to restore it (the WiFi/AsyncWebServer stack is then linked in again, costing roughly 500KB flash and 24KB RAM).
+**Note:** On ESP32 the default is unchanged: `start ota` spawns a WiFi access point with an ElegantOTA web portal. Build with `-D MESH_LORA_OTA` to make it arm a mesh OTA session instead; that build drops the WiFi/AsyncWebServer stack, saving roughly 500KB flash and 24KB RAM, and the `ota ...` commands and the binary `0x70` request become available. Without the flag an ESP32 answers `Err - OTA unsupported` to them.
 
 ---
 

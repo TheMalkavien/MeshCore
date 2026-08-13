@@ -1,6 +1,9 @@
 #pragma once
 
-#if defined(ESP_PLATFORM)
+// Opt-in: only built when the target asks for mesh OTA over LoRa with
+// -D MESH_LORA_OTA. Without it 'start ota' keeps its stock ESP32 behavior (the
+// WiFi + ElegantOTA portal) and none of this is linked in.
+#if defined(ESP_PLATFORM) && defined(MESH_LORA_OTA)
 
 #include <stddef.h>
 #include <stdint.h>
@@ -57,6 +60,7 @@ private:
   uint16_t _ack_every_chunks;
   uint16_t _chunks_since_ack;
   uint32_t _last_activity_millis;
+  uint32_t _awaiting_reboot_since;  // image staged, waiting for the reboot command (0 = no)
   uint8_t *_stage;
   size_t _stage_size;
   size_t _stage_base;     // absolute stream offset of _stage[0] (== bytes already flushed)

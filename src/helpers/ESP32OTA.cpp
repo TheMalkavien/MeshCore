@@ -1,4 +1,4 @@
-#if defined(ESP_PLATFORM)
+#if defined(ESP_PLATFORM) && defined(MESH_LORA_OTA)
 
 #include "ESP32OTA.h"
 
@@ -38,6 +38,16 @@
 // isSleepInhibited() reports false so boards resume normal power management.
 #ifndef ESP32_OTA_SESSION_TIMEOUT_MS
   #define ESP32_OTA_SESSION_TIMEOUT_MS (5UL * 60UL * 1000UL)
+#endif
+
+// A successful 'end' leaves the image staged but the node still has to reset to
+// run it, and the client's reboot command is a plain fire-and-forget packet. The
+// session is over at that point, so power management would resume immediately and
+// a light-sleeping node could miss exactly that packet - leaving a verified image
+// waiting for a manual reset. Keep sleep inhibited for this long afterwards; if
+// the reboot never comes the node simply resumes normal behaviour.
+#ifndef ESP32_OTA_REBOOT_GRACE_MS
+  #define ESP32_OTA_REBOOT_GRACE_MS (60UL * 1000UL)
 #endif
 
 // RAM staging buffer: chunks accumulate here and hit the flash only once per
@@ -278,6 +288,7 @@ ESP32OTAController::ESP32OTAController() {
 void ESP32OTAController::clearState() {
   _armed = false;
   _active = false;
+  _awaiting_reboot_since = 0;
   _update_started = false;
   _gz_mode = false;
   _md5[0] = 0;
@@ -388,6 +399,10 @@ size_t ESP32OTAController::flushBlockBytes() const {
 }
 
 bool ESP32OTAController::isSleepInhibited() const {
+  if (_awaiting_reboot_since != 0
+      && (uint32_t)(millis() - _awaiting_reboot_since) < ESP32_OTA_REBOOT_GRACE_MS) {
+    return true;
+  }
   return (_armed || _active) && !sessionExpired();
 }
 
@@ -806,6 +821,9 @@ bool ESP32OTAController::handleCommand(const char *command, char reply[]) {
 
     OTA_DEBUG_PRINTLN("end ok, image staged");
     clearState();
+    // Stay awake for the reboot command that follows (see ESP32_OTA_REBOOT_GRACE_MS).
+    _awaiting_reboot_since = millis();
+    if (_awaiting_reboot_since == 0) _awaiting_reboot_since = 1;   // 0 means 'not waiting'
     strcpy(reply, "OK - OTA staged, reboot now");
     return true;
   }
