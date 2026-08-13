@@ -3,11 +3,16 @@
 #include "ESP32Board.h"
 #include <target.h>
 
-// 'start ota' arms the mesh OTA session by default (same LoRa OTA protocol
-// as the RP2040 targets — see helpers/ESP32OTA.cpp). Build with
-// -D WIFI_OTA_ON_START to restore the legacy behavior where 'start ota'
-// spawns the WiFi AP + ElegantOTA web portal instead.
-#if defined(WIFI_OTA_ON_START) && defined(ADMIN_PASSWORD) && !defined(DISABLE_WIFI_OTA)   // Repeater or Room Server only
+// 'start ota' keeps its stock ESP32 behavior: it spawns the WiFi AP + ElegantOTA
+// web portal. Build with -D MESH_LORA_OTA to arm a mesh OTA session over LoRa
+// instead (same protocol as the RP2040 targets — see helpers/ESP32OTA.cpp); that
+// build drops the WiFi/AsyncWebServer stack, worth ~520KB flash and ~24KB RAM.
+#if defined(MESH_LORA_OTA)
+bool ESP32Board::startOTAUpdate(const char* id, char reply[]) {
+  return ota.startSession(id, reply);
+}
+
+#elif defined(ADMIN_PASSWORD) && !defined(DISABLE_WIFI_OTA)   // Repeater or Room Server only
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
@@ -45,7 +50,7 @@ bool ESP32Board::startOTAUpdate(const char* id, char reply[]) {
 
 #else
 bool ESP32Board::startOTAUpdate(const char* id, char reply[]) {
-  return ota.startSession(id, reply);
+  return false; // not supported
 }
 #endif
 
