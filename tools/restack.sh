@@ -8,6 +8,7 @@
 #   ./tools/restack.sh integrate   regenerate the integration branch from the stack
 #   ./tools/restack.sh push        force-push the whole set to origin (asks first)
 #   ./tools/restack.sh all         rebase, then integrate - never push
+#   ./tools/restack.sh order       print the merge order, one per line (used by CI)
 #
 # The integration branch is REGENERATED, never merged into incrementally: its
 # history is disposable, the branches are the source of truth. Dropping a feature
@@ -251,6 +252,7 @@ do_check() {
 }
 
 case "${1:-check}" in
+  order)     printf '%s\n' "${MERGE_ORDER[@]}" ;;   # for CI - see stack-check.yml
   check)     do_check ;;
   rebase)    do_rebase ;;
   integrate) do_integrate ;;

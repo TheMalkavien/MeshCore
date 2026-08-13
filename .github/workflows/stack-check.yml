@@ -34,13 +34,33 @@ jobs:
     outputs:
       sha: ${{ steps.merge.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Fetch upstream
         run: |
           git remote add upstream "$UPSTREAM" 2>/dev/null || true
           git fetch upstream "$UPSTREAM_BRANCH"
+      # The merge order lives in tools/restack.sh and nowhere else. Hard-coding a
+      # second copy here is how this job once reported a conflict that did not
+      # exist locally: the chain was reordered in the script and not here.
+      # Read from origin/ because the job detaches onto upstream, which has no
+      # such file.
+      - id: order
+        name: Read the merge order from tools/restack.sh
+        run: |
+          git show origin/packaging/mlk-defaults:tools/restack.sh > "$RUNNER_TEMP/restack.sh"
+          order=$(bash "$RUNNER_TEMP/restack.sh" order | tr '\n' ' ')
+          [ -n "$order" ] || { echo "::error::empty merge order"; exit 1; }
+          echo "branches=$order" >> "$GITHUB_OUTPUT"
+          echo "merge order: $order"
+          # 'on: push:' and the build-branches matrix below cannot read the script
+          # (GitHub needs them at parse time), so they stay hand-written. Warn on
+          # drift rather than let a branch quietly stop being checked.
+          for b in $order; do
+            grep -qE "^ +- $b\$" .github/workflows/stack-check.yml \
+              || echo "::warning::$b is in MERGE_ORDER but not in this workflow's push trigger list"
+          done
       - id: merge
         name: Merge the stack onto upstream/${{ env.UPSTREAM_BRANCH }}
         run: |
@@ -48,13 +68,7 @@ jobs:
           git config user.email "stack-check@localhost"
           git checkout --detach FETCH_HEAD
           fail=0
-          for b in feature/core-enhancements \
-                   feature/repeater-ping \
-                   feature/repeater-flood-retry \
-                   feature/lora-ota \
-                   feature/rp2040-lowpower \
-                   tools/companion-tools \
-                   packaging/mlk-defaults; do
+          for b in ${{ steps.order.outputs.branches }}; do
             if git merge --no-edit --no-ff "origin/$b" >/dev/null 2>&1; then
               echo "::notice::$b merges cleanly"
             else
@@ -94,7 +108,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: integration-tree
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       - name: Cache PlatformIO
@@ -126,10 +140,10 @@ jobs:
           - branch: feature/rp2040-lowpower
             env: waveshare_rp2040_lora_repeater_lowpower
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ matrix.branch }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       - name: Cache PlatformIO
@@ -146,10 +160,10 @@ jobs:
   test-tools:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: tools/companion-tools
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       # The bot's own dependencies, so the tests run against what actually ships
