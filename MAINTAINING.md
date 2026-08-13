@@ -96,6 +96,7 @@ stack
    ├─ 2. Rebase onto upstream
    ├─ 3. Regenerate patch_public
    ├─ 4. Build integration
+   ├─ 5. Push to origin
    └─ Run tools unit tests
 ```
 
@@ -106,7 +107,8 @@ than in a `variants/*/platformio.ini` puts it at the head of the list instead of
 somewhere among the 500-odd board environments.
 
 Equivalent from a terminal: `pio run -e stack -t stack-check` (or
-`-t stack-rebase`, `-t stack-integrate`, `-t stack-build`, `-t stack-tests`).
+`-t stack-rebase`, `-t stack-integrate`, `-t stack-build`, `-t stack-push`,
+`-t stack-tests`).
 
 The tests target deliberately runs under a Python *outside* PlatformIO's own
 venv: the bot's dependencies belong in your environment, not in PlatformIO's.
@@ -122,7 +124,8 @@ Same commands without PlatformIO — `Ctrl+Shift+P` → **Tasks: Run Task** →
 | **Stack: rebase onto upstream** | restacks all seven onto their parents | **rewrites branches** |
 | **Stack: regenerate patch_public** | rebuilds the integration branch (asks first) | **rewrites `patch_public`** |
 | **Stack: build integration** | builds 5 environments | no |
-| **Stack: update from upstream (full)** | rebase + regenerate + build | **both of the above** |
+| **Stack: push to origin** | force-pushes the seven branches and `patch_public` | **rewrites published history** |
+| **Stack: update from upstream (full)** | rebase + regenerate + build — never pushes | **rewrites branches** |
 | **Stack: run tools unit tests** | the Python tests | no |
 
 Prefer a terminal? `Ctrl+ù`, pick the *Git Bash* profile, then `./tools/restack.sh check`.
@@ -142,8 +145,9 @@ This is the whole of it. There is no separate "update dev" step.
 ./tools/restack.sh check       # 1. read-only. Nothing is touched.
 ./tools/restack.sh rebase      # 2. rewrites all seven branches
 ./tools/restack.sh integrate   # 3. rebuilds patch_public (asks for confirmation)
+                               # 4. build - Stack: build integration
+./tools/restack.sh push        # 5. publishes the whole set (asks for confirmation)
 ```
-then **Stack: build integration**, then push.
 
 Roughly monthly, or when upstream lands something you want. The nightly CI
 ([`.github/workflows/stack-check.yml`](.github/workflows/stack-check.yml)) tells
@@ -295,8 +299,12 @@ sits on top of it. The reverse works — dropping only `lora-ota` is fine.
 ```bash
 git checkout -b feature/my-thing feature/core-enhancements
 ```
-then add it in three places: `STACK` and `MERGE_ORDER` in the script, and the
-`on: push: branches:` list in the workflow.
+then add it to `STACK` and `MERGE_ORDER` in
+[`tools/restack.sh`](tools/restack.sh) — that is the one list the CI reads back,
+so the merge order is never duplicated. Two lists in the workflow still have to
+be edited by hand, because GitHub needs them before it can run anything: the
+`on: push: branches:` trigger and the `build-branches` matrix. The `integrate`
+job warns if a branch is in `MERGE_ORDER` but missing from the trigger.
 
 ---
 
