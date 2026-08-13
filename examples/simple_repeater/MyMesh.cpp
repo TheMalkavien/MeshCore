@@ -61,7 +61,7 @@
 #define LAZY_CONTACTS_WRITE_DELAY    5000
 #define PING_TIMEOUT_MILLIS          8000
 #define PING_MAX_COUNT               100   // max pings accepted by a single 'ping' command
-#define PING_INTERVAL_MILLIS         700   // pacing gap between consecutive pings (>= CLI_REPLY_DELAY_MILLIS so remote replies keep their order)
+#define PING_INTERVAL_MILLIS         1700   // pacing gap between consecutive pings (>= CLI_REPLY_DELAY_MILLIS so remote replies keep their order)
 
 void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
 #if MAX_NEIGHBOURS // check if neighbours enabled
