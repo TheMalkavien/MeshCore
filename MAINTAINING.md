@@ -54,6 +54,29 @@ moving code around avoids a merge conflict — only stacking does.
 
 `packaging/mlk-defaults` is merged last so its distribution defaults win.
 
+### What lives in `core-enhancements`, and why
+
+Beyond its own hardening and CPU work, this branch holds everything **two or
+more branches depend on**. That is not tidiness: a thing that two siblings both
+edit is a merge conflict at every single regeneration, and no amount of moving
+code around inside those branches avoids it. Moving it down to the branch they
+both sit on does.
+
+| shared | who needs it |
+|---|---|
+| `Dispatcher::nextAppWake()` | `ping` reports its in-flight deadline, `flood-retry` its earliest retry, `rp2040-lowpower` consults both |
+| `MainBoard::isOTASessionActive()` | `lora-ota` overrides it, `rp2040-lowpower` refuses to sleep while it is true |
+| `CommonCLI::getCommandPrefixLen()` | `ping` reflects the client's token on async replies, `lora-ota` recognises its own commands through it — and the repeater, room server and sensor all strip it |
+
+Each of these arrived the same way: as a conflict during `integrate`, between
+two branches that had both grown a copy. **That is the signal.** When two of
+your branches fight over the same lines and both are right, the answer is
+almost never to resolve the merge — it is to move the disputed thing here and
+let each branch consume it.
+
+The base classes return a neutral default (`0`, `false`), so nothing changes
+for a role that does not override them.
+
 ---
 
 ## 2. The three rules
@@ -72,6 +95,12 @@ computes every branch's old base from the state it finds. If you have already
 moved one, its old tip is no longer an ancestor of its children, the computed
 bases are wrong, and the parent's commits get replayed a second time on top of
 themselves. It is all-or-nothing: let the script do all seven, or none.
+
+> This includes "just this one branch, to get past a conflict". If you do end up
+> rebasing by hand — resolving a conflict the script stopped on is exactly that —
+> finish the whole stack by hand too, with an explicit
+> `git rebase --onto <parent> <the parent's previous tip> <branch>` for each
+> remaining branch. Re-running the script mid-way is what corrupts the stack.
 
 **A clean merge proves nothing. Only a build does.** See §6.
 
@@ -210,10 +239,13 @@ old base is already the parent's tip, and moves on.
     examples/simple_repeater/MyMesh.h
 ```
 
-This means two of *your own* branches now contradict each other, which only
-happens when upstream moved something both touch. `patch_public` was **not**
-touched — you are on a scratch branch. Resolve it in the branch, not here,
-otherwise you will resolve the same conflict at every regeneration:
+Two of *your own* branches now contradict each other. `patch_public` was **not**
+touched — you are on a scratch branch, and aborting costs nothing.
+
+Never resolve it here. A resolution made in the integration is thrown away with
+the branch it lives on, so you will make the same one at every regeneration,
+forever, and `rerere` will start replaying it whether or not it is still right.
+Fix it where it belongs and the conflict stops existing:
 
 ```bash
 git merge --abort
@@ -222,6 +254,13 @@ git checkout feature/repeater-flood-retry
 ./tools/restack.sh rebase
 ./tools/restack.sh integrate
 ```
+
+**Ask first whether it belongs in one branch at all.** Two branches editing the
+same lines, both correct, usually means they have each grown a copy of
+something shared. Moving that thing down into `core-enhancements` — see §1 —
+removes the conflict permanently instead of scheduling it. Every entry in that
+table got there exactly this way. Only fix it inside one branch when the other
+branch has no legitimate claim on those lines.
 
 ### Pushing
 
