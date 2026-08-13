@@ -97,28 +97,12 @@ static const char* skipCommandSpaces(const char* p) {
   return p;
 }
 
-static bool isHexChar(char c) {
-  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-}
-
-// Length of the optional "<hex-token>|" prefix mccli puts in front of a command
-// (0 if absent). Generalises the fixed 2-char form so longer tokens also work.
-static size_t getCommandPrefixLen(const char* command) {
-  const char* p = skipCommandSpaces(command);
-  size_t n = 0;
-  while (isHexChar(p[n])) {
-    n++;
-    if (n >= 8) break;  // safety cap
-  }
-  return (n >= 2 && p[n] == '|') ? n + 1 : 0;
-}
-
 // True for the CLI commands that belong to an OTA transfer, so the reply/ACK
 // delays above can be applied to them and only them.
 static bool isOtaCLICommand(const char* command) {
   if (command == NULL) return false;
   const char* p = skipCommandSpaces(command);
-  p += getCommandPrefixLen(p);
+  p += CommonCLI::getCommandPrefixLen(p);   // same prefix rule handleCommand() strips
   p = skipCommandSpaces(p);
 
   if (memcmp(p, "start ota", 9) == 0 && (p[9] == 0 || p[9] == ' ')) return true;

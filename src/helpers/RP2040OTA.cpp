@@ -21,6 +21,17 @@
   #define RP2040_OTA_SESSION_TIMEOUT_MS (5UL * 60UL * 1000UL)
 #endif
 
+// A successful 'end' leaves the UF2 staged but the node still has to reset to
+// flash it, and the client's reboot command is a plain fire-and-forget packet.
+// The session is over at that point, so power management would resume immediately
+// (dropping the clock and core voltage) and the node could miss exactly that
+// packet - leaving a verified image waiting for a manual reset. Hold the active
+// profile for this long afterwards; if the reboot never comes the node simply
+// resumes normal behaviour.
+#ifndef RP2040_OTA_REBOOT_GRACE_MS
+  #define RP2040_OTA_REBOOT_GRACE_MS (60UL * 1000UL)
+#endif
+
 // RAM staging buffer: chunks accumulate here and hit the flash (LittleFS) only
 // once per buffer-full. Every flash flush freezes the RP2040 (~50ms per 4KB
 // sector) and the OTA client must checkpoint around each freeze, so a bigger
@@ -56,6 +67,7 @@ RP2040OTAController::RP2040OTAController() {
 void RP2040OTAController::clearState() {
   _armed = false;
   _active = false;
+  _awaiting_reboot_since = 0;
   _expected_size = 0;
   _received_size = 0;
   _next_progress_log = 0;
@@ -138,6 +150,10 @@ size_t RP2040OTAController::flushBlockBytes() const {
 }
 
 bool RP2040OTAController::isSleepInhibited() const {
+  if (_awaiting_reboot_since != 0
+      && (uint32_t)(millis() - _awaiting_reboot_since) < RP2040_OTA_REBOOT_GRACE_MS) {
+    return true;
+  }
   return (_armed || _active) && !sessionExpired();
 }
 
@@ -506,6 +522,10 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
 
     OTA_DEBUG_PRINTLN("end ok, image staged");
     clearState();
+    // Stay at the active profile for the reboot command that follows
+    // (see RP2040_OTA_REBOOT_GRACE_MS).
+    _awaiting_reboot_since = millis();
+    if (_awaiting_reboot_since == 0) _awaiting_reboot_since = 1;   // 0 means 'not waiting'
     strcpy(reply, "OK - OTA staged, reboot now");
     return true;
   }
