@@ -103,9 +103,24 @@ record_refs() {
   done
 }
 
+# A branch owns a fixed number of commits above its parent. A restack replays them;
+# it must never change that count. When it does, commits from a parent have been
+# duplicated onto the child - which compiles into duplicate declarations, or
+# surfaces later as a merge conflict that makes no sense. Cheap to check, and the
+# only reliable way to catch it early.
+count_own_commits() {
+  local entry b p
+  for entry in "${STACK[@]}"; do
+    b=$(branch_of "$entry"); p=$(parent_of "$entry")
+    printf '%s %s\n' "$b" "$(git rev-list --count "$p..$b")"
+  done
+}
+
 do_rebase() {
   require_clean_tree
   record_refs
+  local before
+  before=$(count_own_commits)
   git fetch upstream --quiet
 
   # Every old base is computed BEFORE anything moves. This is the whole trick:
@@ -128,9 +143,15 @@ do_rebase() {
       ok "$b" "already on $p"
       continue
     fi
-    # rerere.autoupdate is forced off: it would stage a replayed resolution and
-    # let the rebase carry on silently, which is how a stale one gets in.
-    if git -c rerere.autoupdate=false rebase --onto "$p" "${old_base[$b]}" "$b" >/dev/null 2>&1; then
+    # Both settings are forced off regardless of local config:
+    #  - rerere.autoupdate would stage a replayed resolution and let the rebase
+    #    carry on silently, which is how a stale one gets in.
+    #  - rebase.updateRefs would move OTHER branches that happen to point inside
+    #    the replayed range. This script places every branch explicitly with
+    #    --onto; letting git also move them implicitly is how sibling branches
+    #    end up carrying each other's commits.
+    if git -c rerere.autoupdate=false -c rebase.updateRefs=false \
+           rebase --onto "$p" "${old_base[$b]}" "$b" >/dev/null 2>&1; then
       ok "$b" "onto $p"
     else
       bad "$b" "conflict - resolve, then: git rebase --continue"
@@ -139,6 +160,20 @@ do_rebase() {
       exit 1
     fi
   done
+
+  local after
+  after=$(count_own_commits)
+  if [ "$before" != "$after" ]; then
+    say "BROKEN: a branch changed how many commits it owns"
+    join -j 1 <(echo "$before") <(echo "$after") | while read -r b n1 n2; do
+      [ "$n1" = "$n2" ] || printf '  %-34s %s -> %s commits\n' "$b" "$n1" "$n2"
+    done
+    echo
+    echo "  A restack replays a branch's own commits; it never changes their number."
+    echo "  A parent's commits have been duplicated onto a child. Do NOT integrate."
+    echo "  Recover with the tips printed above, then check 'git config rebase.updateRefs'."
+    exit 1
+  fi
 }
 
 # Rebuilds the integration branch in a scratch ref, so a failure leaves the real
