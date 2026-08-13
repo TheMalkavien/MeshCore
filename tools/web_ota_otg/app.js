@@ -1,5 +1,9 @@
 ﻿const MAX_MESH_CMD_TEXT_LEN = 160;
-const REPEATER_CMD_TOKEN_LEN = 5; // "0000|"
+// Longueur du jeton d'appariement des commandes CLI. 2 chiffres hexa, pas plus :
+// voir MeshCoreSerialClient.nextCliToken() pour la contrainte firmware.
+const CLI_TOKEN_HEX_LEN = 2;
+const CLI_TOKEN_MASK = (1 << (CLI_TOKEN_HEX_LEN * 4)) - 1;
+const REPEATER_CMD_TOKEN_LEN = CLI_TOKEN_HEX_LEN + 1; // "ab|"
 const OTA_WRITE_CMD_PREFIX = "ota write ";
 const OTA_BINARY_REQ_TYPE = 0x70;
 const OTA_BIN_OP = {
@@ -806,7 +810,7 @@ class MeshCoreSerialClient {
     this.connected = false;
     this.rxPending = [];
     this.waiters = [];
-    this.seq = Date.now() & 0xffff;
+    this.seq = Date.now() & CLI_TOKEN_MASK;
     this.messageQueue = [];
     this.maxMessageQueue = 512;
     this.binaryQueue = [];
@@ -1936,10 +1940,24 @@ class MeshCoreSerialClient {
     return null;
   }
 
+  // Tag chaque commande CLI d'un jeton hexa que la cible réfléchit en tête de sa
+  // réponse, ce qui permet d'apparier une réponse tardive à sa requête.
+  //
+  // La longueur du jeton n'est PAS libre : le firmware historique ne reconnaît le
+  // préfixe qu'à la position fixe command[2] == '|', donc un jeton de 4 chiffres
+  // laisse la commande entière non reconnue ("0001|tempradio ..."), sans réponse
+  // porteuse du jeton — côté client, indiscernable d'une commande jamais arrivée.
+  // Deux chiffres, c'est le seul format que comprennent à la fois l'ancien
+  // firmware (celui qu'on est justement en train de mettre à jour) et le nouveau.
+  nextCliToken() {
+    const token = `${this.seq.toString(16).padStart(CLI_TOKEN_HEX_LEN, "0")}|`;
+    this.seq = (this.seq + 1) & CLI_TOKEN_MASK;
+    return token;
+  }
+
   async sendRepeaterCmdAndWaitReply(targetHex, cmd, timeoutSec = 0) {
     const pubkeyPrefix = this.normalizeTargetPrefix(targetHex);
-    const token = `${this.seq.toString(16).padStart(4, "0")}|`;
-    this.seq = (this.seq + 1) & 0xffff;
+    const token = this.nextCliToken();
     this.purgeTokenReplies(pubkeyPrefix, token);
 
     const sent = await this.sendMeshCmd(targetHex, `${token}${cmd}`, true);
@@ -1974,8 +1992,7 @@ class MeshCoreSerialClient {
   }
 
   async sendRepeaterCmdNoReply(targetHex, cmd) {
-    const token = `${this.seq.toString(16).padStart(4, "0")}|`;
-    this.seq = (this.seq + 1) & 0xffff;
+    const token = this.nextCliToken();
     const sent = await this.sendMeshCmd(targetHex, `${token}${cmd}`, true);
     if (!sent || sent.type === "error") {
       const code = sent?.payload?.error_code;
@@ -3391,7 +3408,7 @@ async function runBinaryOta(params) {
     }
 
     await sleep(1000);
-    await client.sendRepeaterCmdNoReply(targetHex, "reboot");
+    await sendTargetRebootRepeatedly(targetHex);
 
     const durationSec = (performance.now() - tStart) / 1000.0;
     const sendFailureRatePct = chunkWriteAttempts > 0
@@ -3816,7 +3833,7 @@ async function runTextOta(params) {
     shouldCleanupTargetOta = false;
 
     await sleep(1000);
-    await client.sendRepeaterCmdNoReply(targetHex, "reboot");
+    await sendTargetRebootRepeatedly(targetHex);
 
     const durationSec = (performance.now() - tStart) / 1000.0;
     const sendFailureRatePct = chunkWriteAttempts > 0
@@ -4050,6 +4067,38 @@ const TEMP_RADIO_MAX_ATTEMPTS = 3;        // renvois tempradio avant abandon pro
 // réponse prouve la joignabilité, seul but ici) ou l'expiration de la fenêtre.
 // STATUS binaire d'abord (rapide, si la clé complète est résolue), puis repli
 // sur "ota status" texte (cibles sans OTA binaire). Ne modifie aucun état cible.
+// Le 'reboot' final est la seule étape sans accusé de réception possible : la
+// cible redémarre au lieu de répondre. Un unique paquet perdu laissait donc
+// l'image vérifiée en attente d'un reset manuel — c'est le cas signalé sur
+// Heltec V4 ("pas de reboot à la fin"). On le réémet donc plusieurs fois.
+//
+// Espacement > 1s obligatoire : le firmware compare le timestamp émetteur (en
+// SECONDES) à client->last_timestamp et traite l'égalité comme un doublon, sans
+// exécuter la commande. Deux 'reboot' dans la même seconde = un seul pris en
+// compte. La commande est idempotente, la réémission est donc sans risque : le
+// premier paquet qui arrive redémarre le nœud, les suivants tombent dans le vide.
+const REBOOT_SEND_ATTEMPTS = 3;
+const REBOOT_SEND_GAP_MS = 2500;
+
+async function sendTargetRebootRepeatedly(targetHex, attempts = REBOOT_SEND_ATTEMPTS) {
+  let delivered = 0;
+  for (let i = 0; i < attempts; i += 1) {
+    if (i > 0) await sleep(REBOOT_SEND_GAP_MS);
+    const err = await client.sendRepeaterCmdNoReply(targetHex, "reboot");
+    if (err) {
+      appendLog(`Reboot cible: échec d'émission ${i + 1}/${attempts} (${err}).`);
+    } else {
+      delivered += 1;
+    }
+  }
+  if (delivered === 0) {
+    appendLog("Reboot cible: aucune émission n'a abouti — redémarre le nœud à la main pour appliquer l'image.");
+  } else {
+    appendLog(`Reboot cible: ${delivered}/${attempts} émission(s) envoyée(s).`);
+  }
+  return delivered > 0;
+}
+
 async function probeTargetReachableOnTemp(targetHex, probeKey, windowMs) {
   const tEnd = performance.now() + windowMs;
   let lastErr = "aucune sonde";
