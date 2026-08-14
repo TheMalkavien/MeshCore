@@ -11,8 +11,30 @@
 
 #include <SPIFFS.h>
 
+#if defined(CONFIG_PM_ENABLE)
+  #include <esp_pm.h>
+  static esp_pm_lock_handle_t ota_no_light_sleep_lock = nullptr;
+  static bool ota_no_light_sleep_lock_acquired = false;
+#endif
+
 bool ESP32Board::startOTAUpdate(const char* id, char reply[]) {
   inhibit_sleep = true;   // prevent sleep during OTA
+
+#if defined(CONFIG_PM_ENABLE)
+  // Event-driven IDF profiles use automatic light sleep rather than
+  // ESP32Board::sleep(), so inhibit_sleep alone is not sufficient. Keep Wi-Fi
+  // AP/AsyncTCP fully awake until the OTA-triggered reboot.
+  if (!ota_no_light_sleep_lock) {
+    (void)esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "meshcore_ota",
+                             &ota_no_light_sleep_lock);
+  }
+  if (ota_no_light_sleep_lock && !ota_no_light_sleep_lock_acquired) {
+    if (esp_pm_lock_acquire(ota_no_light_sleep_lock) == ESP_OK) {
+      ota_no_light_sleep_lock_acquired = true;
+    }
+  }
+#endif
+
   WiFi.softAP("MeshCore-OTA", NULL);
 
   sprintf(reply, "Started: http://%s/update", WiFi.softAPIP().toString().c_str());

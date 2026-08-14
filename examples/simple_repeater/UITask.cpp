@@ -7,7 +7,9 @@
 #define USER_BTN_PRESSED LOW
 #endif
 
-#define AUTO_OFF_MILLIS      20000  // 20 seconds
+#ifndef AUTO_OFF_MILLIS
+  #define AUTO_OFF_MILLIS    20000  // 20 seconds
+#endif
 #define BOOT_SCREEN_MILLIS   4000   // 4 seconds
 
 #define POWEROFF_DELAY 3000

@@ -1094,6 +1094,17 @@ void MyMesh::begin(bool has_display) {
     _prefs.rx_ps_preamble = RXPS_COMPANION_DEFAULT_PREAMBLE;
     _prefs.radio_fem_rxgain = FEM_RXGAIN_COMPANION_DEFAULT;
   }
+  if (_prefs.prefs_format_version < 3) {
+    // RXPS was not compiled into the earlier Heltec V3 BLE/IDF profile, so an
+    // existing V3 installation cannot already have a working RXPS choice to
+    // preserve. Adopt the new profile default once; later user changes remain
+    // untouched.
+#if defined(HELTEC_V3_LOW_POWER_PROFILE)
+    _prefs.rx_ps_enabled = RXPS_COMPANION_DEFAULT_ENABLED;
+    _prefs.rx_ps_level = RXPS_COMPANION_DEFAULT_LEVEL;
+    _prefs.rx_ps_preamble = RXPS_COMPANION_DEFAULT_PREAMBLE;
+#endif
+  }
   if (_prefs.prefs_format_version < COMPANION_PREFS_FORMAT_VERSION) {
     _prefs.prefs_format_version = COMPANION_PREFS_FORMAT_VERSION;
     savePrefs();

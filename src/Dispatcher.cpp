@@ -195,7 +195,13 @@ uint32_t Dispatcher::idleSleepMillis(uint32_t now) const {
   uint32_t sched = _mgr->getNextOutboundSchedule();
   if (sched != 0xFFFFFFFF) {
     d = (int32_t)(sched - now);
-    if (d <= 0) return 0;
+    if (d <= 0) {
+      // A queued packet can already be due while duty-cycle budget or CAD
+      // backoff postpones its next attempt. Sleep to that retry deadline
+      // instead of spinning every few milliseconds.
+      d = (int32_t)(next_tx_time - now);
+      if (d <= 0) return 0;
+    }
     if ((uint32_t)d < sleep_ms) sleep_ms = (uint32_t)d;
   }
   sched = _mgr->getNextInboundSchedule();

@@ -61,11 +61,6 @@ protected:
   void rxPsWatchdogCheck();
   void noiseFloorCalibCheck();
   void endNoiseFloorCalib(unsigned long now);
-  // The measured floor is only ever consumed by the int.thresh branch of
-  // isChannelActive(). With that threshold disabled (the companion default,
-  // which relies on hardware CAD instead) the periodic RXPS calibration window
-  // would drop to continuous RX and hold the main loop at its busy poll rate
-  // once a minute to produce a number nothing reads.
   bool needsNoiseFloor() const { return _threshold != 0; }
   void prepareForRadioConfig();
   void cacheParams(float freq, float bw, uint8_t sf, uint8_t cr) {
@@ -147,6 +142,7 @@ public:
   }
   bool isWatchdogObserving() const { return _wd_observe_until != 0; }
   bool isCalibratingNoiseFloor() const { return _nf_calib_active; }
+  bool isNoiseFloorSampling() const;
   void resetStats() { n_recv = n_sent = n_recv_errors = n_wd_soft = n_wd_hard = 0; }
 
   // final: these must return the metadata cached by recvRaw() before the RX

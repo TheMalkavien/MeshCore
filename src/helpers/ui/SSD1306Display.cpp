@@ -21,6 +21,10 @@ static inline void keepPinActiveDuringSleep(int pin) {
   #define OLED_RELEASE_BUS_WHEN_OFF 0
 #endif
 
+#ifndef OLED_POWER_ON_DELAY_MS
+  #define OLED_POWER_ON_DELAY_MS 0
+#endif
+
 #if defined(ESP_PLATFORM) && OLED_RELEASE_BUS_WHEN_OFF && \
     defined(PIN_BOARD_SDA) && defined(PIN_BOARD_SCL)
 static void setI2CBusIdlePullups(bool enabled) {
@@ -62,7 +66,12 @@ ColorVal UIColor::corp_blue = SSD1306_WHITE;
 
 bool SSD1306Display::begin() {
   if (!_isOn) {
-    if (_peripher_power) _peripher_power->claim();
+    if (_peripher_power) {
+      _peripher_power->claim();
+#if OLED_POWER_ON_DELAY_MS > 0
+      delay(OLED_POWER_ON_DELAY_MS);
+#endif
+    }
     _isOn = true;
   }
 #if defined(ESP_PLATFORM) && defined(CONFIG_PM_SLP_DISABLE_GPIO)
@@ -96,6 +105,9 @@ void SSD1306Display::turnOn() {
   if (!_isOn) {
     if (_peripher_power) {
       _peripher_power->claim();
+#if OLED_POWER_ON_DELAY_MS > 0
+      delay(OLED_POWER_ON_DELAY_MS);
+#endif
       I2C_BUS_IDLE_PULLUPS(true);  // restore the bus before the first transaction
     }
     _isOn = true;  // set before begin() to prevent double claim

@@ -5,6 +5,10 @@
 #endif
 #include "MyMesh.h"
 
+#if defined(EVENT_DRIVEN_LOOP) && defined(ESP32) && defined(ESP_PLATFORM)
+  #include "ESP32EventLoop.h"
+#endif
+
 #ifdef DISPLAY_CLASS
   #include "UITask.h"
   static UITask ui_task(board, display);
@@ -24,10 +28,8 @@ void halt() {
   while (1) ;
 }
 
+#ifndef DISABLE_SERIAL_CONSOLE
 static char command[160];
-#ifdef ETHERNET_ENABLED
-static char ethernet_command[160];
-#endif
 
 static bool isUsbOffCommand(const char *cmd) {
   while (*cmd == ' ') {
@@ -41,6 +43,11 @@ static bool isUsbOffCommand(const char *cmd) {
   }
   return strcmp(cmd, "usb off") == 0;
 }
+#endif
+
+#ifdef ETHERNET_ENABLED
+static char ethernet_command[160];
+#endif
 
 // For power saving
 #if defined(RP2040_PLATFORM)
@@ -56,12 +63,18 @@ static unsigned long userBtnDownAt = 0;
 #endif
 
 void setup() {
+#if defined(EVENT_DRIVEN_LOOP) && defined(ESP32) && defined(ESP_PLATFORM)
+  repeater_low_power::disableUSBSerialJTAG();
+#endif
+
+#ifndef DISABLE_SERIAL_CONSOLE
   #ifdef MLK_PIN_SERIAL_RX
     Serial.setRX(MLK_PIN_SERIAL_RX);
     Serial.setTX(MLK_PIN_SERIAL_TX);
   #endif
   Serial.begin(115200);
   delay(1000);
+#endif
 
   board.begin();
 
@@ -118,10 +131,12 @@ void setup() {
     store.save("_main", the_mesh.self_id);
   }
 
+#ifndef DISABLE_SERIAL_CONSOLE
   Serial.print("Repeater ID: ");
-  mesh::Utils::printHex(Serial, the_mesh.self_id.pub_key, PUB_KEY_SIZE); Serial.println();
-
+  mesh::Utils::printHex(Serial, the_mesh.self_id.pub_key, PUB_KEY_SIZE);
+  Serial.println();
   command[0] = 0;
+#endif
 #ifdef ETHERNET_ENABLED
   ethernet_command[0] = 0;
 #endif
@@ -143,10 +158,15 @@ void setup() {
   the_mesh.sendSelfAdvertisement(16000, false);
 #endif
 
+#if defined(EVENT_DRIVEN_LOOP) && defined(ESP32) && defined(ESP_PLATFORM)
+  repeater_low_power::beginEventDrivenLoop();
+#endif
+
   board.onBootComplete();
 }
 
 void loop() {
+#ifndef DISABLE_SERIAL_CONSOLE
   // Handle Serial CLI
   int len = strlen(command);
   while (Serial.available() && len < sizeof(command)-1) {
@@ -181,6 +201,7 @@ void loop() {
 
     command[0] = 0;  // reset command buffer
   }
+#endif
 
 #ifdef ETHERNET_ENABLED
   ethernet_loop_maintain();
@@ -221,6 +242,32 @@ void loop() {
   external_watchdog.loop();
 #endif
 
+#if defined(EVENT_DRIVEN_LOOP) && defined(ESP32) && defined(ESP_PLATFORM)
+  #ifndef LOOP_BUSY_DELAY_MS
+    #define LOOP_BUSY_DELAY_MS 4
+  #endif
+  #ifndef EVENT_LOOP_IDLE_MAX_MS
+    #define EVENT_LOOP_IDLE_MAX_MS 500
+  #endif
+
+  // The dispatcher knows every packet/app deadline. Block until the nearest
+  // one, capped for UI housekeeping; LoRa DIO1 and the button notify this task
+  // immediately, so reception remains continuous and responsive.
+  uint32_t wait_ms = the_mesh.getIdleWaitMillis();
+  if (wait_ms == 0) {
+    wait_ms = LOOP_BUSY_DELAY_MS;
+  } else if (wait_ms > EVENT_LOOP_IDLE_MAX_MS) {
+    wait_ms = EVENT_LOOP_IDLE_MAX_MS;
+  }
+  // The noise-floor estimator needs 64 loop samples. A 500 ms idle cadence
+  // would take over 32 seconds and a short periodic AGC reset could restart it
+  // forever. Fast-poll only while those samples are pending, then immediately
+  // return to the normal event-driven low-power cadence.
+  if (radio_driver.isNoiseFloorSampling() && wait_ms > LOOP_BUSY_DELAY_MS) {
+    wait_ms = LOOP_BUSY_DELAY_MS;
+  }
+  repeater_low_power::waitForEvent(wait_ms);
+#else
   if (the_mesh.getNodePrefs()->powersaving_enabled) {
 #if defined(NRF52_PLATFORM)
     if (!the_mesh.hasPendingWork()) {
@@ -243,4 +290,5 @@ void loop() {
     }
 #endif
   }
+#endif
 }

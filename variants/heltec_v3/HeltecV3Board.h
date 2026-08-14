@@ -3,6 +3,9 @@
 #include <Arduino.h>
 #include <helpers/RefCountedDigitalPin.h>
 #include <helpers/ESP32Board.h>
+#if defined(HELTEC_V3_LOW_POWER_PROFILE) && defined(CONFIG_PM_SLP_DISABLE_GPIO) && CONFIG_PM_SLP_DISABLE_GPIO
+  #include <driver/gpio.h>
+#endif
 
 // built-ins
 #ifndef PIN_VBAT_READ              // set in platformio.ini for boards like Heltec Wireless Paper (20)
@@ -21,6 +24,18 @@ class HeltecV3Board : public ESP32Board {
 private:
   bool adc_active_state;
 
+#if defined(HELTEC_V3_LOW_POWER_PROFILE) && defined(CONFIG_PM_SLP_DISABLE_GPIO) && CONFIG_PM_SLP_DISABLE_GPIO
+  static inline void configureSleepOutputPin(int pin) {
+    if (pin < 0) return;
+    const gpio_num_t gpio = (gpio_num_t)pin;
+    // Keep the current output level while the IDF isolates ordinary GPIOs in
+    // automatic light sleep.
+    (void)gpio_sleep_set_direction(gpio, GPIO_MODE_OUTPUT);
+    (void)gpio_sleep_set_pull_mode(gpio, GPIO_FLOATING);
+    (void)gpio_sleep_sel_en(gpio);
+  }
+#endif
+
   static inline void biasInputPin(int pin, uint8_t mode) {
     if (pin < 0) return;
     pinMode((uint8_t)pin, mode);
@@ -30,6 +45,18 @@ private:
 #if defined(PIN_USER_BTN)
     // Heltec V3 user button is active-low on GPIO0.
     biasInputPin(PIN_USER_BTN, INPUT_PULLUP);
+#endif
+
+#if defined(HELTEC_V3_LOW_POWER_PROFILE) && defined(CONFIG_PM_SLP_DISABLE_GPIO) && CONFIG_PM_SLP_DISABLE_GPIO
+    // Preserve the radio deselect, battery-divider and disabled TX LED states
+    // while the ESP32-S3 enters automatic light sleep.
+    pinMode(P_LORA_NSS, OUTPUT);
+    digitalWrite(P_LORA_NSS, HIGH);
+    configureSleepOutputPin(P_LORA_NSS);
+    configureSleepOutputPin(PIN_ADC_CTRL);
+#ifdef P_LORA_TX_LED
+    configureSleepOutputPin(P_LORA_TX_LED);
+#endif
 #endif
 
     // Optional user-defined unused GPIO list (bias to GND).
@@ -76,7 +103,11 @@ private:
 public:
   RefCountedDigitalPin periph_power;
 
-  HeltecV3Board() : periph_power(PIN_VEXT_EN) { }
+  HeltecV3Board() : periph_power(PIN_VEXT_EN
+#ifdef PIN_VEXT_EN_ACTIVE
+      , PIN_VEXT_EN_ACTIVE
+#endif
+  ) { }
 
   void begin() {
     ESP32Board::begin();
@@ -117,6 +148,20 @@ public:
 
     return (ADC_MULTIPLIER * (3.3 / 1024.0) * raw) * 1000;
   }
+
+#if defined(P_LORA_TX_LED)
+  void onBeforeTransmit() override {
+#if !defined(DISABLE_TX_LED) || (DISABLE_TX_LED == 0)
+    ESP32Board::onBeforeTransmit();
+#endif
+  }
+
+  void onAfterTransmit() override {
+#if !defined(DISABLE_TX_LED) || (DISABLE_TX_LED == 0)
+    ESP32Board::onAfterTransmit();
+#endif
+  }
+#endif
 
   const char* getManufacturerName() const override {
     return "Heltec V3";

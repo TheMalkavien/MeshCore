@@ -176,18 +176,28 @@ uint32_t MyMesh::nextAppWake(uint32_t now) const {
   uint32_t best = 0;
   (void)now;
 
+  const auto consider = [&best](uint32_t deadline) {
+    if (deadline != 0 && (best == 0 || (int32_t)(deadline - best) < 0)) {
+      best = deadline;
+    }
+  };
+
 #if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
   for (int i = 0; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
     if (!_flood_retry[i].active) continue;
-    uint32_t t = _flood_retry[i].next_retry_at;
-    if (best == 0 || (int32_t)(t - best) < 0) best = t;
+    consider(_flood_retry[i].next_retry_at);
   }
 #endif
 
   if (pending_ping.session_active) {
-    uint32_t t = pending_ping.active ? pending_ping.expiry_at : pending_ping.next_at;
-    if (t != 0 && (best == 0 || (int32_t)(t - best) < 0)) best = t;
+    consider(pending_ping.active ? pending_ping.expiry_at : pending_ping.next_at);
   }
+
+  consider(next_local_advert);
+  consider(next_flood_advert);
+  consider(set_radio_at);
+  consider(revert_radio_at);
+  consider(dirty_contacts_expiry);
 
   return best;
 }
@@ -1646,7 +1656,13 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.rx_boosted_gain = 1; // enabled by default;
 #endif
 #endif
+#ifdef RADIO_FEM_RXGAIN_DEFAULT
+  // Low-power boards can default the external LNA to bypass. Persisted user
+  // preferences still win after loadPrefs(), and the CLI can turn it back on.
+  _prefs.radio_fem_rxgain = RADIO_FEM_RXGAIN_DEFAULT ? 1 : 0;
+#else
   _prefs.radio_fem_rxgain = 1;
+#endif
   _prefs.radio_fem_txgain = 0;
 
   pending_discover_tag = 0;

@@ -12,7 +12,12 @@
 // Persisted preference schema used for one-shot receive-path migrations.
 // 1 = RXPS fields introduced.
 // 2 = FEM RX gain introduced and RXPS/FEM build defaults adopted once.
-#define COMPANION_PREFS_FORMAT_VERSION 2
+// 3 = V3 IDF low-power profile adopts its newly supported RXPS default once.
+#if defined(HELTEC_V3_LOW_POWER_PROFILE)
+  #define COMPANION_PREFS_FORMAT_VERSION 3
+#else
+  #define COMPANION_PREFS_FORMAT_VERSION 2
+#endif
 
 class NodePrefs : public ConfigSerializer {  // persisted to file
 public:

@@ -15,6 +15,10 @@
 #define NF_CALIB_TIMEOUT_MS   5000UL
 #define NF_CALIB_SETTLE_MS    20UL
 
+#ifndef RXPS_BACKGROUND_NOISE_FLOOR_INTERVAL_MS
+  #define RXPS_BACKGROUND_NOISE_FLOOR_INTERVAL_MS  0UL
+#endif
+
 static volatile uint8_t state = STATE_IDLE;
 static RadioLibWrapper* g_radio_for_sleep = NULL;
 
@@ -86,6 +90,10 @@ void RadioLibWrapper::triggerNoiseFloorCalibrate(int threshold) {
     _num_floor_samples = 0;
     _floor_sample_sum = 0;
   }
+}
+
+bool RadioLibWrapper::isNoiseFloorSampling() const {
+  return _num_floor_samples < NUM_NOISE_FLOOR_SAMPLES;
 }
 
 void RadioLibWrapper::doResetAGC() {
@@ -177,13 +185,22 @@ void RadioLibWrapper::rxPsWatchdogCheck() {
 
 void RadioLibWrapper::noiseFloorCalibCheck() {
   const unsigned long now = millis();
+  // RXPS normally measures the floor only for int.thresh. Selected low-power
+  // companions also maintain a rate-limited cached value for UI/stats while
+  // keeping getNoiseFloor() itself free of side effects.
+  const bool background_enabled = RXPS_BACKGROUND_NOISE_FLOOR_INTERVAL_MS > 0;
+  const bool want_noise_floor = needsNoiseFloor() || background_enabled;
+  const unsigned long interval_ms = background_enabled
+      ? RXPS_BACKGROUND_NOISE_FLOOR_INTERVAL_MS
+      : NF_CALIB_INTERVAL_MS;
+
   if (_nf_calib_active) {
-    // A zero threshold can also be set while a window is open; close it early.
-    if (!_rx_ps_enabled || !needsNoiseFloor() || (long)(now - _nf_calib_deadline) >= 0) {
+    // Close if RXPS/the reporting policy is withdrawn, or at the hard deadline.
+    if (!_rx_ps_enabled || !want_noise_floor || (long)(now - _nf_calib_deadline) >= 0) {
       endNoiseFloorCalib(now);
     }
-  } else if (_rx_ps_enabled && _rx_ps_armed && needsNoiseFloor() && state == STATE_RX &&
-             (_nf_last_calib == 0 || now - _nf_last_calib >= NF_CALIB_INTERVAL_MS) &&
+  } else if (_rx_ps_enabled && _rx_ps_armed && want_noise_floor && state == STATE_RX &&
+             (_nf_last_calib == 0 || now - _nf_last_calib >= interval_ms) &&
              !isReceivingPacket()) {
     _nf_calib_active = true;
     _nf_calib_deadline = now + NF_CALIB_TIMEOUT_MS;

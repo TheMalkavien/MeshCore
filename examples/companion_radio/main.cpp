@@ -225,6 +225,8 @@ static bool tryManualLightSleep(uint32_t sleep_ms) {
 // Handle to the Arduino loop task, so ISRs / BLE callbacks can resume it.
 static TaskHandle_t g_main_loop_task = NULL;
 
+extern "C" bool meshcore_radio_irq_pending(void);
+
 // Button edges are also events. Keep a short polling grace period after each
 // edge so MomentaryButton can finish its multi-click window without falling
 // back to the long disconnected idle cap.
@@ -270,9 +272,19 @@ static bool armLevelWakeSafely(gpio_num_t pin, int active_level,
 
   const bool active = gpio_get_level(pin) == active_level;
   if (active && *active_level_latched) {
-    // This level already ran its ISR and is still being serviced. Keep its
-    // interrupt disabled until the peripheral/button releases the line.
+#if defined(P_LORA_DIO_1)
+    if (pin != (gpio_num_t)P_LORA_DIO_1 || meshcore_radio_irq_pending()) {
+      // The original event is still pending. Keep the level interrupt masked
+      // until RadioLib consumes it, otherwise it would retrigger forever.
+      return false;
+    }
+    // RadioLib consumed the original event, but DIO1 is high again: another
+    // packet completed while the GPIO interrupt was masked. Re-arm the level
+    // interrupt so that second event is delivered immediately.
+    *active_level_latched = false;
+#else
     return false;
+#endif
   }
   if (!active) *active_level_latched = false;
 

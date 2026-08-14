@@ -24,8 +24,13 @@ AutoDiscoverRTCClock rtc_clock(fallback_clock);
 #endif
 
 #ifdef DISPLAY_CLASS
-  DISPLAY_CLASS display;
-  MomentaryButton user_btn(PIN_USER_BTN, 1000, true);
+  #if defined(HELTEC_V3_LOW_POWER_PROFILE)
+    DISPLAY_CLASS display(&(board.periph_power));
+    MomentaryButton user_btn(PIN_USER_BTN, 1000, true, true);
+  #else
+    DISPLAY_CLASS display;
+    MomentaryButton user_btn(PIN_USER_BTN, 1000, true);
+  #endif
 #endif
 
 bool radio_init() {

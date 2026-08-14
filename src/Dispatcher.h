@@ -207,6 +207,17 @@ public:
   void begin();
   void loop();
 
+  // Milliseconds until the next dispatcher/app deadline. During TX this is the
+  // expiry deadline; the radio IRQ still wakes an event-driven loop earlier.
+  uint32_t getIdleWaitMillis() const {
+    const uint32_t now = _ms->getMillis();
+    if (outbound != NULL) {
+      const int32_t until_expiry = (int32_t)(outbound_expiry - now);
+      return until_expiry > 0 ? (uint32_t)until_expiry : 0;
+    }
+    return idleSleepMillis(now);
+  }
+
   Packet* obtainNewPacket();
   void releasePacket(Packet* packet);
   void sendPacket(Packet* packet, uint8_t priority, uint32_t delay_millis=0);

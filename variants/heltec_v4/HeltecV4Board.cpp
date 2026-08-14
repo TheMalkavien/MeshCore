@@ -242,6 +242,8 @@ void HeltecV4Board::powerOff() {
   // delegating to the common ESP32 deep-sleep implementation. Keep the
   // active-low user button as the sole wake source.
   loRaFEMControl.setSleepModeEnable();
+  digitalWrite(P_LORA_PA_POWER, LOW);
+  rtc_gpio_hold_en((gpio_num_t)P_LORA_PA_POWER);
   ESP32Board::enterDeepSleep(0, PIN_USER_BTN, LOW);
 }
 

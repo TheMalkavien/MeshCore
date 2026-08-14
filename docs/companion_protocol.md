@@ -993,19 +993,27 @@ def on_notification_received(data):
 
 ## SX1262 RX Duty-Cycle Power Saving
 
-Heltec V4 companion builds compiled with `WITH_SX1262_RX_POWER_SAVING=1` use
-SX1262 `RxDutyCycle` reception. The `heltec_v4_companion_radio_ble_idf`
-low-power profile enables it by default (`RXPS_DEFAULT_ENABLED=1`), which cuts
-the receiver duty cycle to roughly 61% at the default level.
+Heltec V3 and V4 companion builds compiled with
+`WITH_SX1262_RX_POWER_SAVING=1` use SX1262 `RxDutyCycle` reception. The
+`Heltec_v3_companion_radio_ble_idf` and
+`heltec_v4_companion_radio_ble_idf` low-power profiles enable it by default
+(`RXPS_DEFAULT_ENABLED=1`), which cuts the receiver duty cycle to roughly 61%
+at the default level.
 
 The default profile is level 5 with an expected sender preamble of 16 symbols.
 It can be changed at build time with `RXPS_DEFAULT_LEVEL=<1..10>` and
 `RXPS_DEFAULT_PREAMBLE=<16|32>`, or turned off entirely with
 `RXPS_DEFAULT_ENABLED=0`.
 
-Preference files written by an earlier build are migrated once, at the first
-boot on prefs format version 2, and adopt these build defaults. Every later
-boot preserves whatever the user selected at runtime.
+The Heltec V3/V4 BLE IDF profiles briefly return to continuous RX to measure
+the noise floor at startup and then at most once per minute. The result is
+cached: repeated radio-statistics requests do not restart the measurement or
+keep the SX1262 in continuous RX.
+
+Preference files written by an earlier build are migrated once and adopt the
+applicable build defaults (version 2 for the original V4 support, version 3
+when enabling RXPS on V3). Every later boot preserves whatever the user
+selected at runtime.
 
 - Level 1 is the safest setting: longest listening window, shortest sleep and
   therefore the smallest power saving.
