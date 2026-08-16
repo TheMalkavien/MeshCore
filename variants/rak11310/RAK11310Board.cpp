@@ -26,5 +26,5 @@ void RAK11310Board::begin() {
 }
 
 bool RAK11310Board::startOTAUpdate(const char *id, char reply[]) {
-  return false;
+  return ota.startSession(id, reply);
 }
