@@ -22,7 +22,7 @@ bool ArduinoSerialInterface::isWriteBusy() const {
 }
 
 size_t ArduinoSerialInterface::writeFrame(const uint8_t src[], size_t len) {
-  if (len > MAX_FRAME_SIZE) {
+  if (len > MAX_SERIAL_TX_FRAME_SIZE) {
     // frame is too big!
     return 0;
   }
