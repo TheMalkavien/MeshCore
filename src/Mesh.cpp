@@ -61,7 +61,7 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
         pkt->path[pkt->path_len++] = (int8_t) (pkt->getSNR()*4);
 
         uint32_t d = getDirectRetransmitDelay(pkt);
-        return ACTION_RETRANSMIT_DELAYED(5, d);  // schedule with priority 5 (for now), maybe make configurable?
+        return ACTION_RETRANSMIT_DELAYED(0, d);  // schedule with priority 5 (for now), maybe make configurable?
       }
     }
     return ACTION_RELEASE;
