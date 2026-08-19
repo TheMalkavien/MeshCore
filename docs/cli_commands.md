@@ -87,6 +87,29 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 **Usage:**
 - `start ota`
 
+**Note:** On boards that implement mesh OTA (RP2040 variants, and ESP32 built with `-D MESH_LORA_OTA`), this arms an OTA session that then accepts the `ota ...` transfer commands below, over LoRa or over a serial/companion link.
+
+**Note:** On ESP32 the default is unchanged: `start ota` spawns a WiFi access point with an ElegantOTA web portal. Build with `-D MESH_LORA_OTA` to make it arm a mesh OTA session instead; that build drops the WiFi/AsyncWebServer stack, saving roughly 500KB flash and 24KB RAM, and the `ota ...` commands and the binary `0x70` request become available. Without the flag an ESP32 answers `Err - OTA unsupported` to them.
+
+---
+
+### Transfer a firmware image to an armed OTA session
+**Usage:**
+- `ota begin <size> [<crc32>]`
+- `ota write [<offset>] <hex>`
+- `ota status`
+- `ota end`
+- `ota abort`
+- `ota help`
+
+**Note:** `ota status` reports `<received>/<expected>` plus the current flush block size, and advertises the target's capabilities: `gz=` tells the sender whether a gzip-compressed image is accepted, `nack=miss` that the target reports holes in the current block so only the missing chunks are resent.
+
+**Note:** `ota write` accepts chunks out of order when an explicit offset is given. Intermediate chunks are not acknowledged individually; the block checkpoints in `ota status` gate the transfer.
+
+**Note:** Over the mesh, the same protocol is available as a binary request (`0x70`) which avoids the hex encoding overhead. Admin permission is required.
+
+**Note:** Boards without OTA support reply `Err - OTA unsupported` rather than staying silent.
+
 ---
 
 ### Erase/Factory Reset
