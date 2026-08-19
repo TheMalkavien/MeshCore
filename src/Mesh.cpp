@@ -61,7 +61,7 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
         pkt->path[pkt->path_len++] = (int8_t) (pkt->getSNR()*4);
 
         uint32_t d = getDirectRetransmitDelay(pkt);
-        return ACTION_RETRANSMIT_DELAYED(5, d);  // schedule with priority 5 (for now), maybe make configurable?
+        return ACTION_RETRANSMIT_DELAYED(0, d);  // schedule with priority 5 (for now), maybe make configurable?
       }
     }
     return ACTION_RELEASE;
@@ -702,7 +702,7 @@ void Mesh::sendDirect(Packet* packet, const uint8_t* path, uint8_t path_len, uin
     packet->payload_len += path_len;
 
     packet->path_len = 0;
-    pri = 5;   // maybe make this configurable
+    pri = 0;   // maybe make this configurable
   } else {
     packet->path_len = Packet::copyPath(packet->path, path, path_len);
     if (packet->getPayloadType() == PAYLOAD_TYPE_PATH) {
