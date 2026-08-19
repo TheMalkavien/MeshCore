@@ -72,6 +72,14 @@ public:
   virtual bool canControlLoRaFemPaGain() const { return false; }
   virtual bool isLoRaFemPaGainEnabled() const { return false; }
 
+  /**
+   * \brief  True while a firmware update session is armed or in progress on this board.
+   *
+   * Power management must not run while one is: dropping the clock, the core voltage or
+   * USB mid-transfer loses data. Boards with no such session always answer false.
+   */
+  virtual bool isOTASessionActive() const { return false; }
+
   // Power management interface (boards with power management override these)
   virtual bool isExternalPowered() { return false; }
   virtual uint16_t getBootVoltage() { return 0; }
