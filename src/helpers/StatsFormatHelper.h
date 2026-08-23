@@ -8,12 +8,14 @@ public:
                              mesh::MainBoard& board, 
                              mesh::MillisecondClock& ms, 
                              uint16_t err_flags,
+                             uint32_t n_tx_start_fails,
                              mesh::PacketManager* mgr) {
     sprintf(reply, 
-      "{\"battery_mv\":%u,\"uptime_secs\":%u,\"errors\":%u,\"queue_len\":%u}",
+      "{\"battery_mv\":%u,\"uptime_secs\":%u,\"errors\":%u,\"tx_fails\":%u,\"queue_len\":%u}",
       board.getBattMilliVolts(),
       ms.getMillis() / 1000,
       err_flags,
+      n_tx_start_fails,
       mgr->getOutboundTotal()
     );
   }
