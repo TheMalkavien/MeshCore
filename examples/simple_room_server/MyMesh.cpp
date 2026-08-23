@@ -884,7 +884,7 @@ void MyMesh::clearStats() {
 }
 
 void MyMesh::formatStatsReply(char *reply) {
-  StatsFormatHelper::formatCoreStats(reply, board, *_ms, _err_flags, _mgr);
+  StatsFormatHelper::formatCoreStats(reply, board, *_ms, _err_flags, getNumTxStartFails(), _mgr);
 }
 
 void MyMesh::formatRadioStatsReply(char *reply) {
