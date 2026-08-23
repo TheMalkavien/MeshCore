@@ -19,6 +19,9 @@ const OTA_BIN_OP = {
 // est tronquée et la cible rejette silencieusement chaque write (vérifié sur
 // le terrain avec 160). 132 garde une marge et reste la valeur éprouvée.
 const OTA_BINARY_MAX_CHUNK = 132;
+const CMD_GET_DEVICE_TIME = 5;
+const CMD_RESET_PATH = 13;
+const CMD_SET_DEVICE_TIME = 6;
 const CMD_SET_RADIO_PARAMS = 11;
 const CMD_SET_TUNING_PARAMS = 21;
 const CMD_GET_TUNING_PARAMS = 43;
@@ -38,6 +41,7 @@ const PACKET_TYPE = {
   SELF_INFO: 5,
   MSG_SENT: 6,
   CONTACT_MSG_RECV: 7,
+  CURR_TIME: 9,
   NO_MORE_MSGS: 10,
   DEVICE_INFO: 13,
   CONTACT_MSG_RECV_V3: 16,
@@ -506,6 +510,11 @@ function parseOtaOffsetError(text) {
   return { got: Number.parseInt(m[1], 10), expected: Number.parseInt(m[2], 10) };
 }
 
+function formatEpochUtc(epochSecs) {
+  if (!Number.isFinite(epochSecs) || epochSecs <= 0) return "?";
+  return new Date(epochSecs * 1000).toISOString().replace("T", " ").slice(0, 19);
+}
+
 function formatDuration(seconds) {
   if (!Number.isFinite(seconds) || seconds < 0) return "-";
   if (seconds < 60) return `${seconds.toFixed(1)}s`;
@@ -811,6 +820,10 @@ class MeshCoreSerialClient {
     this.rxPending = [];
     this.waiters = [];
     this.seq = Date.now() & CLI_TOKEN_MASK;
+    // Ecart (secondes) entre la RTC du noeud client et l'horloge du navigateur,
+    // et dernier horodatage CLI emis. Voir nextCliTimestamp().
+    this.nodeClockOffsetSecs = 0;
+    this.lastCliTimestamp = 0;
     this.messageQueue = [];
     this.maxMessageQueue = 512;
     this.binaryQueue = [];
@@ -1297,6 +1310,9 @@ class MeshCoreSerialClient {
           airtime_factor: frame.length >= 9 ? parseU32LE(frame, 5) / 1000.0 : null,
         });
         break;
+      case PACKET_TYPE.CURR_TIME:
+        this.emit("curr_time", { epoch: frame.length >= 5 ? parseU32LE(frame, 1) : 0 });
+        break;
       case PACKET_TYPE.NO_MORE_MSGS:
         this.emit("no_more_msgs", {});
         break;
@@ -1581,6 +1597,56 @@ class MeshCoreSerialClient {
     return this.sendCommand(Uint8Array.of(0x16, 0x03), ["device_info", "error"], null, waitMs);
   }
 
+  // Purge le chemin direct memorise vers un contact : le prochain envoi repart
+  // en flood. Indispensable apres un reboot/reflash de la cible, ou son ancien
+  // out_path renvoie dans le vide.
+  async resetPath(targetFullKeyHex, timeoutMs = 3000) {
+    const full = this.normalizeTargetFullKey(targetFullKeyHex);
+    const payload = concatBytes(Uint8Array.of(CMD_RESET_PATH), hexToBytes(full));
+    try {
+      const evt = await this.sendCommand(payload, ["ok", "error"], null, timeoutMs);
+      if (!evt || evt.type === "error") {
+        const code = evt?.payload?.error_code;
+        return { ok: false, error: `reset path refuse${code !== undefined ? ` (code=${code})` : ""}` };
+      }
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e?.message || "timeout reset path" };
+    }
+  }
+
+  async getDeviceTime(timeoutMs = 3000) {
+    try {
+      const evt = await this.sendCommand(
+        Uint8Array.of(CMD_GET_DEVICE_TIME),
+        ["curr_time", "error"],
+        null,
+        timeoutMs
+      );
+      if (!evt || evt.type === "error") return null;
+      const epoch = Number(evt.payload?.epoch || 0);
+      return epoch > 0 ? epoch : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Le firmware n'accepte que l'avance (secs >= sa propre horloge), un recul est
+  // refuse par ERR_CODE_ILLEGAL_ARG.
+  async setDeviceTime(epochSecs, timeoutMs = 3000) {
+    const payload = concatBytes(Uint8Array.of(CMD_SET_DEVICE_TIME), u32ToBytesLE(epochSecs));
+    try {
+      const evt = await this.sendCommand(payload, ["ok", "error"], null, timeoutMs);
+      if (!evt || evt.type === "error") {
+        const code = evt?.payload?.error_code;
+        return { ok: false, error: `set time refuse${code !== undefined ? ` (code=${code})` : ""}` };
+      }
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e?.message || "timeout set device time" };
+    }
+  }
+
   async getTuningParams(timeoutMs = 3000) {
     const evt = await this.sendCommand(
       Uint8Array.of(CMD_GET_TUNING_PARAMS),
@@ -1794,7 +1860,9 @@ class MeshCoreSerialClient {
 
     const expectedPrefix = full.slice(0, 12);
     const suggested = Number(sentEvt.payload?.suggested_timeout || 8000);
-    const waitMs = Math.max(5000, Math.round(((suggested / 800) * 1.5) * 1000));
+    // Plancher aligne sur celui des reponses CLI : 5 s ne couvrent pas un login
+    // flood/multihop, et un abandon premature est indiscernable d'un refus.
+    const waitMs = Math.max(8000, Math.round(((suggested / 800) * 1.5) * 1000));
 
     let evt = null;
     try {
@@ -1827,10 +1895,26 @@ class MeshCoreSerialClient {
     return { ok: false, error: "login error" };
   }
 
+  // Horodatage des commandes CLI. La reference anti-rejeu cote repeteur est la
+  // RTC DU NOEUD client : login (BaseChatMesh::sendLogin) et requetes binaires
+  // sont horodates par le firmware avec getCurrentTimeUnique(), et le repeteur
+  // jette EN SILENCE tout sender_timestamp <= client->last_timestamp (et repond
+  // vide sur l'egalite, cas is_retry). Un firmware companion recent reecrit ce
+  // champ avec sa propre RTC, mais pas les plus anciens : y mettre l'heure du
+  // navigateur rend alors la cible muette, indiscernable d'une commande perdue.
+  // On envoie donc l'heure du noeud (offset mesure a la connexion), strictement
+  // croissante pour ne jamais retomber sur le cas is_retry.
+  nextCliTimestamp() {
+    let ts = Math.floor(Date.now() / 1000) + this.nodeClockOffsetSecs;
+    if (ts <= this.lastCliTimestamp) ts = this.lastCliTimestamp + 1;
+    this.lastCliTimestamp = ts;
+    return ts;
+  }
+
   buildSendCmdPayload(targetHex, commandText) {
     const prefix = this.normalizeTargetPrefix(targetHex);
     const dst = hexToBytes(prefix);
-    const ts = u32ToBytesLE(Math.floor(Date.now() / 1000));
+    const ts = u32ToBytesLE(this.nextCliTimestamp());
     const cmdBytes = textEncoder.encode(commandText);
     const payload = new Uint8Array(3 + 4 + 6 + cmdBytes.length);
     payload[0] = 0x02;
@@ -4007,8 +4091,87 @@ async function refreshKnownRepeaters(logToConsole = false) {
   }
 }
 
+// BaseChatMesh::sendLogin() emet en DIRECT des qu'un out_path est memorise pour
+// le contact, sans aucun repli en flood. Sur un chemin perime - cible rebootee,
+// reflashee, voisin disparu - le paquet part dans le vide et la cible ne repond
+// rien : exactement le meme silence qu'un mot de passe refuse ou qu'un rejeu.
+// Les apps companion s'en sortent en purgeant le chemin puis en refloodant ; on
+// fait pareil au lieu d'abandonner sur le premier timeout.
+async function loginWithPathRecovery(fullKeyHex, password) {
+  let res = await client.sendLogin(fullKeyHex, password);
+  if (res.ok || !String(res.error || "").includes("timeout")) return res;
+
+  appendLog(
+    "Login sans reponse : purge du chemin direct memorise vers la cible, "
+    + "puis nouvelle tentative (qui repartira en flood)."
+  );
+  const reset = await client.resetPath(fullKeyHex);
+  if (!reset.ok) {
+    appendLog(`Purge du chemin impossible (${reset.error}) - nouvelle tentative sur le meme chemin.`);
+  }
+  await sleep(500);
+
+  res = await client.sendLogin(fullKeyHex, password);
+  if (res.ok) {
+    appendLog("Login abouti apres purge : la route directe memorisee etait perimee.");
+  }
+  return res;
+}
+
+// Tolerance avant de considerer la RTC du noeud comme desynchronisee.
+const NODE_CLOCK_MAX_DRIFT_SECS = 5;
+
+// Le noeud client horodate lui-meme le login et les requetes binaires avec sa
+// RTC, et un repeteur refuse EN SILENCE tout horodatage <= au dernier vu pour ce
+// client : handleLoginReq() renvoie 0 (aucune reponse emise) et onPeerDataRecv()
+// classe la commande en "possible replay attack". Une RTC client en retard
+// (reflash, coupure d'alim, horloge jamais reglee) rend donc la cible totalement
+// muette pour cette page, login compris, alors qu'une autre app - qui remet
+// l'horloge a l'heure en se connectant - continue de passer. On lit l'horloge du
+// noeud, on l'avance si besoin (le firmware refuse tout recul) et on garde
+// l'ecart pour horodater les commandes CLI comme le noeud le ferait.
+async function syncNodeClock() {
+  const browserNow = Math.floor(Date.now() / 1000);
+  const nodeNow = await client.getDeviceTime();
+  if (!nodeNow) {
+    client.nodeClockOffsetSecs = 0;
+    client.lastCliTimestamp = 0;
+    appendLog("Horloge noeud: lecture non supportee, horodatage CLI sur l'heure du PC.");
+    return;
+  }
+
+  const driftSecs = nodeNow - browserNow;
+  client.nodeClockOffsetSecs = driftSecs;
+  client.lastCliTimestamp = 0;
+  appendLog(
+    `Horloge noeud: ${formatEpochUtc(nodeNow)} UTC (PC: ${formatEpochUtc(browserNow)} UTC, `
+    + `ecart ${driftSecs >= 0 ? "+" : ""}${driftSecs}s)`
+  );
+
+  if (driftSecs <= -NODE_CLOCK_MAX_DRIFT_SECS) {
+    const res = await client.setDeviceTime(browserNow);
+    if (res.ok) {
+      client.nodeClockOffsetSecs = 0;
+      appendLog(`Horloge noeud resynchronisee sur le PC (+${-driftSecs}s) : anti-rejeu des cibles evite.`);
+    } else {
+      appendLog(
+        `Horloge noeud NON resynchronisee (${res.error}) alors qu'elle a ${-driftSecs}s de retard. `
+        + "Si la cible ne repond ni au login ni aux commandes, c'est la cause la plus probable "
+        + "(protection anti-rejeu) : remets l'heure du noeud a jour avec l'app companion."
+      );
+    }
+  } else if (driftSecs >= NODE_CLOCK_MAX_DRIFT_SECS) {
+    appendLog(
+      `Horloge noeud en avance de ${driftSecs}s sur le PC : les commandes CLI sont horodatees `
+      + "sur l'heure du noeud (l'heure du PC serait vue comme un rejeu par la cible)."
+    );
+  }
+}
+
 async function initClientSession(baudrate) {
   const selfInfo = await syncSelfInfoFromNode(true);
+
+  await syncNodeClock();
 
   await refreshKnownRepeaters(true);
 
@@ -4627,9 +4790,23 @@ ui.startOtaBtn.addEventListener("click", async () => {
       if (!fullKeyForLogin) {
         throw new Error("Impossible de résoudre la clé complète de la cible pour login. Renseigne la clé 64 hex.");
       }
-      const loginRes = await client.sendLogin(fullKeyForLogin, password);
+      const loginRes = await loginWithPathRecovery(fullKeyForLogin, password);
       if (!loginRes.ok) {
-        throw new Error(`Authentification échouée: ${loginRes.error}`);
+        // Un login refuse ne produit AUCUNE reponse cote repeteur (handleLoginReq
+        // renvoie 0) : timeout ici ne veut donc pas dire "paquet perdu".
+        const silent = String(loginRes.error || "").includes("timeout");
+        const selfPreset = extractRadioPresetFromSelfInfo(lastSelfInfo);
+        throw new Error(
+          `Authentification échouée: ${loginRes.error}`
+          + (silent
+            ? " — un répéteur ne répond RIEN à un login refusé, donc ce timeout n'est pas "
+              + "forcément une perte de paquet. Causes possibles : preset radio client != preset "
+              + `de la cible (client actuellement sur ${selfPreset ? formatRadioPresetText(selfPreset) : "preset inconnu"}), `
+              + "mot de passe admin invalide, horodatage <= dernier vu pour ce client "
+              + "(anti-rejeu ; voir la ligne 'Horloge noeud' du log), ou route injoignable "
+              + "meme apres purge du chemin."
+            : "")
+        );
       }
       appendLog(`Login OK${loginRes.is_admin ? " (admin)" : ""}`);
     }
