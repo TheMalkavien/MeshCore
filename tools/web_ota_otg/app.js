@@ -74,6 +74,16 @@ const UF2_MAGIC_END = 0x0ab16f30;
 const UF2_FLAG_NO_FLASH = 0x00000001;
 const UF2_FLAG_FAMILY_ID_PRESENT = 0x00002000;
 const UF2_RP2040_FAMILY_ID = 0xe48bff56;
+const UF2_NRF52840_FAMILY_ID = 0xada52840;
+// Base d'implantation de l'image selon la famille : le RP2040 mappe sa flash en
+// XIP, le nRF52840 place l'app juste apres le SoftDevice S140. La cible attend
+// une image qui commence exactement a cette adresse, sinon le vecteur de reset
+// tombe a cote.
+const UF2_FAMILY_BASE = {
+  [UF2_RP2040_FAMILY_ID]: XIP_BASE,
+  [UF2_NRF52840_FAMILY_ID]: 0x26000,
+};
+const NRF52_APP_BASE = 0x26000;
 const UF2_MAX_PADDING_BYTES = 16 * 1024 * 1024;
 const WEBUSB_DEVICE_FILTERS = [
   { vendorId: 0x2e8a }, // Raspberry Pi / RP2040
@@ -186,10 +196,12 @@ function convertUf2ToBin(bytes) {
   } else {
     appendLog("UF2: aucun family id explicite, poursuite en mode compatible");
   }
-  if (familyIds.size > 0 && !familyIds.has(UF2_RP2040_FAMILY_ID)) {
+  const knownFamilies = Array.from(familyIds).filter((id) => id in UF2_FAMILY_BASE);
+  if (familyIds.size > 0 && knownFamilies.length === 0) {
     const ids = Array.from(familyIds, (id) => `0x${id.toString(16).padStart(8, "0")}`).join(", ");
-    throw new Error(`UF2 non RP2040 (${ids})`);
+    throw new Error(`UF2 d'une famille non supportee (${ids})`);
   }
+  const family = knownFamilies.length > 0 ? knownFamilies[0] : UF2_RP2040_FAMILY_ID;
 
   const blockCount = bytes.length / 512;
   const blocks = [];
@@ -213,7 +225,7 @@ function convertUf2ToBin(bytes) {
     if (payloadSize === 0 || payloadSize > 476) {
       throw new Error(`UF2 invalide (payload bloc ${blockNo})`);
     }
-    if ((flags & UF2_FLAG_FAMILY_ID_PRESENT) !== 0 && familyId !== UF2_RP2040_FAMILY_ID) {
+    if ((flags & UF2_FLAG_FAMILY_ID_PRESENT) !== 0 && familyId !== family) {
       continue;
     }
 
@@ -224,13 +236,17 @@ function convertUf2ToBin(bytes) {
   }
 
   if (blocks.length === 0) {
-    throw new Error("UF2 vide ou sans bloc flash RP2040");
+    throw new Error("UF2 vide ou sans bloc flash exploitable");
   }
 
   blocks.sort((a, b) => a.targetAddr - b.targetAddr);
   const baseAddr = blocks[0].targetAddr >>> 0;
-  if (baseAddr !== XIP_BASE) {
-    throw new Error(`UF2 inattendu: adresse de base 0x${baseAddr.toString(16)}`);
+  const expectedBase = UF2_FAMILY_BASE[family];
+  if (baseAddr !== expectedBase) {
+    throw new Error(
+      `UF2 inattendu: adresse de base 0x${baseAddr.toString(16)} `
+      + `(attendu 0x${expectedBase.toString(16)})`
+    );
   }
 
   const chunks = [];
@@ -253,6 +269,219 @@ function convertUf2ToBin(bytes) {
   const out = concatBytes(...chunks);
   appendLog(`UF2: ${blocks.length} blocs flash retenus, binaire reconstruit ${formatByteCount(out.length)}`);
   return out;
+}
+
+// Les cibles nRF52 (RAK, Heltec T114, ...) ne produisent pas de .bin : la
+// sortie PlatformIO est un Intel HEX implante a 0x26000, juste apres le
+// SoftDevice. On le reconstruit ici en binaire contigu, en ignorant les
+// enregistrements hors region applicative (UICR, MBR) que certains outils
+// ajoutent.
+function convertIntelHexToBin(bytes) {
+  const text = textDecoder.decode(bytes);
+  const lines = text.split(/\r?\n/);
+  const segments = [];
+  let base = 0;
+  let skipped = 0;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    if (!line.startsWith(":")) {
+      throw new Error(`HEX invalide (ligne ${i + 1}: pas de ':')`);
+    }
+    const raw = hexToBytes(line.slice(1));
+    if (raw.length < 5) {
+      throw new Error(`HEX invalide (ligne ${i + 1} trop courte)`);
+    }
+    let sum = 0;
+    for (const b of raw) sum = (sum + b) & 0xff;
+    if (sum !== 0) {
+      throw new Error(`HEX invalide (checksum ligne ${i + 1})`);
+    }
+
+    const count = raw[0];
+    const addr = (raw[1] << 8) | raw[2];
+    const type = raw[3];
+    const data = raw.slice(4, 4 + count);
+    if (data.length !== count) {
+      throw new Error(`HEX invalide (ligne ${i + 1} tronquee)`);
+    }
+
+    if (type === 0x00) {
+      const absolute = base + addr;
+      // Region applicative uniquement : en dessous c'est le SoftDevice, au
+      // dessus le bootloader, et l'UICR vit a 0x10001000.
+      if (absolute < NRF52_APP_BASE || absolute >= 0xf4000) {
+        skipped += data.length;
+        continue;
+      }
+      segments.push({ addr: absolute, data });
+    } else if (type === 0x01) {
+      break;
+    } else if (type === 0x04) {
+      base = ((data[0] << 8) | data[1]) * 65536;
+    } else if (type === 0x02) {
+      base = ((data[0] << 8) | data[1]) * 16;
+    }
+  }
+
+  if (segments.length === 0) {
+    throw new Error("HEX sans donnee dans la region applicative nRF52");
+  }
+  if (skipped > 0) {
+    appendLog(`HEX: ${skipped} octets hors region applicative ignores (UICR/MBR)`);
+  }
+
+  segments.sort((a, b) => a.addr - b.addr);
+  const lo = segments[0].addr;
+  if (lo !== NRF52_APP_BASE) {
+    throw new Error(
+      `HEX inattendu: adresse de base 0x${lo.toString(16)} `
+      + `(attendu 0x${NRF52_APP_BASE.toString(16)})`
+    );
+  }
+  let hi = lo;
+  for (const s of segments) hi = Math.max(hi, s.addr + s.data.length);
+
+  const out = new Uint8Array(hi - lo).fill(0xff);
+  for (const s of segments) out.set(s.data, s.addr - lo);
+  appendLog(
+    `HEX: ${segments.length} enregistrements, image 0x${lo.toString(16)}..0x${hi.toString(16)} `
+    + `(${formatByteCount(out.length)})`
+  );
+  return out;
+}
+
+// Paquet DFU nRF52 (.zip) : c'est l'autre sortie de la toolchain nRF52, a cote
+// du .hex, et celle que tout le monde a sous la main pour un flash DFU normal.
+// Il contient l'image applicative brute implantee a 0x26000, un init packet
+// (.dat) qui ne concerne que le protocole DFU de Nordic, et un manifeste.
+//
+// On lit le manifeste plutot que de deviner : un paquet peut aussi transporter
+// un SoftDevice ou un bootloader, et envoyer une de ces images-la comme
+// firmware applicatif briquerait le noeud. Seule une entree 'application'
+// seule est acceptee.
+
+const ZIP_EOCD_SIG = 0x06054b50;
+const ZIP_CDIR_SIG = 0x02014b50;
+const ZIP_LOCAL_SIG = 0x04034b50;
+
+function parseU16LE(bytes, offset) {
+  return ((bytes[offset] || 0) | ((bytes[offset + 1] || 0) << 8)) >>> 0;
+}
+
+// Lecture minimale d'un zip : repertoire central, puis en-tetes locaux. Les
+// entrees stockees (methode 0) sont tranchees telles quelles, les entrees
+// deflatees (methode 8) passent par DecompressionStream, deja utilise ailleurs
+// dans cet outil. Pas de zip64 : un firmware ne s'en approche pas.
+async function readZipEntries(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.length < 22) {
+    throw new Error("ZIP invalide (trop court)");
+  }
+
+  let eocd = -1;
+  const searchFrom = Math.max(0, bytes.length - (22 + 65535));
+  for (let i = bytes.length - 22; i >= searchFrom; i -= 1) {
+    if (parseU32LE(bytes, i) === ZIP_EOCD_SIG) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) {
+    throw new Error("ZIP invalide (fin de repertoire central introuvable)");
+  }
+
+  const entryCount = parseU16LE(bytes, eocd + 10);
+  let pos = parseU32LE(bytes, eocd + 16);
+  const entries = new Map();
+
+  for (let i = 0; i < entryCount; i += 1) {
+    if (parseU32LE(bytes, pos) !== ZIP_CDIR_SIG) {
+      throw new Error(`ZIP invalide (entree ${i} du repertoire central)`);
+    }
+    const method = parseU16LE(bytes, pos + 10);
+    const compressedSize = parseU32LE(bytes, pos + 20);
+    const uncompressedSize = parseU32LE(bytes, pos + 24);
+    const nameLen = parseU16LE(bytes, pos + 28);
+    const extraLen = parseU16LE(bytes, pos + 30);
+    const commentLen = parseU16LE(bytes, pos + 32);
+    const localOffset = parseU32LE(bytes, pos + 42);
+    const name = textDecoder.decode(bytes.slice(pos + 46, pos + 46 + nameLen));
+
+    if (parseU32LE(bytes, localOffset) !== ZIP_LOCAL_SIG) {
+      throw new Error(`ZIP invalide (en-tete local de ${name})`);
+    }
+    const dataStart = localOffset + 30
+      + parseU16LE(bytes, localOffset + 26)
+      + parseU16LE(bytes, localOffset + 28);
+    const raw = bytes.slice(dataStart, dataStart + compressedSize);
+
+    let content;
+    if (method === 0) {
+      content = raw;
+    } else if (method === 8) {
+      if (typeof DecompressionStream !== "function") {
+        throw new Error(`ZIP: entree ${name} deflatee, DecompressionStream indisponible`);
+      }
+      const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+      content = new Uint8Array(await new Response(stream).arrayBuffer());
+    } else {
+      throw new Error(`ZIP: methode de compression ${method} non supportee (${name})`);
+    }
+    if (content.length !== uncompressedSize) {
+      throw new Error(`ZIP: taille incoherente pour ${name}`);
+    }
+
+    entries.set(name, content);
+    pos += 46 + nameLen + extraLen + commentLen;
+  }
+
+  return entries;
+}
+
+async function extractDfuZipImage(bytes) {
+  const entries = await readZipEntries(bytes);
+  appendLog(`ZIP: ${entries.size} entrees (${Array.from(entries.keys()).join(", ")})`);
+
+  const manifestRaw = entries.get("manifest.json");
+  if (!manifestRaw) {
+    throw new Error("ZIP sans manifest.json (ce n'est pas un paquet DFU nRF52)");
+  }
+
+  let manifest;
+  try {
+    manifest = JSON.parse(textDecoder.decode(manifestRaw)).manifest;
+  } catch (e) {
+    throw new Error(`manifest.json illisible (${e.message})`);
+  }
+  if (!manifest) {
+    throw new Error("manifest.json sans section 'manifest'");
+  }
+
+  // Un paquet mixte reflasherait le SoftDevice ou le bootloader : hors sujet
+  // ici, et destructeur si on l'ecrivait a 0x26000 comme une application.
+  const forbidden = ["softdevice", "bootloader", "softdevice_bootloader"];
+  const present = forbidden.filter((k) => manifest[k]);
+  if (present.length > 0) {
+    throw new Error(
+      `Paquet DFU contenant ${present.join(" + ")} : l'OTA mesh ne met a jour que `
+      + "l'application. Utilise un paquet applicatif seul, ou le .hex."
+    );
+  }
+  if (!manifest.application || !manifest.application.bin_file) {
+    throw new Error("Paquet DFU sans image applicative");
+  }
+
+  const binName = String(manifest.application.bin_file);
+  const bin = entries.get(binName);
+  if (!bin) {
+    throw new Error(`ZIP: ${binName} annonce par le manifeste mais absent`);
+  }
+  appendLog(
+    `ZIP: image applicative ${binName} (${formatByteCount(bin.length)}), `
+    + "implantation 0x" + NRF52_APP_BASE.toString(16)
+  );
+  return bin;
 }
 
 async function gzipBytes(bytes) {
@@ -2598,6 +2827,30 @@ async function getFirmwareBytes(file) {
     );
     return gzipPayload;
   };
+
+  if (fileName.endsWith(".zip")) {
+    appendLog("Firmware: format source détecté = paquet DFU nRF52 (zip)");
+    const binBytes = await extractDfuZipImage(sourceBytes);
+    return {
+      sourceFormat: "dfu-zip",
+      originalSize: sourceBytes.length,
+      extractedSize: binBytes.length,
+      rawBytes: binBytes,
+      gzBytes: await buildGzCandidate(binBytes),
+    };
+  }
+
+  if (fileName.endsWith(".hex")) {
+    appendLog("Firmware: format source détecté = intel hex (nRF52)");
+    const binBytes = convertIntelHexToBin(sourceBytes);
+    return {
+      sourceFormat: "hex",
+      originalSize: sourceBytes.length,
+      extractedSize: binBytes.length,
+      rawBytes: binBytes,
+      gzBytes: await buildGzCandidate(binBytes),
+    };
+  }
 
   if (fileName.endsWith(".uf2")) {
     appendLog("Firmware: format source détecté = uf2");
