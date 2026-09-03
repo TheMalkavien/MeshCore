@@ -1,0 +1,173 @@
+name: Patch stack
+
+# Verifies the fork's patch stack. It never rewrites a branch: rebasing needs
+# judgement and a force-push, so that stays local (tools/restack.sh).
+#
+# What actually breaks silently is upstream drift - a branch that no longer
+# applies, or two branches that start conflicting - so the nightly run is the
+# point of this workflow, not the push trigger.
+
+on:
+  push:
+    branches:
+      - feature/core-enhancements
+      - feature/repeater-ping
+      - feature/repeater-flood-retry
+      - feature/lora-ota
+      - feature/rp2040-lowpower
+      - tools/companion-tools
+      - packaging/mlk-defaults
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+env:
+  UPSTREAM: https://github.com/meshcore-dev/MeshCore.git
+  UPSTREAM_BRANCH: dev
+
+jobs:
+  # Does every branch still merge onto current upstream, in order, without conflict?
+  # rerere is deliberately NOT enabled here: CI must see the raw conflicts, not a
+  # replay of a resolution recorded on someone's laptop.
+  integrate:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.merge.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM" 2>/dev/null || true
+          git fetch upstream "$UPSTREAM_BRANCH"
+      # The merge order lives in tools/restack.sh and nowhere else. Hard-coding a
+      # second copy here is how this job once reported a conflict that did not
+      # exist locally: the chain was reordered in the script and not here.
+      # Read from origin/ because the job detaches onto upstream, which has no
+      # such file.
+      - id: order
+        name: Read the merge order from tools/restack.sh
+        run: |
+          git show origin/packaging/mlk-defaults:tools/restack.sh > "$RUNNER_TEMP/restack.sh"
+          order=$(bash "$RUNNER_TEMP/restack.sh" order | tr '\n' ' ')
+          [ -n "$order" ] || { echo "::error::empty merge order"; exit 1; }
+          echo "branches=$order" >> "$GITHUB_OUTPUT"
+          echo "merge order: $order"
+          # 'on: push:' and the build-branches matrix below cannot read the script
+          # (GitHub needs them at parse time), so they stay hand-written. Warn on
+          # drift rather than let a branch quietly stop being checked.
+          for b in $order; do
+            grep -qE "^ +- $b\$" .github/workflows/stack-check.yml \
+              || echo "::warning::$b is in MERGE_ORDER but not in this workflow's push trigger list"
+          done
+      - id: merge
+        name: Merge the stack onto upstream/${{ env.UPSTREAM_BRANCH }}
+        run: |
+          git config user.name  "stack-check"
+          git config user.email "stack-check@localhost"
+          git checkout --detach FETCH_HEAD
+          fail=0
+          for b in ${{ steps.order.outputs.branches }}; do
+            if git merge --no-edit --no-ff "origin/$b" >/dev/null 2>&1; then
+              echo "::notice::$b merges cleanly"
+            else
+              echo "::error::$b conflicts with the branches merged before it"
+              git diff --diff-filter=U --name-only | sed 's/^/  /'
+              git merge --abort
+              fail=1
+              break
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git branch _integration
+      - name: Save the integration tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-tree
+          path: .
+          include-hidden-files: true
+          retention-days: 3
+
+  # A clean merge is not a working firmware - rerere replays resolutions
+  # faithfully, including wrong ones. Only a build proves the integration.
+  build-integration:
+    needs: integrate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env:
+          - waveshare_rp2040_lora_repeater
+          - waveshare_rp2040_lora_repeater_lowpower
+          - waveshare_rp2040_lora_repeater_ota_esp32
+          - Heltec_v3_repeater
+          - Heltec_v3_companion_radio_usb
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: integration-tree
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+      - run: pip install --upgrade platformio
+      - run: pio run -e ${{ matrix.env }}
+
+  # Each branch must also stand on its own: that is what makes it droppable from
+  # the integration, and proposable upstream.
+  build-branches:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - branch: feature/core-enhancements
+            env: waveshare_rp2040_lora_repeater
+          - branch: feature/repeater-ping
+            env: waveshare_rp2040_lora_repeater
+          - branch: feature/repeater-flood-retry
+            env: waveshare_rp2040_lora_repeater
+          - branch: feature/lora-ota
+            env: waveshare_rp2040_lora_repeater
+          - branch: feature/rp2040-lowpower
+            env: waveshare_rp2040_lora_repeater_lowpower
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.branch }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+      - run: pip install --upgrade platformio
+      - run: pio run -e ${{ matrix.env }}
+
+  # tools/companion-tools carries its own unit tests.
+  test-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: tools/companion-tools
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      # The bot's own dependencies, so the tests run against what actually ships
+      # rather than against a fallback path.
+      - run: pip install -r tools/telegram_bot/requirements.txt
+      - run: python -m unittest discover -s tools -p 'test_*.py' -t tools -v
+      - run: python -m unittest discover -s tools/telegram_bot -p 'test_*.py' -t tools/telegram_bot -v
