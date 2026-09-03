@@ -5,6 +5,10 @@
 #include <bluefruit.h>
 #include <nrf_soc.h>
 
+#ifdef MESH_LORA_OTA
+#include <helpers/nrf52/NRF52OTAApply.h>
+#endif
+
 #ifdef USE_CC310_HW_CRYPTO
 #include <Adafruit_nRFCrypto.h>
 #endif
@@ -24,6 +28,14 @@ static void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
 }
 
 void NRF52Board::begin() {
+#ifdef MESH_LORA_OTA
+  // First thing at boot, before the SoftDevice is enabled and before any
+  // peripheral is brought up: if a mesh OTA image is armed and passes
+  // verification, this rewrites the app region and resets into it, so it does
+  // not return. See helpers/nrf52/NRF52OTAApply.cpp.
+  nrf52OtaApplyPending();
+#endif
+
   startup_reason = BD_STARTUP_NORMAL;
 
   #ifdef USE_CC310_HW_CRYPTO
@@ -402,6 +414,14 @@ bool NRF52Board::getBootloaderVersion(char* out, size_t max_len) {
     return false;
 }
 
+#ifdef MESH_LORA_OTA
+// 'start ota' arms a mesh OTA session over LoRa instead of advertising BLE DFU.
+// The BLE DFU path stays reachable through the bootloader (double-tap reset),
+// which is also the recovery route if an apply is interrupted.
+bool NRF52Board::startOTAUpdate(const char *id, char reply[]) {
+  return ota.startSession(id, reply);
+}
+#else
 bool NRF52Board::startOTAUpdate(const char *id, char reply[]) {
   // Config the peripheral connection with maximum bandwidth
   // more SRAM required by SoftDevice
@@ -450,4 +470,6 @@ bool NRF52Board::startOTAUpdate(const char *id, char reply[]) {
 
   return true;
 }
+#endif  // MESH_LORA_OTA
+
 #endif
