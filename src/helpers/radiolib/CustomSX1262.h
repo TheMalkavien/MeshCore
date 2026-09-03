@@ -148,6 +148,10 @@ class CustomSX1262 : public SX1262 {
       return false;
     }
 
+    // Whether isReceiving() last saw a valid header rather than a bare preamble detect.
+    // Latched there, so it is only meaningful right after an isReceiving() call.
+    bool isHeaderSeen() const { return _headerSeen; }
+
     void setPreambleMillis(uint32_t preambleMillis) {
       _preambleMillis = preambleMillis;
       MESH_DEBUG_PRINTLN("Set _preambleMillis=%u", _preambleMillis);

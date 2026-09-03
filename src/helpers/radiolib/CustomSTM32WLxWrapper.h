@@ -23,6 +23,9 @@ public:
   bool isReceivingPacket() override { 
     return ((CustomSTM32WLx *)_radio)->isReceiving();
   }
+  bool isReceivingHeader() override {
+    return ((CustomSTM32WLx *)_radio)->isHeaderSeen();
+  }
   float getCurrentRSSI() override {
     return ((CustomSTM32WLx *)_radio)->getRSSI(false);
   }

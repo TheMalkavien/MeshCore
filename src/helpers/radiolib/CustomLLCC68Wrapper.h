@@ -23,6 +23,9 @@ public:
   bool isReceivingPacket() override { 
     return ((CustomLLCC68 *)_radio)->isReceiving();
   }
+  bool isReceivingHeader() override {
+    return ((CustomLLCC68 *)_radio)->isHeaderSeen();
+  }
   float getCurrentRSSI() override {
     return ((CustomLLCC68 *)_radio)->getRSSI(false);
   }

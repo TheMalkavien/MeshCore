@@ -12,6 +12,11 @@ namespace mesh {
 #define MIN_TX_BUDGET_RESERVE_MS   100    // min budget (ms) required before allowing next TX
 #define MIN_TX_BUDGET_AIRTIME_DIV  2      // require at least 1/N of estimated airtime as budget before TX
 
+#define CAD_FAIL_MAX_DURATION_FLOOR      4000   // legacy fixed value, kept as the floor at fast presets
+#define CAD_FAIL_MAX_DURATION_CEIL      12000   // a preset slower than this cannot be rescued by waiting
+#define CHANNEL_BUSY_MAX_DURATION_FLOOR   400   // a bare preamble detect never justifies more than this
+#define CAD_RETRY_MAX_SHIFT                 2   // busy backoff tops out at 4x the base retry delay
+
 #ifndef NOISE_FLOOR_CALIB_INTERVAL
   #define NOISE_FLOOR_CALIB_INTERVAL   2000     // 2 seconds
 #endif
@@ -60,7 +65,25 @@ uint32_t Dispatcher::getCADFailRetryDelay() const {
   return 200;
 }
 uint32_t Dispatcher::getCADFailMaxDuration() const {
-  return 4000;   // 4 seconds
+  // Derived from the same airtime figure the radio uses to time out its own stuck Rx IRQ
+  // flags, plus margin, so the radio always releases a stuck flag before the dispatcher
+  // gives up on the channel. A constant cannot hold that invariant: one 255 byte packet is
+  // 2.3s at SF8/BW62.5, but 8.4s at SF10/BW62.5 and 6.7s at SF12/BW250.
+  uint32_t t = _radio->getMaxPacketMillis();
+  if (t == 0) return CAD_FAIL_MAX_DURATION_FLOOR;   // radio cannot say: keep the legacy 4s
+  t += t / 8 + 250;
+  if (t < CAD_FAIL_MAX_DURATION_FLOOR) t = CAD_FAIL_MAX_DURATION_FLOOR;
+  if (t > CAD_FAIL_MAX_DURATION_CEIL) t = CAD_FAIL_MAX_DURATION_CEIL;
+  return t;
+}
+uint32_t Dispatcher::getChannelBusyMaxDuration() const {
+  uint32_t t = _radio->getPreambleMillis();
+  // Twice the preamble-to-header window: a real packet produces a header (or a header error)
+  // within one such window, so anything still 'busy' after two of them was not a packet.
+  t = (t == 0) ? CHANNEL_BUSY_MAX_DURATION_FLOOR : t * 2 + 100;
+  if (t < CHANNEL_BUSY_MAX_DURATION_FLOOR) t = CHANNEL_BUSY_MAX_DURATION_FLOOR;
+  uint32_t cap = getCADFailMaxDuration();
+  return t > cap ? cap : t;
 }
 
 void Dispatcher::loop() {
@@ -273,7 +296,10 @@ void Dispatcher::processRecvPacket(Packet* pkt) {
 }
 
 void Dispatcher::checkSend() {
-  if (_mgr->getOutboundCount(_ms->getMillis()) == 0) return;
+  if (_mgr->getOutboundCount(_ms->getMillis()) == 0) {
+    cad_busy_start = 0;   // nothing pending, so there is no busy episode to be timing
+    return;
+  }
   
   updateTxBudget();
   
@@ -282,23 +308,59 @@ void Dispatcher::checkSend() {
     float duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor());
     unsigned long needed = est_airtime / MIN_TX_BUDGET_AIRTIME_DIV - tx_budget_ms;
     next_tx_time = futureMillis((unsigned long)(needed / duty_cycle));
+    // Deferring on the airtime budget is not channel activity. Leaving cad_busy_start set
+    // here lets a stale timestamp survive the whole deferral, so the first busy observation
+    // after the budget refills is already 'past the deadline' - and the transmit is forced
+    // with no backoff at all, straight on top of whatever is on air.
+    cad_busy_start = 0;
     return;
   }
   
   if (!millisHasNowPassed(next_tx_time)) return;
   if (_radio->isReceiving()) {
+    // Two very different conditions arrive here. Mid-packet means a valid header was seen and
+    // the radio is demodulating a real packet: transmitting aborts that receive and destroys a
+    // packet we may have been about to relay, so it gets the long, airtime-derived deadline.
+    // Anything else - a preamble detect that never produced a header, RSSI over the noise
+    // floor, a hardware CAD hit - may be noise, and gets a short one.
     if (cad_busy_start == 0) {
       cad_busy_start = _ms->getMillis();   // record when CAD busy state started
+      cad_retry_shift = 0;
+      cad_busy_mid_packet = false;
+      cad_force_jitter = getCADFailForceJitter();   // drawn once, so it is stable for the episode
     }
+    // Sticky for the whole episode. Once a real header has been seen, the long deadline stays
+    // even if the busy indication drops back to a bare preamble: the elapsed time was spent
+    // receiving a real packet, and measuring it against the short deadline would instantly
+    // force a transmit over whatever arrived next. Sticky rather than restarting the clock,
+    // because restarting it would let alternating preamble/header states defer forever - and
+    // the point of the deadline is that the node always eventually transmits.
+    if (_radio->isMidPacket()) cad_busy_mid_packet = true;
 
-    if (_ms->getMillis() - cad_busy_start > getCADFailMaxDuration()) {
+    unsigned long busy_for = _ms->getMillis() - cad_busy_start;
+    unsigned long limit = cad_busy_mid_packet ? getCADFailMaxDuration()
+                                             : getChannelBusyMaxDuration();
+    // Jitter is capped at half the deadline it perturbs, so it decorrelates nodes without
+    // swamping the short noise deadline - an airtime-scaled offset can be several times it.
+    unsigned long jitter = cad_force_jitter > limit / 2 ? limit / 2 : cad_force_jitter;
+    limit += jitter;
+
+    if (busy_for > limit) {
       _err_flags |= ERR_EVENT_CAD_TIMEOUT;
 
-      MESH_DEBUG_PRINTLN("%s Dispatcher::checkSend(): CAD busy max duration reached!", getLogDateTime());
+      MESH_DEBUG_PRINTLN("%s Dispatcher::checkSend(): CAD busy max duration reached! (%d ms, mid_packet=%d)",
+                         getLogDateTime(), (int)busy_for, (int)cad_busy_mid_packet);
       // channel activity has gone on too long... (Radio might be in a bad state)
       // force the pending transmit below...
     } else {
-      next_tx_time = futureMillis(getCADFailRetryDelay());
+      // Truncated exponential backoff. Re-probing on a fixed short period for seconds on end
+      // is wasted work, and with hardware CAD enabled every probe takes the receiver off air.
+      // The last wait is trimmed so the backoff never overshoots the deadline.
+      unsigned long d = (unsigned long)getCADFailRetryDelay() << cad_retry_shift;
+      if (cad_retry_shift < CAD_RETRY_MAX_SHIFT) cad_retry_shift++;
+      unsigned long remaining = limit - busy_for;
+      if (d > remaining) d = remaining > 0 ? remaining : 1;
+      next_tx_time = futureMillis((int)d);
       return;
     }
   }
@@ -329,6 +391,24 @@ void Dispatcher::checkSend() {
       bool success = _radio->startSendRaw(raw, len);
       if (!success) {
         MESH_DEBUG_PRINTLN("%s Dispatcher::loop(): ERROR: send start failed!", getLogDateTime());
+        n_tx_start_fails++;
+
+        // startTransmit() refusing is a radio state error, not a busy channel. Dropping the
+        // packet here loses it silently - no counter, and logTxFail() only writes anything if
+        // packet logging happens to be on - which is exactly the kind of invisible loss that
+        // makes a missing relay impossible to diagnose in the field. Re-queue a bounded number
+        // of times instead, so a genuinely wedged radio still gives up rather than looping.
+        //
+        // The priority is not recoverable once dequeued: it lives in the send queue, not in
+        // the Packet. Re-queueing at the top is the closest thing available, and it is not a
+        // promotion - this was the highest priority due packet a moment ago.
+        if (tx_start_fail_streak < getTxStartFailRetries()) {
+          tx_start_fail_streak++;
+          _mgr->queueOutbound(outbound, 0, futureMillis(getCADFailRetryDelay()));
+          outbound = NULL;
+          return;
+        }
+        tx_start_fail_streak = 0;
 
         logTxFail(outbound, outbound->getRawLength());
   
@@ -336,6 +416,7 @@ void Dispatcher::checkSend() {
         outbound = NULL;
         return;
       }
+      tx_start_fail_streak = 0;
       outbound_expiry = futureMillis(max_airtime);
 
     #if MESH_PACKET_LOGGING
