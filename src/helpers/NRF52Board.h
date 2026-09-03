@@ -6,6 +6,10 @@
 
 #if defined(NRF52_PLATFORM)
 
+#ifdef MESH_LORA_OTA
+#include <helpers/nrf52/NRF52OTA.h>
+#endif
+
 #ifdef NRF52_POWER_MANAGEMENT
 // Shutdown Reason Codes (stored in GPREGRET before SYSTEMOFF)
 #define SHUTDOWN_REASON_NONE          0x00
@@ -33,6 +37,9 @@ class NRF52Board : public mesh::MainBoard {
 protected:
   uint8_t startup_reason;
   char *ota_name;
+#ifdef MESH_LORA_OTA
+  NRF52OTAController ota;
+#endif
 
 #ifdef NRF52_POWER_MANAGEMENT
   uint32_t reset_reason;              // RESETREAS register value
@@ -55,6 +62,19 @@ public:
   virtual void powerOff() override;
   virtual bool getBootloaderVersion(char* version, size_t max_len) override;
   virtual bool startOTAUpdate(const char *id, char reply[]) override;
+#ifdef MESH_LORA_OTA
+  bool handleOTACommand(const char* command, char reply[]) override {
+    return ota.handleCommand(command, reply);
+  }
+  bool handleOTABinaryCommand(uint8_t opcode, const uint8_t* payload, size_t payload_len, char reply[]) override {
+    return ota.handleBinaryCommand(opcode, payload, payload_len, reply);
+  }
+  // Unlike the ESP32 and RP2040 boards this does not gate sleep(): nRF52 sleep
+  // is a plain event wait that any radio interrupt wakes, so it costs the OTA
+  // transfer nothing. The mesh still uses it to suspend the periodic AGC reset
+  // and shorten CAD backoff while a session is running.
+  bool isOTASessionActive() const override { return ota.isSleepInhibited(); }
+#endif
   virtual void sleep(uint32_t secs) override;
   bool isExternalPowered() override;
 
