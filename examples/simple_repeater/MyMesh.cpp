@@ -730,7 +730,10 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
         }
       }
 
-      uint8_t temp[166];
+      // 5 header bytes + the reflected command prefix + the 160-char reply CommonCLI
+      // is allowed to write. Over-long replies are dropped by createDatagram() below,
+      // but they must not run off this buffer first.
+      uint8_t temp[5 + CommonCLI::MAX_CMD_PREFIX_LEN + 161];
       char *command = (char *)&data[5];
       char *reply = (char *)&temp[5];
       if (is_retry) {
@@ -1231,10 +1234,14 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 
   while (*command == ' ') command++; // skip leading spaces
 
-  if (strlen(command) > 4 && command[2] == '|') { // optional prefix (for companion radio CLI)
-    memcpy(reply, command, 3);                    // reflect the prefix back
-    reply += 3;
-    command += 3;
+  // Optional "<hex-token>|" prefix (for companion radio CLI). The token is not a
+  // fixed 2 chars: mccli sends 2, other clients more, and a mis-parsed prefix makes
+  // the whole command unrecognisable, so measure it instead of assuming.
+  uint8_t prefix_len = CommonCLI::getCommandPrefixLen(command);
+  if (prefix_len > 0) {
+    memcpy(reply, command, prefix_len);           // reflect the prefix back
+    reply += prefix_len;
+    command += prefix_len;
   }
 
   // handle ACL related commands
