@@ -50,6 +50,7 @@ build_flags =
 ## Limitations connues
 
 - Si tu charges un `.uf2`, l'interface web reconstruit le `.bin` puis prépare aussi sa forme gzip ; pour une cible ESP32, utilise directement le `firmware.bin` produit par PlatformIO.
+- Pour une cible **nRF52840** (RAK3401, WisMesh Tag), charge le `firmware.zip` (le paquet DFU standard) ou le `firmware.hex` produit par PlatformIO : c'est la seule sortie de la toolchain nRF52, et l'interface la reconvertit en binaire implanté à `0x26000`. Un `.uf2` nRF52 (famille `0xADA52840`) est également accepté. Dans le `.zip`, l'outil lit le `manifest.json` et n'accepte qu'un paquet **applicatif seul** : un paquet contenant un SoftDevice ou un bootloader est refusé, ces images n'ayant rien à faire à `0x26000`. Ces cibles **exigent** la forme gzip (`gz=1`) : l'image brute ne tient pas à côté du firmware en cours d'exécution. Compte quelques secondes de plus sur `ota end`, le temps que le noeud décompresse l'image pour la vérifier avant de l'armer.
 - Web Serial dépend du support navigateur/OS. Sur Android, le prototype force plutôt WebUSB.
 - Le fallback WebUSB dépend des interfaces USB exposées par le firmware companion (CDC-ACM bulk IN/OUT requis).
 - Si erreur `Unable to claim interface` : Android peut déjà attacher le driver CDC système sur l'interface série USB. Dans ce cas, WebUSB navigateur ne peut pas toujours la prendre.
@@ -153,7 +154,7 @@ Options pour l'utilisateur, de la plus simple à la plus robuste :
 3. Cliquer `Connecter`.
 4. Renseigner la cible OTA (pubkey hex, min 12 chars = préfixe 6 octets).
 5. (Optionnel) renseigner `Mot de passe` pour faire un login avant OTA.
-6. Sélectionner le firmware `.bin`, `.bin.gz` ou `.uf2`.
+6. Sélectionner le firmware `.bin`, `.bin.gz`, `.uf2`, ou `.hex` / `.zip` (nRF52).
 7. (Optionnel) activer `Preset OTA temporaire` et régler `freq,bw,sf,cr` (défaut : `869.4,250,5,5`).
 8. Cliquer `Lancer l'OTA`.
 
