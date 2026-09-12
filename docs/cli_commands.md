@@ -87,6 +87,32 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 **Usage:**
 - `start ota`
 
+**Note:** On boards that implement mesh OTA (RP2040 variants, ESP32 built with `-D MESH_LORA_OTA`, and nRF52840 built with `-D MESH_LORA_OTA` plus `boards/nrf52840_s140_v6_lora_ota.ld`), this arms an OTA session that then accepts the `ota ...` transfer commands below, over LoRa or over a serial/companion link.
+
+**Note:** On ESP32 the default is unchanged: `start ota` spawns a WiFi access point with an ElegantOTA web portal. Build with `-D MESH_LORA_OTA` to make it arm a mesh OTA session instead; that build drops the WiFi/AsyncWebServer stack, saving roughly 500KB flash and 24KB RAM, and the `ota ...` commands and the binary `0x70` request become available. Without the flag an ESP32 answers `Err - OTA unsupported` to them.
+
+---
+
+### Transfer a firmware image to an armed OTA session
+**Usage:**
+- `ota begin <size> [<crc32>]`
+- `ota write [<offset>] <hex>`
+- `ota status`
+- `ota end`
+- `ota abort`
+- `ota help`
+- `ota dryrun`  *(nRF52 only)*
+
+**Note:** `ota status` reports `<received>/<expected>` plus the current flush block size, and advertises the target's capabilities: `gz=` tells the sender whether a gzip-compressed image is accepted, `nack=miss` that the target reports holes in the current block so only the missing chunks are resent.
+
+**Note:** On nRF52840 the image is parked compressed in a staging area and copied over the app region at the next boot, so a few things differ: a gzip image is mandatory (the target advertises `gz=1` and rejects a raw stream), `ota end` takes several seconds because it decompresses the whole image to verify it before arming the update, and `ota dryrun` repeats that verification on demand without writing anything. If `end`'s reply is lost, repeating it returns the same answer rather than an error. `start ota` on those builds arms a mesh session instead of advertising BLE DFU; BLE DFU stays reachable through the bootloader, which is also the recovery path if an apply is interrupted by a power cut.
+
+**Note:** `ota write` accepts chunks out of order when an explicit offset is given. Intermediate chunks are not acknowledged individually; the block checkpoints in `ota status` gate the transfer.
+
+**Note:** Over the mesh, the same protocol is available as a binary request (`0x70`) which avoids the hex encoding overhead. Admin permission is required.
+
+**Note:** Boards without OTA support reply `Err - OTA unsupported` rather than staying silent.
+
 ---
 
 ### Erase/Factory Reset
