@@ -31,6 +31,44 @@ const MAX_PATH_SIZE = 64;
 // ContactInfo.h : out_path_len == 0xFF => "aucun chemin connu", le prochain
 // envoi part en flood. 0 => chemin direct sans relais (zero saut).
 const OUT_PATH_UNKNOWN = 0xff;
+
+// out_path_len n'est PAS un nombre d'octets ni un nombre de sauts : c'est le
+// champ path_len packe de Packet.h.
+//   bits 0-5 : nombre de sauts   (getPathHashCount)
+//   bits 6-7 : taille de hash -1 (getPathHashSize, 4 = reserve/invalide)
+// Longueur utile en octets = sauts x taille. Ainsi 0x40 = hashes de 2 octets et
+// ZERO saut, c'est-a-dire un chemin direct - pas "64 sauts".
+// OUT_PATH_UNKNOWN (0xFF) code une taille de 4, invalide, donc sans collision
+// possible avec un chemin reel.
+function pathHopCount(pathLen) {
+  return Number(pathLen) & 63;
+}
+
+function pathHashSize(pathLen) {
+  return ((Number(pathLen) >> 6) & 3) + 1;
+}
+
+function pathByteLen(pathLen) {
+  return pathHopCount(pathLen) * pathHashSize(pathLen);
+}
+
+// Meme regle que mesh::Packet::isValidPathLen, plus la sentinelle "inconnu".
+function isValidPathLen(pathLen) {
+  const v = Number(pathLen);
+  if (!Number.isInteger(v) || v < 0 || v > 0xff) return false;
+  if (v === OUT_PATH_UNKNOWN) return true;
+  if (pathHashSize(v) === 4) return false; // reserve
+  return pathByteLen(v) <= MAX_PATH_SIZE;
+}
+
+// Chemin direct : zero saut, quelle que soit la taille de hash du noeud. On
+// conserve les bits de taille pour que l'enregistrement reste coherent avec le
+// mode de hash configure sur le companion (CMD_SET_PATH_HASH_MODE).
+function directPathLenFrom(pathLen) {
+  const v = Number(pathLen);
+  if (!Number.isInteger(v) || v === OUT_PATH_UNKNOWN || pathHashSize(v) === 4) return 0;
+  return v & 0xc0;
+}
 // Facteur de budget d'airtime du companion pendant l'OTA. Le dispatcher
 // maintient une réserve de 100 ms et attend (airtime/duty) après chaque TX :
 // même à 0.25 (80%), l'inter-paquet reste ~t/0.8 et la file se remplit dès que
@@ -1627,18 +1665,20 @@ class MeshCoreSerialClient {
     // CMD_ADD_UPDATE_CONTACT.
     const outPathLen = frame[35] & 0xff;
     const outPathBytes = frame.slice(36, 100);
-    // Le chemin utile est delimite par out_path_len, PAS par un remplissage de
-    // zeros : un hash de saut peut legitimement valoir 0x00, et le tronquer sur
-    // les zeros de fin faussait l'affichage comme la reecriture du contact.
-    const outPathUsed = outPathLen === OUT_PATH_UNKNOWN
-      ? new Uint8Array()
-      : outPathBytes.slice(0, Math.min(outPathLen, MAX_PATH_SIZE));
+    // Le chemin utile est delimite par sauts x taille_de_hash, PAS par
+    // out_path_len lui-meme (champ packe) ni par un remplissage de zeros : un
+    // hash de saut peut legitimement valoir 0x00.
+    const usedLen = outPathLen === OUT_PATH_UNKNOWN
+      ? 0
+      : Math.min(pathByteLen(outPathLen), MAX_PATH_SIZE);
     return {
       public_key: bytesToHex(frame.slice(1, 33)),
       type: frame[33],
       flags: frame[34],
       out_path_len: outPathLen,
-      out_path: bytesToHex(outPathUsed),
+      out_path_hops: outPathLen === OUT_PATH_UNKNOWN ? -1 : pathHopCount(outPathLen),
+      out_path_hash_size: outPathLen === OUT_PATH_UNKNOWN ? 0 : pathHashSize(outPathLen),
+      out_path: bytesToHex(outPathBytes.slice(0, usedLen)),
       out_path_full: bytesToHex(outPathBytes),
       adv_name: textDecoder.decode(frame.slice(100, 132)).replace(/\0/g, ""),
       last_advert: parseU32LE(frame, 132),
@@ -1875,12 +1915,13 @@ class MeshCoreSerialClient {
   async setContactOutPath(contact, outPathLen, outPathBytes = new Uint8Array(), timeoutMs = 3000) {
     const full = this.normalizeTargetFullKey(contact?.public_key || "");
     const len = Number(outPathLen);
-    if (!Number.isFinite(len) || len < 0 || (len > MAX_PATH_SIZE && len !== OUT_PATH_UNKNOWN)) {
+    if (!isValidPathLen(len)) {
       return { ok: false, error: `out_path_len invalide (${outPathLen})` };
     }
+    const byteLen = len === OUT_PATH_UNKNOWN ? 0 : pathByteLen(len);
     const path = new Uint8Array(MAX_PATH_SIZE);
-    if (len !== OUT_PATH_UNKNOWN && len > 0) {
-      path.set(outPathBytes.subarray(0, Math.min(len, MAX_PATH_SIZE)));
+    if (byteLen > 0) {
+      path.set(outPathBytes.subarray(0, byteLen));
     }
     const name = new Uint8Array(32);
     name.set(textEncoder.encode(String(contact?.adv_name || "")).subarray(0, 32));
@@ -1906,7 +1947,9 @@ class MeshCoreSerialClient {
       const cached = this.contactsByKey[full];
       if (cached) {
         cached.out_path_len = len & 0xff;
-        cached.out_path = len === OUT_PATH_UNKNOWN ? "" : bytesToHex(path.subarray(0, len));
+        cached.out_path_hops = len === OUT_PATH_UNKNOWN ? -1 : pathHopCount(len);
+        cached.out_path_hash_size = len === OUT_PATH_UNKNOWN ? 0 : pathHashSize(len);
+        cached.out_path = bytesToHex(path.subarray(0, byteLen));
       }
       return { ok: true };
     } catch (e) {
@@ -2430,6 +2473,10 @@ const ui = {
   step3badge: document.querySelector("#step3badge"),
   rebootBtn: document.querySelector("#rebootBtn"),
   copyLogBtn: document.querySelector("#copyLogBtn"),
+  saveLogBtn: document.querySelector("#saveLogBtn"),
+  advancedToggle: document.querySelector("#advancedToggle"),
+  advancedBody: document.querySelector("#advancedBody"),
+  fileInfo: document.querySelector("#fileInfo"),
   clearLogBtn: document.querySelector("#clearLogBtn"),
   modalOverlay: document.querySelector("#modalOverlay"),
   modalMessage: document.querySelector("#modalMessage"),
@@ -2448,20 +2495,97 @@ let otaCompleted = false;
 // getOtaStatusBinary, remis à zéro à chaque transfert.
 const otaBusyStats = { events: 0, sleepMs: 0 };
 let lastSelfInfo = null;
+// Verrou d'ecran maintenu pendant l'OTA. En USB OTG sur telephone, l'extinction
+// de l'ecran endort l'onglet et gele l'alimentation des chunks en plein
+// transfert. Le verrou est relache par le navigateur des que la page passe en
+// arriere-plan : on le reprend au retour (visibilitychange).
+let wakeLockSentinel = null;
 let knownRepeaterTargets = [];
 let lastDeviceInfo = null;
 let lastPlanSummary = "";
 
+// ── Preferences locales ────────────────────────────────────────────────────
+// Tout etait a ressaisir a chaque ouverture : mode de connexion, hote TCP,
+// preset OTA temporaire, reglages avances. On memorise ce qui n'est pas secret,
+// par navigateur. Le mot de passe cible et le fichier firmware sont exclus
+// deliberement.
+const PREFS_KEY = "meshcore-web-ota.prefs.v1";
+const PREF_VALUE_FIELDS = [
+  "connectionMode", "baudrate", "tcpTarget", "targetKey",
+  "tempRadioFreq", "tempRadioBw", "tempRadioSf", "tempRadioCr", "tempRadioMins",
+  "chunkSize", "ackEvery", "noAckGap", "checkpointTimeout",
+];
+const PREF_CHECK_FIELDS = ["forceDirectPath", "restorePathAfter", "autoTune", "useTempRadio"];
+
+function setAdvancedOpen(open) {
+  if (!ui.advancedBody || !ui.advancedToggle) return;
+  ui.advancedBody.classList.toggle("open", open);
+  ui.advancedToggle.classList.toggle("open", open);
+  ui.advancedToggle.setAttribute("aria-expanded", String(open));
+}
+
+function savePrefs() {
+  try {
+    const data = { advancedOpen: Boolean(ui.advancedBody?.classList.contains("open")) };
+    for (const key of PREF_VALUE_FIELDS) {
+      if (ui[key]) data[key] = String(ui[key].value ?? "");
+    }
+    for (const key of PREF_CHECK_FIELDS) {
+      if (ui[key]) data[key] = Boolean(ui[key].checked);
+    }
+    localStorage.setItem(PREFS_KEY, JSON.stringify(data));
+  } catch {
+    // Navigation privee, quota plein, stockage bloque : sans consequence.
+  }
+}
+
+function loadPrefs() {
+  let data = null;
+  try {
+    data = JSON.parse(localStorage.getItem(PREFS_KEY) || "null");
+  } catch {
+    data = null;
+  }
+  if (!data || typeof data !== "object") return;
+  for (const key of PREF_VALUE_FIELDS) {
+    if (ui[key] && typeof data[key] === "string") ui[key].value = data[key];
+  }
+  for (const key of PREF_CHECK_FIELDS) {
+    if (ui[key] && typeof data[key] === "boolean") ui[key].checked = data[key];
+  }
+  setAdvancedOpen(Boolean(data.advancedOpen));
+}
+
+function attachPrefsPersistence() {
+  for (const key of [...PREF_VALUE_FIELDS, ...PREF_CHECK_FIELDS]) {
+    const el = ui[key];
+    if (!el) continue;
+    el.addEventListener("change", savePrefs);
+    el.addEventListener("input", savePrefs);
+  }
+}
+
 const LOG_MAX_CHARS = 200000;
+// Marge sous laquelle on considere que l'utilisateur "suit" la fin du journal.
+const LOG_STICK_PX = 24;
 
 function appendLog(line) {
+  // Mesure AVANT d'ecrire : autrement la nouvelle ligne a deja decale le
+  // scrollHeight et tout defilement parait "en bas".
+  const wasAtBottom =
+    ui.log.scrollHeight - ui.log.scrollTop - ui.log.clientHeight < LOG_STICK_PX;
+
   let value = `${ui.log.value}[${nowTime()}] ${line}\n`;
   if (value.length > LOG_MAX_CHARS) {
     const cut = value.indexOf("\n", value.length - Math.floor(LOG_MAX_CHARS * 0.75));
-    value = `[journal tronqué]\n${value.slice(cut + 1)}`;
+    // indexOf peut ne rien trouver (une seule ligne enorme) : on repart de zero
+    // plutot que de garder l'integralite avec un entete mensonger.
+    value = `[journal tronqué]\n${cut >= 0 ? value.slice(cut + 1) : ""}`;
   }
   ui.log.value = value;
-  ui.log.scrollTop = ui.log.scrollHeight;
+  // Relire pendant un transfert de 20 min etait impossible : le journal
+  // ramenait en bas a chaque ligne. On ne suit que si l'utilisateur y est reste.
+  if (wasAtBottom) ui.log.scrollTop = ui.log.scrollHeight;
 }
 
 function showToast(message, kind = "") {
@@ -2478,15 +2602,38 @@ function showConfirm(message) {
     return Promise.resolve(window.confirm(message));
   }
   return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
     ui.modalMessage.textContent = message;
     ui.modalOverlay.hidden = false;
+    ui.modalConfirmBtn.focus();
+
+    // La modale confirme un reboot distant : Echap doit annuler, et le focus ne
+    // doit pas s'echapper vers les boutons de la page derriere l'overlay.
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        done(false);
+        return;
+      }
+      if (e.key !== "Tab") return;
+      e.preventDefault();
+      const target = document.activeElement === ui.modalConfirmBtn
+        ? ui.modalCancelBtn
+        : ui.modalConfirmBtn;
+      target.focus();
+    };
+
     const done = (value) => {
+      document.removeEventListener("keydown", onKeyDown, true);
       ui.modalOverlay.hidden = true;
       ui.modalConfirmBtn.onclick = null;
       ui.modalCancelBtn.onclick = null;
       ui.modalOverlay.onclick = null;
+      previousFocus?.focus?.();
       resolve(value);
     };
+
+    document.addEventListener("keydown", onKeyDown, true);
     ui.modalConfirmBtn.onclick = () => done(true);
     ui.modalCancelBtn.onclick = () => done(false);
     ui.modalOverlay.onclick = (e) => {
@@ -2721,6 +2868,13 @@ function updateLiveMetrics(transport, doneBytes, totalBytes, startTs, attempts, 
     + `srv ${serverRejects}/${attempts} ${serverRejectRatePct.toFixed(2)}%]`;
 }
 
+// L'etape 2 est-elle utilisable ? (cible resolue + firmware lisible)
+function otaInputsReady() {
+  const hasTarget = getSelectedTargetHex().length >= 12;
+  const hasFile = Boolean(ui.firmwareFile?.files && ui.firmwareFile.files[0]);
+  return hasTarget && hasFile;
+}
+
 function updateButtons() {
   const connected = Boolean(client && client.connected);
   const mode = String(ui.connectionMode?.value || "usb");
@@ -2728,7 +2882,9 @@ function updateButtons() {
   const isTcp = mode === "tcp";
   ui.connectBtn.disabled = connected || otaRunning;
   ui.disconnectBtn.disabled = !connected || otaRunning;
-  ui.startOtaBtn.disabled = !connected || otaRunning;
+  // Le bouton etait vert des la connexion : le clic ne faisait que logger
+  // "aucun firmware selectionne". On le grise tant que l'etape 2 est incomplete.
+  ui.startOtaBtn.disabled = !connected || otaRunning || !otaInputsReady();
   ui.cancelOtaBtn.disabled = !otaRunning;
   if (ui.refreshTargetsBtn) ui.refreshTargetsBtn.disabled = !connected || otaRunning;
   if (ui.targetSelect) ui.targetSelect.disabled = !connected || otaRunning;
@@ -2772,7 +2928,11 @@ function updateTempRadioInputsState() {
 
 function updatePlanLine(logToConsole = true) {
   const file = ui.firmwareFile?.files && ui.firmwareFile.files[0];
-  const fwSize = file ? Number(file.size || 0) : 0;
+  // La taille du fichier n'est pas celle du transfert : un .uf2 porte 256
+  // octets de payload par bloc de 512, un .hex est du texte, et le gzip divise
+  // le tout par ~2. On prend le payload prepare des qu'il est disponible.
+  const preparedSize = preparedPayloadSize();
+  const fwSize = preparedSize > 0 ? preparedSize : (file ? Number(file.size || 0) : 0);
   const chunkInput = Number.parseInt(ui.chunkSize?.value || "0", 10) || 0;
   const ackEvery = Number.parseInt(ui.ackEvery?.value || "0", 10) || 0;
   let planText = "Plan OTA: sélectionne un firmware";
@@ -2880,25 +3040,28 @@ function recalcAutoFromCurrentSelection(logReason = null) {
 // connue seulement après la sonde) — voir chooseFirmwareVariant(). Le gzip
 // réduit le volume transmis de ~40-50% quand la cible sait décompresser
 // (bootloader arduino-pico, inflater ROM des ESP32).
-async function getFirmwareBytes(file) {
+async function getFirmwareBytes(file, quiet = false) {
+  // Silencieux a la selection du fichier (on prepare juste pour afficher la
+  // taille reelle et le plan) ; bavard au lancement de l'OTA.
+  const say = quiet ? () => {} : appendLog;
   const sourceBytes = new Uint8Array(await file.arrayBuffer());
   const fileName = lowerFileName(file);
-  appendLog(`Lecture firmware: ${file.name} (${formatByteCount(sourceBytes.length)})`);
+  say(`Lecture firmware: ${file.name} (${formatByteCount(sourceBytes.length)})`);
 
   const canGzip = typeof CompressionStream === "function";
   const canGunzip = typeof DecompressionStream === "function";
 
   const buildGzCandidate = async (rawBytes) => {
     if (!canGzip) {
-      appendLog("Firmware: CompressionStream indisponible, forme gzip non préparée");
+      say("Firmware: CompressionStream indisponible, forme gzip non préparée");
       return null;
     }
     const gzipPayload = await gzipBytes(rawBytes);
     if (gzipPayload.length >= rawBytes.length) {
-      appendLog("Firmware: gzip sans gain, forme gzip écartée");
+      say("Firmware: gzip sans gain, forme gzip écartée");
       return null;
     }
-    appendLog(
+    say(
       `Firmware: forme gzip prête ${formatByteCount(rawBytes.length)} -> ${formatByteCount(gzipPayload.length)} `
       + `(${Math.round((1 - (gzipPayload.length / rawBytes.length)) * 100)}% de moins si la cible décompresse)`
     );
@@ -2906,7 +3069,7 @@ async function getFirmwareBytes(file) {
   };
 
   if (fileName.endsWith(".zip")) {
-    appendLog("Firmware: format source détecté = paquet DFU nRF52 (zip)");
+    say("Firmware: format source détecté = paquet DFU nRF52 (zip)");
     const binBytes = await extractDfuZipImage(sourceBytes);
     return {
       sourceFormat: "dfu-zip",
@@ -2918,7 +3081,7 @@ async function getFirmwareBytes(file) {
   }
 
   if (fileName.endsWith(".hex")) {
-    appendLog("Firmware: format source détecté = intel hex (nRF52)");
+    say("Firmware: format source détecté = intel hex (nRF52)");
     const binBytes = convertIntelHexToBin(sourceBytes);
     return {
       sourceFormat: "hex",
@@ -2930,7 +3093,7 @@ async function getFirmwareBytes(file) {
   }
 
   if (fileName.endsWith(".uf2")) {
-    appendLog("Firmware: format source détecté = uf2");
+    say("Firmware: format source détecté = uf2");
     const binBytes = convertUf2ToBin(sourceBytes);
     return {
       sourceFormat: "uf2",
@@ -2942,7 +3105,7 @@ async function getFirmwareBytes(file) {
   }
 
   const isGzip = fileName.endsWith(".gz");
-  appendLog(`Firmware: format source détecté = ${isGzip ? "bin.gz" : "bin"}`);
+  say(`Firmware: format source détecté = ${isGzip ? "bin.gz" : "bin"}`);
 
   if (isGzip) {
     let rawBytes = null;
@@ -2950,10 +3113,10 @@ async function getFirmwareBytes(file) {
       try {
         rawBytes = await gunzipBytes(sourceBytes);
       } catch (e) {
-        appendLog(`Firmware: décompression du .gz impossible (${e.message}), forme brute non préparée`);
+        say(`Firmware: décompression du .gz impossible (${e.message}), forme brute non préparée`);
       }
     } else {
-      appendLog("Firmware: DecompressionStream indisponible, forme brute non préparée");
+      say("Firmware: DecompressionStream indisponible, forme brute non préparée");
     }
     return {
       sourceFormat: "bin.gz",
@@ -2971,6 +3134,104 @@ async function getFirmwareBytes(file) {
     rawBytes: sourceBytes,
     gzBytes: await buildGzCandidate(sourceBytes),
   };
+}
+
+// Preparation memorisee du firmware selectionne. Elle sert deux fois : a la
+// selection du fichier, pour afficher la taille REELLEMENT transmise (un .uf2
+// ou un .hex ne pese pas ce que pese le .bin qu'il contient) et un plan OTA
+// juste, puis au lancement, sans refaire conversion et compression.
+let preparedFirmware = null; // { key, info, variants }
+let firmwarePrepareToken = 0;
+
+function firmwareFileKey(file) {
+  return file ? `${file.name}|${file.size}|${file.lastModified}` : "";
+}
+
+async function prepareFirmware(file, { quiet = false, withMd5 = false } = {}) {
+  if (!file) {
+    preparedFirmware = null;
+    return null;
+  }
+  const key = firmwareFileKey(file);
+  if (preparedFirmware?.key !== key) {
+    const info = await getFirmwareBytes(file, quiet);
+    preparedFirmware = { key, info, variants: null };
+  }
+  if (withMd5 && !preparedFirmware.variants) {
+    const info = preparedFirmware.info;
+    preparedFirmware.variants = {
+      raw: info.rawBytes
+        ? { bytes: info.rawBytes, md5: md5Hex(info.rawBytes), format: "bin" }
+        : null,
+      gz: info.gzBytes
+        ? { bytes: info.gzBytes, md5: md5Hex(info.gzBytes), format: "bin.gz" }
+        : null,
+    };
+  }
+  return preparedFirmware;
+}
+
+// Taille du payload qui partira reellement sur l'air : la forme gzip si elle
+// existe (les cibles sans gzip recoivent la brute, le plan reste indicatif).
+function preparedPayloadSize() {
+  const info = preparedFirmware?.info;
+  if (!info) return 0;
+  if (info.gzBytes) return info.gzBytes.length;
+  if (info.rawBytes) return info.rawBytes.length;
+  return 0;
+}
+
+function describePreparedFirmware(file) {
+  const info = preparedFirmware?.info;
+  if (!info) return `${file.name} — ${formatByteCount(file.size)}`;
+  const parts = [`${file.name} — ${formatByteCount(info.originalSize)}`];
+  if (info.sourceFormat !== "bin" && Number.isFinite(info.extractedSize)) {
+    parts.push(`${info.sourceFormat} → bin ${formatByteCount(info.extractedSize)}`);
+  }
+  if (info.gzBytes && info.rawBytes && info.gzBytes.length < info.rawBytes.length) {
+    const gain = Math.round((1 - (info.gzBytes.length / info.rawBytes.length)) * 100);
+    parts.push(`gzip ${formatByteCount(info.gzBytes.length)} (−${gain}%)`);
+  } else if (info.sourceFormat === "bin.gz") {
+    parts.push("déjà gzip");
+  }
+  return parts.join("  ·  ");
+}
+
+function setFileInfoText(text, visible = true) {
+  if (!ui.fileInfo) return;
+  ui.fileInfo.textContent = text;
+  ui.fileInfo.classList.toggle("visible", visible);
+}
+
+// Prepare en tache de fond a la selection du fichier. Le jeton evite qu'une
+// preparation lente (gros .hex) ecrase l'affichage d'un fichier choisi depuis.
+async function onFirmwareFileSelected() {
+  const file = ui.firmwareFile?.files && ui.firmwareFile.files[0];
+  firmwarePrepareToken += 1;
+  const token = firmwarePrepareToken;
+
+  if (!file) {
+    preparedFirmware = null;
+    setFileInfoText("—", false);
+    updatePlanLine(true);
+    updateButtons();
+    return;
+  }
+
+  setFileInfoText(`${file.name} — ${formatByteCount(file.size)}  ·  analyse…`);
+  updateButtons();
+  try {
+    await prepareFirmware(file, { quiet: true });
+    if (token !== firmwarePrepareToken) return;
+    setFileInfoText(describePreparedFirmware(file));
+  } catch (e) {
+    if (token !== firmwarePrepareToken) return;
+    preparedFirmware = null;
+    setFileInfoText(`${file.name} — illisible : ${e.message}`);
+    appendLog(`Firmware illisible: ${e.message}`);
+  }
+  updatePlanLine(true);
+  updateButtons();
 }
 
 async function getOtaStatus(targetHex, timeoutSec = 10) {
@@ -4464,14 +4725,24 @@ async function refreshKnownRepeaters(logToConsole = false) {
 // savoir que les DEUX sens fonctionnent en direct.
 let forcedDirectPath = null; // { fullKey, contact, prevLen, prevPath, applied }
 
+function contactIsDirectPath(contact) {
+  const len = Number(contact?.out_path_len);
+  return Number.isInteger(len) && len !== OUT_PATH_UNKNOWN && pathHopCount(len) === 0;
+}
+
 function describeContactPath(contact) {
   const len = Number(contact?.out_path_len);
-  if (!Number.isFinite(len) || len === OUT_PATH_UNKNOWN) {
+  if (!Number.isInteger(len) || len === OUT_PATH_UNKNOWN) {
     return "inconnu (le prochain envoi partira en flood)";
   }
-  if (len <= 0) return "direct, 0 saut";
-  const hops = contact?.out_path ? ` [${contact.out_path}]` : "";
-  return `${len} saut${len > 1 ? "s" : ""}${hops}`;
+  if (!isValidPathLen(len)) return `encodage invalide (out_path_len=0x${len.toString(16)})`;
+  const hops = pathHopCount(len);
+  const size = pathHashSize(len);
+  if (hops === 0) return `direct, 0 saut${size > 1 ? ` (hash ${size} o)` : ""}`;
+  const raw = String(contact?.out_path || "");
+  // 63 sauts x 3 octets = 378 caracteres hexa : illisible tel quel.
+  const shown = raw.length > 24 ? `${raw.slice(0, 24)}…` : raw;
+  return `${hops} saut${hops > 1 ? "s" : ""}${shown ? ` [${shown}]` : ""}`;
 }
 
 function lookupCachedContact(targetHex) {
@@ -4498,7 +4769,7 @@ function updateTargetPathLine() {
     ui.pathLine.className = "path-line warn";
     return;
   }
-  const direct = Number(contact.out_path_len) === 0;
+  const direct = contactIsDirectPath(contact);
   ui.pathLine.textContent = `Chemin vers la cible : ${describeContactPath(contact)}`;
   ui.pathLine.className = `path-line ${direct ? "ok" : "warn"}`;
 }
@@ -4527,24 +4798,28 @@ async function forceDirectPathToTarget(fullKeyHex, reason = "ota") {
 
   const prevLen = Number(contact.out_path_len);
   const prevPath = hexToBytes(contact.out_path || "");
+  // Zero saut en conservant la taille de hash du noeud : ecrire un 0 brut
+  // forcerait le contact en mode hash 1 octet.
+  const directLen = directPathLenFrom(prevLen);
   forcedDirectPath = {
     fullKey: normalizeHex(contact.public_key).slice(0, 64),
     contact: { ...contact },
     prevLen,
     prevPath,
+    directLen,
     applied: false,
   };
 
   appendLog(`Chemin memorise vers ${targetKeyPreview(fullKeyHex)} : ${describeContactPath(contact)}.`);
 
-  if (prevLen === 0) {
+  if (contactIsDirectPath(contact)) {
     forcedDirectPath.applied = true;
     appendLog("Chemin deja direct (0 saut) : rien a reecrire.");
     updateTargetPathLine();
     return forcedDirectPath;
   }
 
-  const res = await client.setContactOutPath(forcedDirectPath.contact, 0, new Uint8Array());
+  const res = await client.setContactOutPath(forcedDirectPath.contact, directLen, new Uint8Array());
   if (!res.ok) {
     forcedDirectPath = null;
     throw new Error(
@@ -4553,7 +4828,7 @@ async function forceDirectPathToTarget(fullKeyHex, reason = "ota") {
     );
   }
   forcedDirectPath.applied = true;
-  forcedDirectPath.contact.out_path_len = 0;
+  forcedDirectPath.contact.out_path_len = directLen;
   forcedDirectPath.contact.out_path = "";
   appendLog(
     `Chemin force en direct 0 saut (${reason}) : commandes et chunks partiront `
@@ -4569,7 +4844,11 @@ async function forceDirectPathToTarget(fullKeyHex, reason = "ota") {
 // qui reecrit out_path avec la route du paquet.
 async function reassertDirectPath(reason) {
   if (!forcedDirectPath?.applied || !client?.connected) return;
-  const res = await client.setContactOutPath(forcedDirectPath.contact, 0, new Uint8Array());
+  const res = await client.setContactOutPath(
+    forcedDirectPath.contact,
+    forcedDirectPath.directLen ?? 0,
+    new Uint8Array()
+  );
   if (!res.ok) {
     appendLog(`Warning: re-application du chemin direct echouee (${reason} : ${res.error}).`);
     return;
@@ -4583,9 +4862,8 @@ async function reportLearnedPath(reason) {
   if (!forcedDirectPath) return null;
   const contact = await fetchContactRecord(forcedDirectPath.fullKey, true);
   if (!contact) return null;
-  const len = Number(contact.out_path_len);
   appendLog(`Chemin appris apres ${reason} : ${describeContactPath(contact)}.`);
-  if (len > 0 && len !== OUT_PATH_UNKNOWN) {
+  if (!contactIsDirectPath(contact) && Number(contact.out_path_len) !== OUT_PATH_UNKNOWN) {
     appendLog(
       "ATTENTION: la cible n'a repondu qu'en multi-saut. Une OTA sur preset radio "
       + "temporaire ne peut PAS aboutir ainsi (les relais restent sur le preset "
@@ -4600,7 +4878,7 @@ async function reportLearnedPath(reason) {
 async function restoreTargetContactPath() {
   const state = forcedDirectPath;
   forcedDirectPath = null;
-  if (!state?.applied || state.prevLen === 0) {
+  if (!state?.applied || state.prevLen === state.directLen) {
     updateTargetPathLine();
     return;
   }
@@ -4614,7 +4892,7 @@ async function restoreTargetContactPath() {
   if (res.ok) {
     appendLog(
       `Chemin d'origine restaure vers ${targetKeyPreview(state.fullKey)} (`
-      + `${state.prevLen === OUT_PATH_UNKNOWN ? "inconnu/flood" : `${state.prevLen} saut(s)`}).`
+      + `${state.prevLen === OUT_PATH_UNKNOWN ? "inconnu/flood" : `${pathHopCount(state.prevLen)} saut(s)`}).`
     );
   } else {
     appendLog(`Warning: restauration du chemin d'origine echouee (${res.error}).`);
@@ -4797,22 +5075,64 @@ async function sendTargetRebootRepeatedly(targetHex, attempts = REBOOT_SEND_ATTE
   return delivered > 0;
 }
 
+// La fenetre est un budget de DEMARRAGE, pas une limite dure : le timeout
+// effectif d'une sonde est un plancher que l'estimation de route du companion
+// peut allonger (multihop). On refuse donc d'entamer une tentative quand il
+// reste moins que sa duree minimale, et on rapporte le temps reellement passe
+// pour que le journal ne mente pas sur la fenetre annoncee.
+const PROBE_BINARY_MIN_MS = 3000;
+const PROBE_TEXT_MIN_MS = 4000;
+
 async function probeTargetReachable(targetHex, probeKey, windowMs) {
-  const tEnd = performance.now() + windowMs;
+  const tStart = performance.now();
+  const tEnd = tStart + windowMs;
+  const elapsed = () => (performance.now() - tStart) / 1000;
   let lastErr = "aucune sonde";
+  let attempts = 0;
+
   while (performance.now() < tEnd) {
-    if (probeKey) {
-      const b = await getOtaStatusBinary(probeKey, 1, 3000);
-      if (!b.error) return { ok: true, via: "binaire", reply: b.reply };
+    if (probeKey && performance.now() + PROBE_BINARY_MIN_MS <= tEnd) {
+      attempts += 1;
+      const b = await getOtaStatusBinary(probeKey, 1, PROBE_BINARY_MIN_MS);
+      if (!b.error) return { ok: true, via: "binaire", reply: b.reply, elapsedSec: elapsed() };
       lastErr = b.error;
-      if (performance.now() >= tEnd) break;
     }
+    if (performance.now() + PROBE_TEXT_MIN_MS > tEnd) break;
+    attempts += 1;
     const t = await client.sendRepeaterCmdAndWaitReply(targetHex, "ota status", 4);
-    if (!t.error) return { ok: true, via: "texte", reply: t.reply };
+    if (!t.error) return { ok: true, via: "texte", reply: t.reply, elapsedSec: elapsed() };
     lastErr = t.error;
     if (performance.now() < tEnd) await sleep(300);
   }
-  return { ok: false, error: lastErr };
+
+  if (attempts === 0) {
+    // Fenetre trop courte pour meme une tentative : le dire plutot que de
+    // renvoyer "aucune sonde" comme si la cible etait muette.
+    return { ok: false, error: `fenetre de sonde trop courte (${windowMs} ms)`, elapsedSec: elapsed() };
+  }
+  return { ok: false, error: `${lastErr} (${attempts} sonde(s) en ${elapsed().toFixed(1)}s)`, elapsedSec: elapsed() };
+}
+
+async function acquireOtaWakeLock() {
+  if (wakeLockSentinel || !navigator.wakeLock?.request) return;
+  try {
+    wakeLockSentinel = await navigator.wakeLock.request("screen");
+    wakeLockSentinel.addEventListener?.("release", () => { wakeLockSentinel = null; });
+    appendLog("Verrou d'écran acquis : l'écran ne s'éteindra pas pendant l'OTA.");
+  } catch (e) {
+    // Refus courant hors HTTPS/localhost, ou onglet en arriere-plan. Non bloquant.
+    appendLog(`Verrou d'écran indisponible (${e.message}) — garde l'écran allumé manuellement.`);
+  }
+}
+
+async function releaseOtaWakeLock() {
+  if (!wakeLockSentinel) return;
+  try {
+    await wakeLockSentinel.release();
+  } catch {
+    // deja relache par le navigateur
+  }
+  wakeLockSentinel = null;
 }
 
 async function applyTempRadioPresetForOta(targetHex, preset) {
@@ -4924,6 +5244,13 @@ function attachClientDebugHooks(c) {
   c.onDisconnected = () => {
     if (client !== c) return;
     setConnectionStatus("Connexion perdue", "err");
+    // Sans ca, la boucle OTA continuait a alimenter un transport mort jusqu'a
+    // epuisement des retries, en affichant une progression qui n'existait plus.
+    if (otaRunning && !otaCancelRequested) {
+      otaCancelRequested = true;
+      setOtaStatus("Lien companion perdu — annulation…");
+      appendLog("Lien avec le companion perdu : annulation de l'OTA en cours.");
+    }
     updateButtons();
   };
 }
@@ -5157,7 +5484,7 @@ if (ui.targetSelect) {
       appendLog(`Cible OTA sélectionnée: ${targetKeyPreview(selected)}`);
     }
     updateTargetPathLine();
-    updateStepBadges();
+    updateButtons();
   });
 }
 
@@ -5194,6 +5521,30 @@ if (ui.rebootBtn) {
 if (ui.clearLogBtn) {
   ui.clearLogBtn.addEventListener("click", () => {
     ui.log.value = "";
+  });
+}
+
+// Copier-coller un journal de 200 000 caracteres est impraticable sur mobile :
+// on propose le telechargement direct.
+if (ui.saveLogBtn) {
+  ui.saveLogBtn.addEventListener("click", () => {
+    try {
+      const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "");
+      const blob = new Blob([ui.log.value], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `meshcore-ota-${stamp}.log`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // Liberer immediatement casserait le telechargement sur certains
+      // navigateurs : on laisse un tour de boucle.
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      showToast("Journal enregistré", "ok");
+    } catch (e) {
+      showToast(`Enregistrement impossible: ${e.message}`, "err");
+    }
   });
 }
 
@@ -5302,16 +5653,12 @@ ui.startOtaBtn.addEventListener("click", async () => {
   let firmware;
   let firmwareMd5;
   try {
-    firmwareInfo = await getFirmwareBytes(file);
-    appendLog("Lancer OTA: calcul MD5 des formes disponibles...");
-    firmwareVariants = {
-      raw: firmwareInfo.rawBytes
-        ? { bytes: firmwareInfo.rawBytes, md5: md5Hex(firmwareInfo.rawBytes), format: "bin" }
-        : null,
-      gz: firmwareInfo.gzBytes
-        ? { bytes: firmwareInfo.gzBytes, md5: md5Hex(firmwareInfo.gzBytes), format: "bin.gz" }
-        : null,
-    };
+    // Conversion et gzip ont deja ete faits a la selection du fichier (en
+    // silence) : prepareFirmware ne refait que ce qui manque, ici les MD5.
+    const prepared = await prepareFirmware(file, { withMd5: true });
+    firmwareInfo = prepared.info;
+    appendLog(`Lancer OTA: ${describePreparedFirmware(file)}`);
+    firmwareVariants = prepared.variants;
     // Forme par défaut (métriques initiales) : gzip si disponible, comme les
     // cibles historiques ; le choix définitif se fait sur la réponse START.
     const preferred = firmwareVariants.gz || firmwareVariants.raw;
@@ -5334,6 +5681,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
   otaRunning = true;
   otaCancelRequested = false;
   otaCompleted = false;
+  await acquireOtaWakeLock();
   updateButtons();
   setProgress(0);
   setProgressIndeterminate();
@@ -5607,6 +5955,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
     } catch (pathErr) {
       appendLog(`Warning: restauration du chemin d'origine echouee (${pathErr.message}).`);
     }
+    await releaseOtaWakeLock();
     otaRunning = false;
     otaCancelRequested = false;
     updateButtons();
@@ -5656,8 +6005,16 @@ for (const el of [ui.tempRadioFreq, ui.tempRadioBw, ui.tempRadioSf, ui.tempRadio
 
 if (ui.firmwareFile) {
   ui.firmwareFile.addEventListener("change", () => {
-    updatePlanLine(true);
-    updateStepBadges();
+    onFirmwareFileSelected();
+  });
+}
+
+// Panneau "Paramètres avancés" : porté ici (et non en script inline) pour que
+// son état soit mémorisé avec le reste des préférences.
+if (ui.advancedToggle && ui.advancedBody) {
+  ui.advancedToggle.addEventListener("click", () => {
+    setAdvancedOpen(!ui.advancedBody.classList.contains("open"));
+    savePrefs();
   });
 }
 if (ui.chunkSize) {
@@ -5674,11 +6031,11 @@ if (ui.targetKey) {
   ui.targetKey.addEventListener("input", () => {
     const manual = normalizeHex(ui.targetKey.value || "");
     if (!ui.targetSelect) {
-      updateStepBadges();
+      updateButtons();
       return;
     }
     if (!manual) {
-      updateStepBadges();
+      updateButtons();
       return;
     }
     const match = findKnownRepeaterTarget(manual);
@@ -5688,9 +6045,31 @@ if (ui.targetKey) {
       ui.targetSelect.value = "";
     }
     updateTargetPathLine();
-    updateStepBadges();
+    updateButtons();
   });
 }
+
+// Fermer l'onglet en pleine OTA laisse la cible avec une session armee et une
+// image partielle : demander confirmation est le minimum.
+window.addEventListener("beforeunload", (e) => {
+  if (!otaRunning) return;
+  e.preventDefault();
+  e.returnValue = "";
+});
+
+// Le navigateur relache le verrou d'ecran des que la page passe en
+// arriere-plan ; on le reprend au retour tant que l'OTA tourne.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && otaRunning) {
+    acquireOtaWakeLock();
+  }
+});
+
+loadPrefs();
+attachPrefsPersistence();
+// Rejoue l'affichage dependant du mode : loadPrefs a pu restaurer "tcp", dont
+// le champ hote etait masque par l'appel initial a updateConnectionModeUi().
+updateConnectionModeUi();
 
 setConnectionStatus("Non connecté");
 setProgress(0);
