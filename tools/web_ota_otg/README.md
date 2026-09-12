@@ -25,6 +25,16 @@ En mode `USB`, il tente :
 - **Compression gzip automatique** des `.bin` bruts — ~40-50 % de données en moins. Les deux formes (brute et gzip) sont préparées au lancement et la forme réellement envoyée est choisie d'après la capacité annoncée par la cible dans la réponse START (`gz=1`/`gz=0` ; absence du jeton = cible RP2040 historique qui décompresse nativement via le bootloader arduino-pico). Les cibles ESP32 décompressent en streaming via le tinfl du ROM ; celles qui ne le peuvent pas (`gz=0`) reçoivent le `.bin` brut automatiquement.
 - Affiche le `Plan OTA` sous la barre de progression, ainsi que le débit (ko/s) et une estimation du temps restant.
 - **`ack_every` adaptatif** en mode binaire : les checkpoints `STATUS` s'espacent automatiquement (jusqu'à 32 chunks) quand le lien est propre, et se resserrent au premier rejet. Note : en transport binaire, le firmware supprime tous les ACK d'écriture ; la valeur `ack_every` envoyée dans le `BEGIN` ne sert que de cadence initiale côté client (et de compat avec le mode texte).
+- **Chemin direct 0 saut** (`Forcer le chemin direct`, activé par défaut) : avant toute
+  commande vers la cible — login compris — l'outil réécrit le contact côté companion avec
+  `out_path_len = 0`. Sans ça, `BaseChatMesh` émet en DIRECT le long du chemin déjà
+  mémorisé : un chemin multi-saut envoie les paquets vers le **premier relais**, pas vers
+  la cible. C'est rédhibitoire avec le preset OTA temporaire, puisque les relais restent
+  sur le preset standard et n'entendent plus rien. Le chemin d'origine est restauré en fin
+  d'opération (case `Restaurer le chemin d'origine`). Le bouton `Vérifier le lien` fait la
+  même chose puis sonde la cible : c'est le seul test du sens **retour**, dont le
+  `out_path` vit dans le répéteur et n'est pas réécrivable à distance (le firmware ne le
+  purge que sur un login reçu en flood).
 - Option `Preset OTA temporaire` :
   - envoie `tempradio` à la cible avant OTA
   - bascule le client USB sur le même preset
@@ -54,6 +64,13 @@ build_flags =
 - Web Serial dépend du support navigateur/OS. Sur Android, le prototype force plutôt WebUSB.
 - Le fallback WebUSB dépend des interfaces USB exposées par le firmware companion (CDC-ACM bulk IN/OUT requis).
 - Si erreur `Unable to claim interface` : Android peut déjà attacher le driver CDC système sur l'interface série USB. Dans ce cas, WebUSB navigateur ne peut pas toujours la prendre.
+- Le forçage du chemin direct ne maîtrise que le sens **companion → cible**. Le répéteur
+  répond le long de son propre `out_path` pour ce client, qu'aucune commande companion ne
+  peut réécrire à distance : s'il est périmé ou multi-saut, les réponses se perdent même
+  quand l'aller passe. Un login en flood le réinitialise côté répéteur (`if (is_flood)`
+  dans `handleLoginReq`) ; c'est ce que fait automatiquement la récupération de chemin du
+  login. Si `Vérifier le lien` reste muet alors que la cible est à portée, renseigner le
+  mot de passe et relancer suffit généralement.
 - Le mode BLE dépend du support `Web Bluetooth` du navigateur et du companion BLE. Les trames sont supposées tenir dans une notification GATT (MTU suffisant).
 
 ## Lancer en local
@@ -153,10 +170,14 @@ Options pour l'utilisateur, de la plus simple à la plus robuste :
 2. Connecter le client MeshCore (en TCP : renseigner `ip:port` du companion).
 3. Cliquer `Connecter`.
 4. Renseigner la cible OTA (pubkey hex, min 12 chars = préfixe 6 octets).
-5. (Optionnel) renseigner `Mot de passe` pour faire un login avant OTA.
-6. Sélectionner le firmware `.bin`, `.bin.gz`, `.uf2`, ou `.hex` / `.zip` (nRF52).
-7. (Optionnel) activer `Preset OTA temporaire` et régler `freq,bw,sf,cr` (défaut : `869.4,250,5,5`).
-8. Cliquer `Lancer l'OTA`.
+   La ligne `Chemin vers la cible` indique le chemin mémorisé par le companion :
+   vert = direct 0 saut, orange = multi-saut ou inconnu.
+5. Laisser `Forcer le chemin direct (0 saut)` coché, et cliquer `Vérifier le lien`
+   pour confirmer que la cible répond sans relais avant de lancer quoi que ce soit.
+6. (Optionnel) renseigner `Mot de passe` pour faire un login avant OTA.
+7. Sélectionner le firmware `.bin`, `.bin.gz`, `.uf2`, ou `.hex` / `.zip` (nRF52).
+8. (Optionnel) activer `Preset OTA temporaire` et régler `freq,bw,sf,cr` (défaut : `869.4,250,5,5`).
+9. Cliquer `Lancer l'OTA`.
 
 ## Réglages
 
