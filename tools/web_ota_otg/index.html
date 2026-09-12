@@ -477,6 +477,20 @@
       to   { opacity: 1; transform: translateY(0); }
     }
 
+    /* ── Ligne de chemin ── */
+    .path-line {
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      color: var(--muted);
+      padding: 6px 9px;
+      border-radius: var(--r-sm);
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      overflow-wrap: anywhere;
+    }
+    .path-line.ok   { color: var(--green); border-color: #238636; }
+    .path-line.warn { color: var(--orange); border-color: #6b5015; }
+
     /* ── File info ── */
     .file-info {
       font-size: 0.78rem;
@@ -573,17 +587,31 @@
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M13.5 2.5A6.5 6.5 0 1 1 2 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M13.5 2.5V6h-3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
             Rafraîchir
           </button>
-          <div><!-- spacer --></div>
+          <button id="checkPathBtn" class="btn-secondary" disabled>
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M2 8h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="3" cy="8" r="2" fill="currentColor"/><circle cx="13" cy="8" r="2" fill="currentColor"/></svg>
+            Vérifier le lien
+          </button>
         </div>
+
+        <div id="pathLine" class="path-line">Chemin vers la cible : -</div>
 
         <div class="field">
           <label for="targetKey">Pubkey manuelle (optionnel)</label>
           <input id="targetKey" type="text" placeholder="0a0c54d3… (hex partiel ou complet)" autocomplete="off" autocorrect="off" spellcheck="false">
         </div>
 
+        <div class="check-row">
+          <input id="forceDirectPath" type="checkbox" checked>
+          <label for="forceDirectPath" title="Impose out_path_len = 0 sur le contact du companion avant toute commande : les paquets partent vers la cible sans passer par un relais.">Forcer le chemin direct (0 saut) avant toute commande</label>
+        </div>
+        <div class="check-row">
+          <input id="restorePathAfter" type="checkbox" checked>
+          <label for="restorePathAfter">Restaurer le chemin d'origine après l'opération</label>
+        </div>
+
         <div class="field">
           <label for="targetPassword">Mot de passe</label>
-          <input id="targetPassword" type="password" placeholder="Laisser vide si non requis">
+          <input id="targetPassword" type="password" placeholder="Laisser vide si non requis" autocomplete="off">
         </div>
 
         <div class="field">
@@ -744,6 +772,6 @@
     });
   </script>
 
-  <script defer src="./app.js?v=20260710-r14"></script>
+  <script defer src="./app.js?v=20260912-r15"></script>
 </body>
 </html>

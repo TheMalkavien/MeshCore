@@ -25,6 +25,12 @@ const CMD_SET_DEVICE_TIME = 6;
 const CMD_SET_RADIO_PARAMS = 11;
 const CMD_SET_TUNING_PARAMS = 21;
 const CMD_GET_TUNING_PARAMS = 43;
+const CMD_ADD_UPDATE_CONTACT = 9;
+// MeshCore.h : taille max (en octets) d'un out_path memorise pour un contact.
+const MAX_PATH_SIZE = 64;
+// ContactInfo.h : out_path_len == 0xFF => "aucun chemin connu", le prochain
+// envoi part en flood. 0 => chemin direct sans relais (zero saut).
+const OUT_PATH_UNKNOWN = 0xff;
 // Facteur de budget d'airtime du companion pendant l'OTA. Le dispatcher
 // maintient une réserve de 100 ms et attend (airtime/duty) après chaque TX :
 // même à 0.25 (80%), l'inter-paquet reste ~t/0.8 et la file se remplit dès que
@@ -1615,13 +1621,25 @@ class MeshCoreSerialClient {
     if (!frame || frame.length < 148) {
       return { public_key: "" };
     }
-    const outPathLenSigned = (frame[35] << 24) >> 24;
+    // out_path_len est un uint8_t cote firmware, avec 0xFF (= OUT_PATH_UNKNOWN)
+    // comme sentinelle "aucun chemin connu". On garde la valeur brute : la lire
+    // en signe donnait -1, valeur impossible a renvoyer telle quelle dans un
+    // CMD_ADD_UPDATE_CONTACT.
+    const outPathLen = frame[35] & 0xff;
+    const outPathBytes = frame.slice(36, 100);
+    // Le chemin utile est delimite par out_path_len, PAS par un remplissage de
+    // zeros : un hash de saut peut legitimement valoir 0x00, et le tronquer sur
+    // les zeros de fin faussait l'affichage comme la reecriture du contact.
+    const outPathUsed = outPathLen === OUT_PATH_UNKNOWN
+      ? new Uint8Array()
+      : outPathBytes.slice(0, Math.min(outPathLen, MAX_PATH_SIZE));
     return {
       public_key: bytesToHex(frame.slice(1, 33)),
       type: frame[33],
       flags: frame[34],
-      out_path_len: outPathLenSigned,
-      out_path: bytesToHex(frame.slice(36, 100)).replace(/(00)+$/i, ""),
+      out_path_len: outPathLen,
+      out_path: bytesToHex(outPathUsed),
+      out_path_full: bytesToHex(outPathBytes),
       adv_name: textDecoder.decode(frame.slice(100, 132)).replace(/\0/g, ""),
       last_advert: parseU32LE(frame, 132),
       adv_lat: (parseU32LE(frame, 136) | 0) / 1e6,
@@ -1841,6 +1859,58 @@ class MeshCoreSerialClient {
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e?.message || "timeout reset path" };
+    }
+  }
+
+  // Impose le chemin de sortie memorise pour un contact (0 = direct sans relais,
+  // OUT_PATH_UNKNOWN = flood au prochain envoi).
+  //
+  // Il n'existe pas de commande "set path" dans le protocole companion :
+  // CMD_ADD_UPDATE_CONTACT reecrit l'enregistrement ENTIER. updateContactFromFrame()
+  // relit sans condition type, flags, out_path_len, out_path[64], name[32] et
+  // last_advert (soit 136 octets minimum), puis lat/lon si la trame fait >= 144.
+  // On renvoie donc le contact tel qu'on l'a lu, en ne changeant que le chemin ;
+  // omettre un champ l'ecraserait avec des zeros. lastmod est volontairement
+  // absent : le noeud horodate lui-meme la modification.
+  async setContactOutPath(contact, outPathLen, outPathBytes = new Uint8Array(), timeoutMs = 3000) {
+    const full = this.normalizeTargetFullKey(contact?.public_key || "");
+    const len = Number(outPathLen);
+    if (!Number.isFinite(len) || len < 0 || (len > MAX_PATH_SIZE && len !== OUT_PATH_UNKNOWN)) {
+      return { ok: false, error: `out_path_len invalide (${outPathLen})` };
+    }
+    const path = new Uint8Array(MAX_PATH_SIZE);
+    if (len !== OUT_PATH_UNKNOWN && len > 0) {
+      path.set(outPathBytes.subarray(0, Math.min(len, MAX_PATH_SIZE)));
+    }
+    const name = new Uint8Array(32);
+    name.set(textEncoder.encode(String(contact?.adv_name || "")).subarray(0, 32));
+
+    const payload = concatBytes(
+      Uint8Array.of(CMD_ADD_UPDATE_CONTACT),
+      hexToBytes(full),
+      Uint8Array.of(Number(contact?.type) & 0xff, Number(contact?.flags) & 0xff, len & 0xff),
+      path,
+      name,
+      u32ToBytesLE(Number(contact?.last_advert) || 0),
+      u32ToBytesLE(Math.round((Number(contact?.adv_lat) || 0) * 1e6)),
+      u32ToBytesLE(Math.round((Number(contact?.adv_lon) || 0) * 1e6))
+    );
+    try {
+      const evt = await this.sendCommand(payload, ["ok", "error"], null, timeoutMs);
+      if (!evt || evt.type === "error") {
+        const code = evt?.payload?.error_code;
+        return { ok: false, error: `mise a jour contact refusee${code !== undefined ? ` (code=${code})` : ""}` };
+      }
+      // Garde le cache local coherent : resolveTargetFullKeyForBinary() et
+      // l'affichage du chemin relisent contactsByKey sans requete radio.
+      const cached = this.contactsByKey[full];
+      if (cached) {
+        cached.out_path_len = len & 0xff;
+        cached.out_path = len === OUT_PATH_UNKNOWN ? "" : bytesToHex(path.subarray(0, len));
+      }
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e?.message || "timeout mise a jour contact" };
     }
   }
 
@@ -2331,6 +2401,10 @@ const ui = {
   targetSelect: document.querySelector("#targetSelect"),
   targetKey: document.querySelector("#targetKey"),
   targetPassword: document.querySelector("#targetPassword"),
+  forceDirectPath: document.querySelector("#forceDirectPath"),
+  restorePathAfter: document.querySelector("#restorePathAfter"),
+  checkPathBtn: document.querySelector("#checkPathBtn"),
+  pathLine: document.querySelector("#pathLine"),
   firmwareFile: document.querySelector("#firmwareFile"),
   chunkSize: document.querySelector("#chunkSize"),
   ackEvery: document.querySelector("#ackEvery"),
@@ -2668,7 +2742,10 @@ function updateButtons() {
   if (ui.connectionMode) ui.connectionMode.disabled = otaRunning;
   if (ui.baudrate) ui.baudrate.disabled = otaRunning || isBle || isTcp;
   if (ui.tcpTarget) ui.tcpTarget.disabled = otaRunning || connected;
-  if (ui.rebootBtn) ui.rebootBtn.disabled = otaRunning;
+  if (ui.rebootBtn) ui.rebootBtn.disabled = otaRunning || !connected;
+  if (ui.forceDirectPath) ui.forceDirectPath.disabled = otaRunning;
+  if (ui.restorePathAfter) ui.restorePathAfter.disabled = otaRunning || !ui.forceDirectPath?.checked;
+  if (ui.checkPathBtn) ui.checkPathBtn.disabled = otaRunning || !connected;
   if (ui.useTempRadio) {
     ui.useTempRadio.disabled = otaRunning;
   }
@@ -3009,14 +3086,22 @@ async function sendRemoteReboot(targetHex) {
   }
 
   try {
+    const fullKey = await client.resolveTargetFullKeyForBinary(targetHex);
+    // Meme regle que pour l'OTA : la commande suit le out_path memorise, donc
+    // on l'impose en direct avant d'emettre quoi que ce soit.
+    if (ui.forceDirectPath?.checked && fullKey) {
+      await forceDirectPathToTarget(fullKey, "reboot");
+    }
+
     const password = String(ui.targetPassword?.value || "").trim();
     if (password.length > 0) {
       appendLog("Tentative de login...");
-      const fullKey = await client.resolveTargetFullKeyForBinary(targetHex);
       if (!fullKey) {
         throw new Error("Impossible de résoudre la clé complète de la cible. Renseigne la clé 64 hex.");
       }
-      const loginRes = await client.sendLogin(fullKey, password);
+      // Recuperation de chemin comme pour l'OTA : un login sans reponse sur une
+      // route perimee est indiscernable d'un mot de passe refuse.
+      const loginRes = await loginWithPathRecovery(fullKey, password);
       if (!loginRes.ok) {
         throw new Error(`Authentification échouée: ${loginRes.error}`);
       }
@@ -3024,6 +3109,7 @@ async function sendRemoteReboot(targetHex) {
     }
 
     appendLog(`Envoi de la commande reboot à ${targetHex}...`);
+    await reassertDirectPath("reboot");
     await client.sendRepeaterCmdNoReply(targetHex, "reboot");
     appendLog(`Reboot envoyé avec succès à ${targetHex}`);
     return { error: false };
@@ -3031,6 +3117,12 @@ async function sendRemoteReboot(targetHex) {
     const msg = e.message || String(e);
     appendLog(`Erreur lors du reboot: ${msg}`);
     return { error: true, message: msg };
+  } finally {
+    try {
+      await restoreTargetContactPath();
+    } catch (pathErr) {
+      appendLog(`Warning: restauration du chemin apres reboot echouee (${pathErr.message}).`);
+    }
   }
 }
 
@@ -4333,6 +4425,7 @@ async function refreshKnownRepeaters(logToConsole = false) {
     const contacts = await client.requestContacts();
     updateTargetRepeaterSelect(contacts, true);
     const repeaters = Object.values(contacts || {}).filter((c) => isRepeaterContact(c)).length;
+    updateTargetPathLine();
     if (logToConsole) {
       appendLog(`Répéteurs connus: ${repeaters}`);
     }
@@ -4342,6 +4435,191 @@ async function refreshKnownRepeaters(logToConsole = false) {
     if (logToConsole) appendLog(`Lecture contacts échouée: ${e.message}`);
     return {};
   }
+}
+
+// ---------------------------------------------------------------------------
+// Chemin direct (zero saut) vers la cible
+// ---------------------------------------------------------------------------
+// La route d'un paquet n'est PAS choisie a l'envoi : BaseChatMesh lit le
+// out_path memorise pour le contact et, des qu'il en existe un, emet en DIRECT
+// le long de ce chemin (sendMessage, sendCommandData, sendLogin, sendBinaryReq :
+// tous identiques sur ce point). Un chemin multi-saut herite d'une decouverte
+// anterieure part donc vers le PREMIER RELAIS, pas vers la cible.
+//
+// Pour une OTA c'est redhibitoire :
+//   - sur preset temporaire, les relais restent sur le preset standard : ils
+//     n'entendent rien, la cible non plus, et tout le transfert tombe a l'eau ;
+//   - meme sur le preset standard, chaque saut ajoute latence, airtime et
+//     pertes, multiplies par des milliers de chunks.
+//
+// On impose donc out_path_len = 0 (direct, zero saut) AVANT toute commande vers
+// la cible - login compris, puisque le login emprunte exactement la meme route.
+// Le chemin d'origine est memorise pour restauration en fin d'OTA.
+//
+// Limite connue, a garder en tete : ceci ne maitrise que le sens
+// companion -> cible. Le repeteur repond le long de SON propre out_path pour ce
+// client, qu'aucune commande companion ne peut reecrire a distance ; il ne le
+// reinitialise que sur un login recu en flood (MyMesh.cpp, "if (is_flood)").
+// D'ou la sonde de verification : constater une reponse est le seul moyen de
+// savoir que les DEUX sens fonctionnent en direct.
+let forcedDirectPath = null; // { fullKey, contact, prevLen, prevPath, applied }
+
+function describeContactPath(contact) {
+  const len = Number(contact?.out_path_len);
+  if (!Number.isFinite(len) || len === OUT_PATH_UNKNOWN) {
+    return "inconnu (le prochain envoi partira en flood)";
+  }
+  if (len <= 0) return "direct, 0 saut";
+  const hops = contact?.out_path ? ` [${contact.out_path}]` : "";
+  return `${len} saut${len > 1 ? "s" : ""}${hops}`;
+}
+
+function lookupCachedContact(targetHex) {
+  const clean = normalizeHex(targetHex || "");
+  if (clean.length < 12) return null;
+  const map = client?.contactsByKey || {};
+  if (clean.length >= 64 && map[clean.slice(0, 64)]) return map[clean.slice(0, 64)];
+  const prefix = clean.slice(0, 12);
+  const keys = Object.keys(map).filter((k) => k.startsWith(prefix));
+  return keys.length === 1 ? map[keys[0]] : null;
+}
+
+function updateTargetPathLine() {
+  if (!ui.pathLine) return;
+  const targetHex = getSelectedTargetHex();
+  if (!client?.connected || targetHex.length < 12) {
+    ui.pathLine.textContent = "Chemin vers la cible : -";
+    ui.pathLine.className = "path-line";
+    return;
+  }
+  const contact = lookupCachedContact(targetHex);
+  if (!contact) {
+    ui.pathLine.textContent = "Chemin vers la cible : contact inconnu du companion";
+    ui.pathLine.className = "path-line warn";
+    return;
+  }
+  const direct = Number(contact.out_path_len) === 0;
+  ui.pathLine.textContent = `Chemin vers la cible : ${describeContactPath(contact)}`;
+  ui.pathLine.className = `path-line ${direct ? "ok" : "warn"}`;
+}
+
+async function fetchContactRecord(fullKeyHex, refresh = false) {
+  const full = normalizeHex(fullKeyHex || "").slice(0, 64);
+  if (full.length < 64) return null;
+  if (!refresh && client?.contactsByKey?.[full]) return client.contactsByKey[full];
+  try {
+    await client.requestContacts();
+  } catch (e) {
+    appendLog(`Lecture contacts echouee (${e.message}) : chemin memorise inconnu.`);
+  }
+  return client?.contactsByKey?.[full] || null;
+}
+
+// Impose le chemin direct et memorise l'ancien pour la restauration.
+async function forceDirectPathToTarget(fullKeyHex, reason = "ota") {
+  const contact = await fetchContactRecord(fullKeyHex, true);
+  if (!contact) {
+    throw new Error(
+      "Contact introuvable dans le companion : impossible d'imposer un chemin direct. "
+      + "Attends un advert de la cible (ou importe-la dans l'app companion), puis rafraichis la liste."
+    );
+  }
+
+  const prevLen = Number(contact.out_path_len);
+  const prevPath = hexToBytes(contact.out_path || "");
+  forcedDirectPath = {
+    fullKey: normalizeHex(contact.public_key).slice(0, 64),
+    contact: { ...contact },
+    prevLen,
+    prevPath,
+    applied: false,
+  };
+
+  appendLog(`Chemin memorise vers ${targetKeyPreview(fullKeyHex)} : ${describeContactPath(contact)}.`);
+
+  if (prevLen === 0) {
+    forcedDirectPath.applied = true;
+    appendLog("Chemin deja direct (0 saut) : rien a reecrire.");
+    updateTargetPathLine();
+    return forcedDirectPath;
+  }
+
+  const res = await client.setContactOutPath(forcedDirectPath.contact, 0, new Uint8Array());
+  if (!res.ok) {
+    forcedDirectPath = null;
+    throw new Error(
+      `Forcage du chemin direct refuse par le companion (${res.error}). `
+      + "Sans chemin direct, les paquets OTA partiraient vers un relais."
+    );
+  }
+  forcedDirectPath.applied = true;
+  forcedDirectPath.contact.out_path_len = 0;
+  forcedDirectPath.contact.out_path = "";
+  appendLog(
+    `Chemin force en direct 0 saut (${reason}) : commandes et chunks partiront `
+    + "vers la cible sans relais."
+  );
+  updateTargetPathLine();
+  return forcedDirectPath;
+}
+
+// Re-impose le chemin direct sans relire les contacts (une trame USB, idempotent).
+// Necessaire apres chaque phase susceptible d'avoir fait REAPPRENDRE un chemin au
+// companion : toute reponse recue en flood passe par BaseChatMesh::onPeerPathRecv,
+// qui reecrit out_path avec la route du paquet.
+async function reassertDirectPath(reason) {
+  if (!forcedDirectPath?.applied || !client?.connected) return;
+  const res = await client.setContactOutPath(forcedDirectPath.contact, 0, new Uint8Array());
+  if (!res.ok) {
+    appendLog(`Warning: re-application du chemin direct echouee (${reason} : ${res.error}).`);
+    return;
+  }
+  updateTargetPathLine();
+}
+
+// Relit le chemin reellement memorise apres un evenement qui a pu le faire
+// changer (login rattrape en flood, par exemple) et le commente.
+async function reportLearnedPath(reason) {
+  if (!forcedDirectPath) return null;
+  const contact = await fetchContactRecord(forcedDirectPath.fullKey, true);
+  if (!contact) return null;
+  const len = Number(contact.out_path_len);
+  appendLog(`Chemin appris apres ${reason} : ${describeContactPath(contact)}.`);
+  if (len > 0 && len !== OUT_PATH_UNKNOWN) {
+    appendLog(
+      "ATTENTION: la cible n'a repondu qu'en multi-saut. Une OTA sur preset radio "
+      + "temporaire ne peut PAS aboutir ainsi (les relais restent sur le preset "
+      + "standard). Rapproche-toi de la cible, ou desactive le preset temporaire."
+    );
+    await reassertDirectPath(reason);
+  }
+  updateTargetPathLine();
+  return contact;
+}
+
+async function restoreTargetContactPath() {
+  const state = forcedDirectPath;
+  forcedDirectPath = null;
+  if (!state?.applied || state.prevLen === 0) {
+    updateTargetPathLine();
+    return;
+  }
+  if (!ui.restorePathAfter?.checked) {
+    appendLog("Chemin direct conserve pour la cible (restauration desactivee).");
+    updateTargetPathLine();
+    return;
+  }
+  if (!client?.connected) return;
+  const res = await client.setContactOutPath(state.contact, state.prevLen, state.prevPath);
+  if (res.ok) {
+    appendLog(
+      `Chemin d'origine restaure vers ${targetKeyPreview(state.fullKey)} (`
+      + `${state.prevLen === OUT_PATH_UNKNOWN ? "inconnu/flood" : `${state.prevLen} saut(s)`}).`
+    );
+  } else {
+    appendLog(`Warning: restauration du chemin d'origine echouee (${res.error}).`);
+  }
+  updateTargetPathLine();
 }
 
 // BaseChatMesh::sendLogin() emet en DIRECT des qu'un out_path est memorise pour
@@ -4367,6 +4645,10 @@ async function loginWithPathRecovery(fullKeyHex, password) {
   res = await client.sendLogin(fullKeyHex, password);
   if (res.ok) {
     appendLog("Login abouti apres purge : la route directe memorisee etait perimee.");
+    // La purge a fait repartir le login en flood : le companion a donc pu
+    // REAPPRENDRE un chemin multi-saut (onPeerPathRecv). On relit ce qu'il a
+    // retenu et, si ce n'est pas 0 saut, on previent et on re-impose direct.
+    await reportLearnedPath("login flood");
   }
   return res;
 }
@@ -4478,7 +4760,7 @@ const TEMP_RADIO_SWITCH_SETTLE_MS = 3500; // délai firmware futureMillis(2000) 
 const TEMP_RADIO_PROBE_WINDOW_MS = 14000; // fenêtre de sonde par tentative
 const TEMP_RADIO_MAX_ATTEMPTS = 3;        // renvois tempradio avant abandon propre
 
-// Sonde la cible SUR LE PRESET TEMPORAIRE en boucle jusqu'à obtenir une réponse
+// Sonde la cible SUR LE PRESET COURANT en boucle jusqu'à obtenir une réponse
 // (n'importe laquelle — "OK", "Err - admin required", un statut… — toute
 // réponse prouve la joignabilité, seul but ici) ou l'expiration de la fenêtre.
 // STATUS binaire d'abord (rapide, si la clé complète est résolue), puis repli
@@ -4515,7 +4797,7 @@ async function sendTargetRebootRepeatedly(targetHex, attempts = REBOOT_SEND_ATTE
   return delivered > 0;
 }
 
-async function probeTargetReachableOnTemp(targetHex, probeKey, windowMs) {
+async function probeTargetReachable(targetHex, probeKey, windowMs) {
   const tEnd = performance.now() + windowMs;
   let lastErr = "aucune sonde";
   while (performance.now() < tEnd) {
@@ -4567,6 +4849,12 @@ async function applyTempRadioPresetForOta(targetHex, preset) {
       + "bascule locale puis sonde de joignabilité pour trancher."
     );
   }
+
+  // L'ACK tempradio a pu revenir en flood et faire reapprendre un chemin
+  // multi-saut au companion : on re-impose le direct avant la bascule locale,
+  // sans quoi les chunks repartiraient vers un relais reste sur le preset
+  // standard.
+  await reassertDirectPath("tempradio");
 
   // Laisser la cible exécuter sa bascule différée (~2000ms après sa réponse)
   // avant de basculer le local. La sonde en boucle du caller absorbe tout écart
@@ -4820,7 +5108,9 @@ ui.disconnectBtn.addEventListener("click", async () => {
   ui.selfKey.textContent = "PubKey: -";
   if (ui.selfRadio) ui.selfRadio.textContent = "Radio: -";
   resetTargetRepeaterSelect();
+  forcedDirectPath = null;
   if (ui.targetKey) ui.targetKey.value = "";
+  updateTargetPathLine();
   if (ui.autoTune?.checked) applyAutoOtaSettings("disconnect");
   appendLog("Déconnecté.");
   updateButtons();
@@ -4866,6 +5156,7 @@ if (ui.targetSelect) {
     if (selected.length >= 12) {
       appendLog(`Cible OTA sélectionnée: ${targetKeyPreview(selected)}`);
     }
+    updateTargetPathLine();
     updateStepBadges();
   });
 }
@@ -4914,6 +5205,70 @@ if (ui.copyLogBtn) {
     } catch (e) {
       showToast(`Copie impossible: ${e.message}`, "err");
     }
+  });
+}
+
+// Verification manuelle : impose le chemin direct puis sonde la cible sur le
+// preset COURANT. Une reponse quelconque prouve que les deux sens fonctionnent
+// sans relais - le seul test possible du sens cible -> companion, dont le
+// out_path n'est pas reecrivable a distance.
+if (ui.checkPathBtn) {
+  ui.checkPathBtn.addEventListener("click", async () => {
+    if (!client || !client.connected || otaRunning) return;
+    const targetHex = getSelectedTargetHex();
+    if (targetHex.length < 12) {
+      showToast("Sélectionne d'abord une cible", "err");
+      return;
+    }
+    ui.checkPathBtn.disabled = true;
+    try {
+      const fullKey = await client.resolveTargetFullKeyForBinary(targetHex);
+      if (ui.forceDirectPath?.checked) {
+        if (!fullKey) {
+          throw new Error("clé complète de la cible non résolue (rafraîchis la liste)");
+        }
+        await forceDirectPathToTarget(fullKey, "vérification");
+      }
+      appendLog("Vérification du lien direct : sonde de la cible…");
+      const probe = await probeTargetReachable(targetHex, fullKey, 10000);
+      if (probe.ok) {
+        appendLog(
+          `Lien direct OK (via ${probe.via}`
+          + `${probe.reply ? ` : ${String(probe.reply).trim()}` : ""}).`
+        );
+        showToast("Cible joignable en direct", "ok");
+      } else {
+        appendLog(
+          `Cible muette en direct 0 saut (${probe.error}). Causes usuelles : hors de portee `
+          + "radio directe, chemin de retour perime cote repeteur (un login en flood le purge), "
+          + "ou droits admin requis pour repondre."
+        );
+        showToast("Pas de réponse en direct", "err");
+      }
+    } catch (e) {
+      appendLog(`Vérification du lien direct échouée: ${e.message}`);
+      showToast(`Vérification échouée: ${e.message}`, "err");
+    } finally {
+      // La verification ne doit rien laisser derriere elle.
+      try {
+        await restoreTargetContactPath();
+      } catch (pathErr) {
+        appendLog(`Warning: restauration du chemin echouee (${pathErr.message}).`);
+      }
+      updateButtons();
+    }
+  });
+}
+
+if (ui.forceDirectPath) {
+  ui.forceDirectPath.addEventListener("change", () => {
+    appendLog(
+      ui.forceDirectPath.checked
+        ? "Chemin direct 0 saut : activé (recommandé pour l'OTA)."
+        : "Chemin direct 0 saut : DÉSACTIVÉ — les paquets suivront le chemin mémorisé, "
+          + "multi-saut le cas échéant, et l'OTA échouera si la cible n'est pas joignable ainsi."
+    );
+    updateButtons();
   });
 }
 
@@ -5002,6 +5357,29 @@ ui.startOtaBtn.addEventListener("click", async () => {
     }
     activeTargetHex = selectedTargetHex;
 
+    // ETAPE CHEMIN : avant la moindre commande vers la cible (login inclus),
+    // imposer un chemin direct 0 saut depuis le companion. Sans ca, les paquets
+    // suivent le out_path deja memorise - typiquement multi-saut - et l'OTA ne
+    // peut pas aboutir : sur preset temporaire les relais n'entendent plus rien.
+    if (ui.forceDirectPath?.checked) {
+      setOtaStatus("Chemin direct vers la cible…");
+      const fullKeyForPath = await client.resolveTargetFullKeyForBinary(selectedTargetHex);
+      if (!fullKeyForPath) {
+        throw new Error(
+          "Impossible de resoudre la cle complete de la cible pour imposer le chemin direct. "
+          + "Rafraichis la liste des repeteurs, ou renseigne la cle 64 hex."
+        );
+      }
+      await forceDirectPathToTarget(fullKeyForPath, "ota-start");
+    } else {
+      const known = lookupCachedContact(selectedTargetHex);
+      if (known) {
+        appendLog(
+          `Forcage du chemin direct desactive - chemin utilise : ${describeContactPath(known)}.`
+        );
+      }
+    }
+
     const autoSettings = ui.autoTune?.checked ? recalcAutoFromCurrentSelection("ota-start") : null;
     const manualChunk = Number.parseInt(ui.chunkSize.value, 10) || 64;
     const manualAck = Number.parseInt(ui.ackEvery.value, 10) || 1;
@@ -5062,6 +5440,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
         );
       }
       appendLog(`Login OK${loginRes.is_admin ? " (admin)" : ""}`);
+      await reassertDirectPath("post-login");
     }
 
     // Booste le budget d'airtime du companion local le temps de l'OTA (réglage
@@ -5103,7 +5482,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
       setOtaStatus("Vérification de la cible…");
       let reached = null;
       for (let attempt = 1; attempt <= TEMP_RADIO_MAX_ATTEMPTS; attempt += 1) {
-        const probe = await probeTargetReachableOnTemp(
+        const probe = await probeTargetReachable(
           params.targetHex,
           probeKey,
           TEMP_RADIO_PROBE_WINDOW_MS
@@ -5223,6 +5602,11 @@ ui.startOtaBtn.addEventListener("click", async () => {
         appendLog(`Warning: restauration preset client échouée: ${restoreErr.message}`);
       }
     }
+    try {
+      await restoreTargetContactPath();
+    } catch (pathErr) {
+      appendLog(`Warning: restauration du chemin d'origine echouee (${pathErr.message}).`);
+    }
     otaRunning = false;
     otaCancelRequested = false;
     updateButtons();
@@ -5303,12 +5687,14 @@ if (ui.targetKey) {
     } else {
       ui.targetSelect.value = "";
     }
+    updateTargetPathLine();
     updateStepBadges();
   });
 }
 
 setConnectionStatus("Non connecté");
 setProgress(0);
+updateTargetPathLine();
 resetTargetRepeaterSelect();
 updateTuneInputsState();
 updateTempRadioInputsState();
