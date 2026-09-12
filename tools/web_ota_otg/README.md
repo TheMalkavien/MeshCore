@@ -43,6 +43,28 @@ En mode `USB`, il tente :
   **direct**, pas 64 sauts. `0xFF` reste la sentinelle « aucun chemin connu » (elle encode
   une taille de 4, invalide, donc sans collision possible). Forcer le direct conserve les
   bits de taille, pour ne pas rétrograder le contact en hashes de 1 octet.
+- **Amorçage du chemin retour**, automatique et sans mot de passe. Forcer le contact ne
+  règle que le sens companion → cible : le répéteur, lui, répond le long de *son* `out_path`
+  pour ce client, qu'aucune commande companion ne réécrit à distance. Le firmware laisse
+  une seule prise : sur une requête reçue en **flood**, `simple_repeater` répond par un
+  `PATH return` (`if (packet->isRouteFlood())` dans `onPeerDataRecv`) **avant** de consulter
+  sa route mémorisée — la réponse revient donc même si celle-ci est périmée. Le companion,
+  en la recevant, mémorise la route et renvoie automatiquement un chemin réciproque en
+  direct (`Mesh.cpp` : *send a reciprocal return path to sender*), que le répéteur range
+  dans `client->out_path`. Les deux sens sont alors alignés.
+
+  L'outil déclenche donc, avant de forcer le direct : purge du chemin (`CMD_RESET_PATH`)
+  puis **une requête binaire `OTA STATUS` en flood**, inoffensive. Une commande CLI texte
+  ne ferait pas l'affaire : sur `TXT_MSG`, l'ACK comme la réponse passent par
+  `client->out_path` dès qu'il est connu, flood ou pas. Un login reçu en flood marche aussi
+  (il remet en plus `out_path_len` à `UNKNOWN`), mais il exige un mot de passe — d'où le
+  choix de la requête binaire.
+
+  L'amorçage est rejoué **sur le preset temporaire**, où aucun relais n'écoute : un flood y
+  est forcément direct, donc l'alignement des deux sens y est garanti. Sur le preset
+  standard le flood peut encore emprunter un relais ; c'est justement ce que l'outil
+  détecte — s'il revient avec des sauts, la cible n'est pas joignable en direct et l'OTA
+  sur preset temporaire ne pourra pas aboutir.
 - **Verrou d'écran** pendant l'OTA (`navigator.wakeLock`) : en USB OTG sur téléphone,
   l'extinction de l'écran endormait l'onglet en plein transfert. Repris automatiquement
   quand la page revient au premier plan ; une confirmation est demandée si on ferme
@@ -85,13 +107,10 @@ build_flags =
 - Web Serial dépend du support navigateur/OS. Sur Android, le prototype force plutôt WebUSB.
 - Le fallback WebUSB dépend des interfaces USB exposées par le firmware companion (CDC-ACM bulk IN/OUT requis).
 - Si erreur `Unable to claim interface` : Android peut déjà attacher le driver CDC système sur l'interface série USB. Dans ce cas, WebUSB navigateur ne peut pas toujours la prendre.
-- Le forçage du chemin direct ne maîtrise que le sens **companion → cible**. Le répéteur
-  répond le long de son propre `out_path` pour ce client, qu'aucune commande companion ne
-  peut réécrire à distance : s'il est périmé ou multi-saut, les réponses se perdent même
-  quand l'aller passe. Un login en flood le réinitialise côté répéteur (`if (is_flood)`
-  dans `handleLoginReq`) ; c'est ce que fait automatiquement la récupération de chemin du
-  login. Si `Vérifier le lien` reste muet alors que la cible est à portée, renseigner le
-  mot de passe et relancer suffit généralement.
+- L'amorçage du chemin retour suppose que la cible répond aux **requêtes binaires**
+  (`REQ_TYPE_OTA_BINARY`). Sur une cible trop ancienne pour ça, le sens retour ne peut être
+  réparé que par un login reçu en flood : renseigne le mot de passe, la récupération de
+  chemin du login s'en charge.
 - Seuls les contacts de type **répéteur** sont proposés dans la liste : `simple_repeater`
   est le seul exemple qui implémente les commandes `ota ...` (ni le room server ni le
   capteur ne les ont). Pour une cible hors liste — un build maison, par exemple — renseigne

@@ -4875,6 +4875,76 @@ async function reportLearnedPath(reason) {
   return contact;
 }
 
+// Amorce le chemin RETOUR (repeteur -> companion), que le forcage du contact ne
+// touche pas : le repeteur repond le long de SON propre out_path pour ce client,
+// et aucune commande companion ne peut le reecrire a distance.
+//
+// Le firmware offre quand meme une prise, et une seule : sur une requete recue
+// en FLOOD, simple_repeater repond par un PATH return (`if (packet->isRouteFlood())`
+// dans onPeerDataRecv), AVANT meme de consulter son out_path memorise. La reponse
+// revient donc meme si sa route stockee est perimee. Le companion, en recevant ce
+// PATH return, memorise la route et renvoie AUTOMATIQUEMENT un chemin reciproque
+// en direct (Mesh.cpp: "send a reciprocal return path to sender") ; le repeteur le
+// range dans client->out_path. Les deux sens sont alors alignes sur la route
+// reellement empruntee par le flood.
+//
+// D'ou la sequence : purger le chemin memorise (pour que l'envoi reparte en
+// flood) puis emettre UNE requete binaire inoffensive, ici OTA STATUS.
+//
+// Pourquoi pas une commande CLI texte : sur TXT_MSG, l'ACK comme la reponse
+// passent par client->out_path des qu'il est connu (flood ou pas), donc une route
+// retour perimee reste perimee. Seules les requetes binaires - et un login recu en
+// flood, qui remet en plus out_path a UNKNOWN - font le travail.
+//
+// Appele deux fois : sur le preset standard (ou un flood peut encore passer par un
+// relais, d'ou la verification du nombre de sauts), puis sur le preset temporaire
+// ou un flood est forcement direct, aucun relais n'y ecoutant.
+async function primeReturnPath(targetHex, fullKeyHex, reason) {
+  const full = normalizeHex(fullKeyHex || "").slice(0, 64);
+  if (full.length < 64) {
+    appendLog(
+      `Chemin retour (${reason}) : cle complete de la cible inconnue, amorcage impossible. `
+      + "Si la cible reste muette, son chemin de retour est peut-etre perime."
+    );
+    return { ok: false, error: "cle complete non resolue" };
+  }
+
+  appendLog(`Chemin retour (${reason}) : purge du chemin puis requete en flood…`);
+  const reset = await client.resetPath(full);
+  if (!reset.ok) {
+    appendLog(`Chemin retour (${reason}) : purge refusee (${reset.error}), requete envoyee telle quelle.`);
+  }
+
+  const res = await getOtaStatusBinary(full, 2, 8000);
+  if (res.error) {
+    appendLog(
+      `Chemin retour (${reason}) : pas de reponse (${res.error}). Le chemin de retour du `
+      + "repeteur n'a pas pu etre reamorce."
+    );
+    return { ok: false, error: res.error };
+  }
+
+  // La reponse est arrivee : le PATH return a ete traite des deux cotes.
+  const contact = await fetchContactRecord(full, true);
+  const hops = contact ? pathHopCount(contact.out_path_len) : -1;
+  if (contact && Number(contact.out_path_len) === OUT_PATH_UNKNOWN) {
+    appendLog(
+      `Chemin retour (${reason}) : cible joignable, mais aucune route memorisee `
+      + "(reponse recue hors PATH return) — le sens retour reste incertain."
+    );
+  } else if (hops === 0) {
+    appendLog(`Chemin retour (${reason}) : aligne en direct 0 saut dans les deux sens.`);
+  } else if (hops > 0) {
+    appendLog(
+      `Chemin retour (${reason}) : le flood est passe par ${hops} relais — la cible n'est `
+      + "donc PAS joignable en direct depuis ce companion. Une OTA sur preset temporaire "
+      + "ne peut pas aboutir ; rapproche-toi, ou desactive le preset temporaire."
+    );
+  }
+  updateTargetPathLine();
+  return { ok: true, via: "binaire", reply: res.reply, hops };
+}
+
 async function restoreTargetContactPath() {
   const state = forcedDirectPath;
   forcedDirectPath = null;
@@ -4923,9 +4993,10 @@ async function loginWithPathRecovery(fullKeyHex, password) {
   res = await client.sendLogin(fullKeyHex, password);
   if (res.ok) {
     appendLog("Login abouti apres purge : la route directe memorisee etait perimee.");
-    // La purge a fait repartir le login en flood : le companion a donc pu
-    // REAPPRENDRE un chemin multi-saut (onPeerPathRecv). On relit ce qu'il a
-    // retenu et, si ce n'est pas 0 saut, on previent et on re-impose direct.
+    // La purge a fait repartir le login en flood : bonne nouvelle pour le sens
+    // retour (handleLoginReq remet client->out_path_len a UNKNOWN sur un login
+    // recu en flood), mais le companion a pu REAPPRENDRE un chemin multi-saut
+    // au passage. On relit ce qu'il a retenu et on re-impose direct au besoin.
     await reportLearnedPath("login flood");
   }
   return res;
@@ -5574,6 +5645,7 @@ if (ui.checkPathBtn) {
     ui.checkPathBtn.disabled = true;
     try {
       const fullKey = await client.resolveTargetFullKeyForBinary(targetHex);
+      const primed = await primeReturnPath(targetHex, fullKey, "vérification");
       if (ui.forceDirectPath?.checked) {
         if (!fullKey) {
           throw new Error("clé complète de la cible non résolue (rafraîchis la liste)");
@@ -5581,7 +5653,7 @@ if (ui.checkPathBtn) {
         await forceDirectPathToTarget(fullKey, "vérification");
       }
       appendLog("Vérification du lien direct : sonde de la cible…");
-      const probe = await probeTargetReachable(targetHex, fullKey, 10000);
+      const probe = primed.ok ? primed : await probeTargetReachable(targetHex, fullKey, 10000);
       if (probe.ok) {
         appendLog(
           `Lien direct OK (via ${probe.via}`
@@ -5718,6 +5790,9 @@ ui.startOtaBtn.addEventListener("click", async () => {
           + "Rafraichis la liste des repeteurs, ou renseigne la cle 64 hex."
         );
       }
+      // Amorcer AVANT de forcer : l'amorcage purge puis reapprend le chemin
+      // (c'est tout l'interet), le forcage doit donc venir apres.
+      await primeReturnPath(selectedTargetHex, fullKeyForPath, "avant OTA");
       await forceDirectPathToTarget(fullKeyForPath, "ota-start");
     } else {
       const known = lookupCachedContact(selectedTargetHex);
@@ -5830,7 +5905,12 @@ ui.startOtaBtn.addEventListener("click", async () => {
       setOtaStatus("Vérification de la cible…");
       let reached = null;
       for (let attempt = 1; attempt <= TEMP_RADIO_MAX_ATTEMPTS; attempt += 1) {
-        const probe = await probeTargetReachable(
+        // Sur le preset temporaire, aucun relais n'ecoute : un flood y est
+        // forcement direct. C'est donc le moment ideal pour aligner le chemin
+        // de retour du repeteur. Une reponse vaut sonde, on ne la refait pas.
+        const primed = await primeReturnPath(params.targetHex, probeKey, `preset temporaire ${attempt}`);
+        await reassertDirectPath("post-amorcage");
+        const probe = primed.ok ? primed : await probeTargetReachable(
           params.targetHex,
           probeKey,
           TEMP_RADIO_PROBE_WINDOW_MS
