@@ -853,7 +853,7 @@ void SensorMesh::setTxPower(int8_t power_dbm) {
 }
 
 void SensorMesh::formatStatsReply(char *reply) {
-  StatsFormatHelper::formatCoreStats(reply, board, *_ms, _err_flags, _mgr);
+  StatsFormatHelper::formatCoreStats(reply, board, *_ms, _err_flags, getNumTxStartFails(), _mgr);
 }
 
 void SensorMesh::formatRadioStatsReply(char *reply) {

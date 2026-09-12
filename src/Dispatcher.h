@@ -76,6 +76,35 @@ public:
   */
   virtual bool isReceiving() { return false; }
 
+  /**
+   * \brief  Whether the busy state reported by the most recent isReceiving() call was a
+   *         valid LoRa header, ie. a real packet is being demodulated right now.
+   *
+   * Only meaningful immediately after isReceiving() returned true; implementations latch it
+   * there rather than re-reading the radio. A busy state that is NOT mid-packet - a bare
+   * preamble detect that never produced a header, RSSI above the noise floor, a hardware CAD
+   * hit - may well be noise, and the dispatcher may transmit through it after a short
+   * deadline. Mid-packet must not be interrupted: transmitting aborts the receive and
+   * destroys the very packet we were about to relay.
+   *
+   * The default is the conservative answer, ie. the pre-existing behaviour of never forcing
+   * a transmit early. Radios that can tell the two apart override it.
+  */
+  virtual bool isMidPacket() { return true; }
+
+  /**
+   * \returns  worst case milliseconds a single packet can occupy the channel at the current
+   *           radio settings (preamble + maximum payload), or 0 if the radio cannot say.
+  */
+  virtual uint32_t getMaxPacketMillis() const { return 0; }
+
+  /**
+   * \returns  milliseconds from preamble-detect to header-valid at the current radio
+   *           settings, ie. how long a bare preamble detect can legitimately stay raised.
+   *           0 if the radio cannot say.
+  */
+  virtual uint32_t getPreambleMillis() const { return 0; }
+
   virtual float getLastRSSI() const { return 0; }
   virtual float getLastSNR() const { return 0; }
 };
@@ -120,6 +149,11 @@ class Dispatcher {
   unsigned long outbound_expiry, outbound_start, total_air_time, rx_air_time;
   unsigned long next_tx_time;
   unsigned long cad_busy_start;
+  unsigned long cad_force_jitter;    // per-episode random offset applied to the force deadline
+  bool     cad_busy_mid_packet;      // a valid header was seen at some point in this busy episode
+  uint8_t  cad_retry_shift;          // exponential backoff step within the current busy episode
+  uint8_t  tx_start_fail_streak;     // consecutive startSendRaw() failures
+  uint32_t n_tx_start_fails;         // startSendRaw() failures since boot (or last resetStats)
   unsigned long radio_nonrx_start;
   unsigned long next_floor_calib_time, next_agc_reset_time;
   bool  prev_isrecv_mode;
@@ -145,6 +179,11 @@ protected:
     total_air_time = rx_air_time = 0;
     next_tx_time = ms.getMillis();
     cad_busy_start = 0;
+    cad_force_jitter = 0;
+    cad_busy_mid_packet = false;
+    cad_retry_shift = 0;
+    tx_start_fail_streak = 0;
+    n_tx_start_fails = 0;
     next_floor_calib_time = next_agc_reset_time = 0;
     _err_flags = 0;
     radio_nonrx_start = 0;
@@ -166,7 +205,43 @@ protected:
   virtual float getAirtimeBudgetFactor() const;
   virtual int calcRxDelay(float score, uint32_t air_time) const;
   virtual uint32_t getCADFailRetryDelay() const;
+
+  /**
+   * \brief  How long a busy channel may hold off a pending transmit before it is forced
+   *         through, when the radio reports it is mid-packet (a valid header was seen).
+   *
+   * Must exceed the radio's own stuck-Rx-IRQ timeout, which is derived from the worst case
+   * airtime of a maximum length packet. If it does not, a legitimately long reception trips
+   * this deadline and the forced transmit destroys it. That is why it cannot be a constant:
+   * at SF10+ on 62.5kHz, SF11+ on 125kHz or SF12 on 250kHz, one 255 byte packet already
+   * takes longer than the 4 seconds this used to be fixed at.
+  */
   virtual uint32_t getCADFailMaxDuration() const;
+
+  /**
+   * \brief  Same, for a busy channel that is NOT mid-packet - a preamble detect that never
+   *         produced a header, RSSI above the noise floor, or a hardware CAD hit.
+   *
+   * Any of those can be noise, and holding a transmit for seconds on noise is how a node
+   * stalls on an otherwise usable channel. Bounded above by getCADFailMaxDuration() so a
+   * subclass that shortens that one (during an OTA session, say) shortens this one with it.
+  */
+  virtual uint32_t getChannelBusyMaxDuration() const;
+
+  /**
+   * \returns  a random offset added to both deadlines above, drawn once per busy episode.
+   *
+   * Every node that heard the same flood begins its backoff at very nearly the same instant,
+   * so without this they all reach the deadline together and the recovery transmit becomes a
+   * synchronised collision. The base class has no RNG; Mesh overrides this.
+  */
+  virtual uint32_t getCADFailForceJitter() const { return 0; }
+
+  /**
+   * \returns  how many times a packet is re-queued after startSendRaw() fails, before it is
+   *           finally dropped. 0 restores the old drop-on-first-failure behaviour.
+  */
+  virtual uint8_t getTxStartFailRetries() const { return 2; }
   virtual int getInterferenceThreshold() const { return 0; }    // disabled by default
   virtual bool getCADEnabled() const { return false; }    // hardware CAD disabled by default
   virtual int getAGCResetInterval() const { return 0; }    // disabled by default
@@ -187,8 +262,10 @@ public:
   uint32_t getNumSentDirect() const { return n_sent_direct; }
   uint32_t getNumRecvFlood() const { return n_recv_flood; }
   uint32_t getNumRecvDirect() const { return n_recv_direct; }
+  uint32_t getNumTxStartFails() const { return n_tx_start_fails; }
   void resetStats() {
     n_sent_flood = n_sent_direct = n_recv_flood = n_recv_direct = 0;
+    n_tx_start_fails = 0;
     _err_flags = 0;
   }
 

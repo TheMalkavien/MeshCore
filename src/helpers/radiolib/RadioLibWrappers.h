@@ -20,16 +20,31 @@ protected:
   bool _cad_enabled;
   uint16_t _num_floor_samples;
   int32_t _floor_sample_sum;
+  uint32_t _floor_batch_start;
   uint8_t _preamble_sf;
+  uint32_t _preamble_millis, _max_packet_millis;
+  bool _mid_packet;
 
   void idle();
   void startRecv();
   float packetScoreInt(float snr, int sf, int packet_len);
   virtual bool isReceivingPacket() =0;
+
+  /**
+   * \returns  whether the busy state isReceivingPacket() just reported came from a valid
+   *           header rather than a bare preamble detect. Radios whose isReceiving() cannot
+   *           tell the two apart keep the conservative default.
+  */
+  virtual bool isReceivingHeader() { return true; }
+
   virtual void doResetAGC();
+  void startFloorBatch();
+  void publishNoiseFloor();
 
 public:
-  RadioLibWrapper(PhysicalLayer& radio, mesh::MainBoard& board) : _radio(&radio), _board(&board), _preamble_sf(0) { n_recv = n_sent = 0; }
+  RadioLibWrapper(PhysicalLayer& radio, mesh::MainBoard& board)
+    : _radio(&radio), _board(&board), _floor_batch_start(0), _preamble_sf(0),
+      _preamble_millis(0), _max_packet_millis(0), _mid_packet(false) { n_recv = n_sent = 0; }
 
   void begin() override;
   virtual void powerOff() { _radio->sleep(); }
@@ -42,10 +57,18 @@ public:
   bool isChannelActive();
 
   bool isReceiving() override {
-    if (isReceivingPacket()) return true;
+    if (isReceivingPacket()) {
+      _mid_packet = isReceivingHeader();
+      return true;
+    }
+    _mid_packet = false;
 
     return isChannelActive();
   }
+
+  bool isMidPacket() override { return _mid_packet; }
+  uint32_t getMaxPacketMillis() const override { return _max_packet_millis; }
+  uint32_t getPreambleMillis() const override { return _preamble_millis; }
 
   virtual void setParams(float freq, float bw, uint8_t sf, uint8_t cr) = 0;
   uint32_t getRngSeed();

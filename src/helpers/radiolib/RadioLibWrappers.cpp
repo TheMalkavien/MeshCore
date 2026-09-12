@@ -9,7 +9,9 @@
 #define STATE_INT_READY 16
 
 #define NUM_NOISE_FLOOR_SAMPLES  64
+#define MIN_NOISE_FLOOR_SAMPLES  12       // enough to publish a floor from a starved batch
 #define SAMPLING_THRESHOLD  14
+#define NOISE_FLOOR_BATCH_TIMEOUT  30000  // ms a single calibration batch may take
 
 static volatile uint8_t state = STATE_IDLE;
 
@@ -37,10 +39,32 @@ void RadioLibWrapper::begin() {
   _noise_floor = 0;
   _threshold = 0;
   _cad_enabled = false;
+  _mid_packet = false;
 
   // start average out some samples
+  startFloorBatch();
+}
+
+void RadioLibWrapper::startFloorBatch() {
   _num_floor_samples = 0;
   _floor_sample_sum = 0;
+  _floor_batch_start = millis();
+}
+
+void RadioLibWrapper::publishNoiseFloor() {
+  if (_num_floor_samples == 0) return;
+
+  int32_t nf = _floor_sample_sum / (int32_t)_num_floor_samples;
+  if (nf < -120) {
+    nf = -120;    // clamp to lower bound of -120dBi
+  }
+  _noise_floor = (int16_t)nf;
+  _floor_sample_sum = 0;
+
+  #ifdef MESH_DEBUG_NOISE_FLOOR
+  MESH_DEBUG_PRINTLN("RadioLibWrapper: noise_floor = %d (%d samples)", (int)_noise_floor,
+                     (int)_num_floor_samples);
+  #endif
 }
 
 uint32_t RadioLibWrapper::getRngSeed() {
@@ -61,10 +85,29 @@ void RadioLibWrapper::idle() {
 
 void RadioLibWrapper::triggerNoiseFloorCalibrate(int threshold) {
   _threshold = threshold;
-  if (_num_floor_samples >= NUM_NOISE_FLOOR_SAMPLES) {  // ignore trigger if currently sampling
-    _num_floor_samples = 0;
-    _floor_sample_sum = 0;
+  if (_num_floor_samples >= NUM_NOISE_FLOOR_SAMPLES) {  // previous batch is complete
+    startFloorBatch();
+    return;
   }
+
+  // A batch is still running. Samples are only accepted below _noise_floor + SAMPLING_THRESHOLD,
+  // so if the ambient floor has risen by more than that, NOTHING is accepted: the batch never
+  // completes, every later trigger is ignored as 'still sampling', and _noise_floor stays frozen
+  // at its old low value for good. With int.thresh enabled that reads as a channel that is
+  // permanently busy, because getCurrentRSSI() is then always above _noise_floor + threshold.
+  // So the batch gets a deadline.
+  if ((uint32_t)(millis() - _floor_batch_start) < NOISE_FLOOR_BATCH_TIMEOUT) return;
+
+  if (_num_floor_samples >= MIN_NOISE_FLOOR_SAMPLES) {
+    publishNoiseFloor();    // short batch, but enough samples to mean something
+  } else {
+    // Not even that. The stored floor is the thing blocking acceptance, so drop it and let the
+    // next batch converge unfiltered, the same way it does at boot.
+    MESH_DEBUG_PRINTLN("RadioLibWrapper: noise floor batch starved (%d samples), reconverging",
+                       (int)_num_floor_samples);
+    _noise_floor = 0;
+  }
+  startFloorBatch();
 }
 
 void RadioLibWrapper::doResetAGC() {
@@ -83,29 +126,20 @@ void RadioLibWrapper::resetAGC() {
   // too low (-106) to accept normal samples (~-105), self-reinforcing the
   // stuck value even after the receiver has recovered.
   _noise_floor = 0;
-  _num_floor_samples = 0;
-  _floor_sample_sum = 0;
+  startFloorBatch();
 }
 
 void RadioLibWrapper::loop() {
-  if (state == STATE_RX && _num_floor_samples < NUM_NOISE_FLOOR_SAMPLES) {
-    if (!isReceivingPacket()) {
+  if (_num_floor_samples < NUM_NOISE_FLOOR_SAMPLES) {
+    if (state == STATE_RX && !isReceivingPacket()) {
       int rssi = getCurrentRSSI();
       if (rssi < _noise_floor + SAMPLING_THRESHOLD) {  // only consider samples below current floor + sampling THRESHOLD
         _num_floor_samples++;
         _floor_sample_sum += rssi;
       }
     }
-  } else if (_num_floor_samples >= NUM_NOISE_FLOOR_SAMPLES && _floor_sample_sum != 0) {
-    _noise_floor = _floor_sample_sum / NUM_NOISE_FLOOR_SAMPLES;
-    if (_noise_floor < -120) {
-      _noise_floor = -120;    // clamp to lower bound of -120dBi
-    }
-    _floor_sample_sum = 0;
-
-    #ifdef MESH_DEBUG_NOISE_FLOOR
-    MESH_DEBUG_PRINTLN("RadioLibWrapper: noise_floor = %d", (int)_noise_floor);
-    #endif
+  } else if (_floor_sample_sum != 0) {
+    publishNoiseFloor();
   }
 }
 
@@ -196,8 +230,17 @@ int16_t RadioLibWrapper::performChannelScan() {
 }
 
 bool RadioLibWrapper::isChannelActive() {
-  // int.thresh: RSSI-based interference detection (relative to noise floor)
-  if (_threshold != 0 && getCurrentRSSI() > _noise_floor + _threshold) return true;
+  // int.thresh: RSSI-based interference detection (relative to noise floor).
+  //
+  // Two reads, both required to be over the threshold. A single instantaneous RSSI sample has
+  // several dB of spread, and one high outlier is enough to stall a transmit for a whole retry
+  // period. A real carrier lasts hundreds of milliseconds, so it comfortably survives both
+  // reads; the second read only happens when the first was already over, so a free channel
+  // still costs exactly one SPI transaction.
+  if (_threshold != 0) {
+    float limit = (float)(_noise_floor + _threshold);
+    if (getCurrentRSSI() > limit && getCurrentRSSI() > limit) return true;
+  }
 
   // cad: hardware channel activity detection
   if (_cad_enabled) {
@@ -256,5 +299,13 @@ PacketMillis RadioLibWrapper::calcMaxPacketMillis(uint8_t sf, float bw, uint8_t 
   // rescale payload_us for max possible CR
   if (cr >= 5 && cr < 8) { payload_us = (payload_us * 8) / cr; }
 
-  return PacketMillis {(preamble_us + 999) / 1000, (payload_us + 999) / 1000};
+  PacketMillis pm {(preamble_us + 999) / 1000, (payload_us + 999) / 1000};
+
+  // Cached for the dispatcher's transmit deadlines. Those have to be derived from the same
+  // airtime figures the radio uses to time out its own stuck Rx IRQ flags, otherwise the two
+  // disagree and a legitimately long reception gets cut short by a forced transmit.
+  _preamble_millis = pm.preambleMillis;
+  _max_packet_millis = pm.preambleMillis + pm.payloadMillis;
+
+  return pm;
 }
