@@ -176,6 +176,15 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 
 ---
 
+### Flood retry stats (Repeater Only)
+**Usage:** `stats-flood`
+
+**Note:** Returns JSON: `{"trk":<tracked>,"ok":<confirmed>,"fail":<gave up>,"retry":<retransmits>,"loss":"<pct>%"}`
+
+**Note:** `trk` is the number of floods put under retry tracking, `ok` those a neighbour was heard relaying, `fail` those that exhausted `flood.maxretry`.
+
+---
+
 ## Logging
 
 ### Begin capture of rx log to node storage
@@ -660,7 +669,27 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 **Parameters:**
 - `state`: `0` (disable) or `1` (enable)
 
-**Default:** `0`
+**Default:** `0` (`1` on repeaters)
+
+---
+
+#### View or change the conditional flood retry parameters (Repeater Only)
+**Usage:**
+- `get flood`
+- `set flood.maxretry <count>`
+- `set flood.timeout <ms>`
+
+**Parameters:**
+- `count`: max retransmit attempts per tracked flood (1-10)
+- `ms`: minimum confirm window before the first retry (500-10000)
+
+**Default:** `flood.maxretry=3`, `flood.timeout=2500`
+
+**Note:** After sending or forwarding a flood, the repeater listens for a neighbour relaying it. If none is heard within the confirm window, the packet is retransmitted up to `flood.maxretry` times. The effective window is `max(flood.timeout, 8 x estimated airtime)`.
+
+**Note:** Stored in `/other_prefs`, separate from the main preferences file. See `stats-flood` for counters.
+
+**Set by build flag:** `ENABLE_FLOOD_CONDITIONAL_RETRY` (set to `0` to compile the feature out), `FLOOD_RETRY_MAX_RETRANSMITS`, `FLOOD_RETRY_CONFIRM_WINDOW_MS`
 
 ---
 

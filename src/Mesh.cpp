@@ -667,6 +667,7 @@ void Mesh::sendFlood(Packet* packet, uint32_t delay_millis, uint8_t path_hash_si
   } else {
     pri = 1;
   }
+  onFloodQueued(packet, pri, delay_millis);
   sendPacket(packet, pri, delay_millis);
 }
 
@@ -696,6 +697,7 @@ void Mesh::sendFlood(Packet* packet, uint16_t* transport_codes, uint32_t delay_m
   } else {
     pri = 1;
   }
+  onFloodQueued(packet, pri, delay_millis);
   sendPacket(packet, pri, delay_millis);
 }
 

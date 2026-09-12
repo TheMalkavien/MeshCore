@@ -108,6 +108,25 @@ struct PendingPing {
 #define PACKET_LOG_FILE  "/packet_log"
 
 class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
+  struct FloodRetryEntry {
+    uint8_t active;
+    uint8_t retries_sent;
+    uint8_t priority;
+    uint8_t raw_len;
+    uint8_t hash[MAX_HASH_SIZE];
+    uint8_t raw[MAX_TRANS_UNIT];
+    unsigned long created_at;
+    unsigned long next_retry_at;
+    uint32_t wait_ms;
+  };
+
+  // Extensible custom prefs stored in /other_prefs, independent of NodePrefs.
+  // Add new fields at the end only; bump OTHER_PREFS_VERSION on breaking changes.
+  struct OtherPrefs {
+    uint8_t  flood_max_retries; // max retransmit attempts per flood packet
+    uint16_t flood_timeout_ms;  // minimum confirm window before first retry (ms)
+  };
+
   FILESYSTEM* _fs;
   uint32_t last_millis;
   uint64_t uptime_millis;
@@ -144,6 +163,12 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   // asynchronously (eg. 'ping') knows who to send its later datagrams to.
   ClientInfo* active_cli_client;
   uint8_t active_cli_path_hash_size;
+  FloodRetryEntry _flood_retry[8];
+  uint32_t _flood_retry_tracked;
+  uint32_t _flood_retry_confirmed;
+  uint32_t _flood_retry_failed;
+  uint32_t _flood_retry_retransmits;
+  OtherPrefs _other_prefs;
 #if defined(WITH_RS232_BRIDGE)
   RS232Bridge bridge;
 #elif defined(WITH_ESPNOW_BRIDGE)
@@ -161,6 +186,13 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void runLocalPingSession(char* reply);
   void formatPingLine(char* out) const;
   void formatPingSummary(char* out) const;
+  void trackFloodForward(const mesh::Packet* pkt, mesh::DispatcherAction action);
+  void markFloodHeard(const mesh::Packet* pkt);
+  void processFloodRetries();
+  void clearFloodRetryState();
+  void loadOtherPrefs();
+  void saveOtherPrefs();
+  void onFloodQueued(const mesh::Packet* packet, uint8_t priority, uint32_t delay_ms) override;
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
@@ -261,6 +293,7 @@ public:
   void formatStatsReply(char *reply) override;
   void formatRadioStatsReply(char *reply) override;
   void formatPacketStatsReply(char *reply) override;
+  void formatFloodStatsReply(char *reply) override;
   void startRegionsLoad() override;
   bool saveRegions() override;
   void onDefaultRegionChanged(const RegionEntry* r) override;
