@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
   <title>MeshCore OTA</title>
   <style>
     :root {
@@ -711,7 +712,7 @@
           <div class="progress-wrap">
             <div class="progress-bar" id="progressBar"></div>
           </div>
-          <div id="planLine">Plan OTA : sélectionne un firmware</div>
+          <div id="planLine">Plan OTA: sélectionne un firmware</div>
           <div id="metricsLine">Aucune mise à jour lancée.</div>
         </div>
       </div>
@@ -723,6 +724,7 @@
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="10" rx="1.5" stroke="currentColor" stroke-width="1.4"/><path d="M5 6h6M5 9h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
         <div class="card-title">Journal</div>
         <button type="button" id="copyLogBtn" class="btn-mini">Copier</button>
+        <button type="button" id="saveLogBtn" class="btn-mini">Enregistrer</button>
         <button type="button" id="clearLogBtn" class="btn-mini">Vider</button>
       </div>
       <div class="card-body" style="padding-top:8px;">
@@ -748,30 +750,6 @@
   <!-- ── Toasts ── -->
   <div id="toastContainer" class="toast-container"></div>
 
-  <script>
-    // ── Advanced toggle ──
-    const toggle = document.getElementById('advancedToggle');
-    const body   = document.getElementById('advancedBody');
-    toggle.addEventListener('click', () => {
-      const open = body.classList.toggle('open');
-      toggle.classList.toggle('open', open);
-      toggle.setAttribute('aria-expanded', open);
-    });
-
-    // ── File info display ──
-    document.getElementById('firmwareFile').addEventListener('change', function() {
-      const info = document.getElementById('fileInfo');
-      if (this.files && this.files[0]) {
-        const f = this.files[0];
-        const kb = (f.size / 1024).toFixed(1);
-        info.textContent = `${f.name}  —  ${kb} KB`;
-        info.classList.add('visible');
-      } else {
-        info.classList.remove('visible');
-      }
-    });
-  </script>
-
-  <script defer src="./app.js?v=20260912-r15"></script>
+  <script defer src="./app.js?v=20260912-r16"></script>
 </body>
 </html>

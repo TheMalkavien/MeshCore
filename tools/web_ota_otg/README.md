@@ -27,7 +27,7 @@ En mode `USB`, il tente :
 - **`ack_every` adaptatif** en mode binaire : les checkpoints `STATUS` s'espacent automatiquement (jusqu'à 32 chunks) quand le lien est propre, et se resserrent au premier rejet. Note : en transport binaire, le firmware supprime tous les ACK d'écriture ; la valeur `ack_every` envoyée dans le `BEGIN` ne sert que de cadence initiale côté client (et de compat avec le mode texte).
 - **Chemin direct 0 saut** (`Forcer le chemin direct`, activé par défaut) : avant toute
   commande vers la cible — login compris — l'outil réécrit le contact côté companion avec
-  `out_path_len = 0`. Sans ça, `BaseChatMesh` émet en DIRECT le long du chemin déjà
+  un chemin à zéro saut. Sans ça, `BaseChatMesh` émet en DIRECT le long du chemin déjà
   mémorisé : un chemin multi-saut envoie les paquets vers le **premier relais**, pas vers
   la cible. C'est rédhibitoire avec le preset OTA temporaire, puisque les relais restent
   sur le preset standard et n'entendent plus rien. Le chemin d'origine est restauré en fin
@@ -35,6 +35,27 @@ En mode `USB`, il tente :
   même chose puis sonde la cible : c'est le seul test du sens **retour**, dont le
   `out_path` vit dans le répéteur et n'est pas réécrivable à distance (le firmware ne le
   purge que sur un login reçu en flood).
+
+  Attention en lisant le code : `out_path_len` n'est **ni** un nombre d'octets **ni** un
+  nombre de sauts. C'est le champ packé `path_len` de `Packet.h` — bits 0-5 = nombre de
+  sauts, bits 6-7 = taille de hash moins un — et la longueur utile vaut `sauts × taille`.
+  Ainsi `0x40` (64) signifie « zéro saut, hashes de 2 octets », c'est-à-dire un chemin
+  **direct**, pas 64 sauts. `0xFF` reste la sentinelle « aucun chemin connu » (elle encode
+  une taille de 4, invalide, donc sans collision possible). Forcer le direct conserve les
+  bits de taille, pour ne pas rétrograder le contact en hashes de 1 octet.
+- **Verrou d'écran** pendant l'OTA (`navigator.wakeLock`) : en USB OTG sur téléphone,
+  l'extinction de l'écran endormait l'onglet en plein transfert. Repris automatiquement
+  quand la page revient au premier plan ; une confirmation est demandée si on ferme
+  l'onglet pendant un transfert.
+- **Réglages mémorisés** d'une session à l'autre (`localStorage`) : mode de connexion,
+  hôte TCP, baudrate, dernière cible, preset OTA temporaire, paramètres avancés et état du
+  panneau. Le mot de passe cible et le firmware ne sont **jamais** mémorisés.
+- L'encart sous le sélecteur de firmware affiche la taille **réellement transmise** : un
+  `.uf2`, un `.hex` ou un `.zip` sont convertis et compressés dès la sélection, donc le
+  plan OTA compte les chunks du payload final, pas ceux du fichier source.
+- Journal : bouton `Enregistrer` (téléchargement direct, le copier-coller de 200 000
+  caractères étant impraticable sur mobile) et défilement automatique seulement si on est
+  resté en bas, pour pouvoir relire pendant un transfert.
 - Option `Preset OTA temporaire` :
   - envoie `tempradio` à la cible avant OTA
   - bascule le client USB sur le même preset
@@ -71,6 +92,10 @@ build_flags =
   dans `handleLoginReq`) ; c'est ce que fait automatiquement la récupération de chemin du
   login. Si `Vérifier le lien` reste muet alors que la cible est à portée, renseigner le
   mot de passe et relancer suffit généralement.
+- Seuls les contacts de type **répéteur** sont proposés dans la liste : `simple_repeater`
+  est le seul exemple qui implémente les commandes `ota ...` (ni le room server ni le
+  capteur ne les ont). Pour une cible hors liste — un build maison, par exemple — renseigne
+  sa pubkey dans `Pubkey manuelle`.
 - Le mode BLE dépend du support `Web Bluetooth` du navigateur et du companion BLE. Les trames sont supposées tenir dans une notification GATT (MTU suffisant).
 
 ## Lancer en local
