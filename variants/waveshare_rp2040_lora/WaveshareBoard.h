@@ -4,6 +4,14 @@
 #include <MeshCore.h>
 #include <helpers/KeyValueStore.h>
 
+#if defined(ARDUINO_ARCH_RP2040)
+  #include <hardware/clocks.h>
+#endif
+#ifdef MLK_RP2040_LOWPOWER
+  #include <hardware/vreg.h>
+  #include <hardware/timer.h>
+#endif
+
 // LoRa radio module pins for Waveshare RP2040-LoRa-HF/LF
 // https://files.waveshare.com/wiki/RP2040-LoRa/Rp2040-lora-sch.pdf
 
@@ -21,16 +29,20 @@
  *              |    100k
  *    BAT- -----+
  */
-#define PIN_VBAT_READ            28
+#ifndef PIN_VBAT_READ
+  #define PIN_VBAT_READ          28
+#endif
 #define BATTERY_SAMPLES          8
 #define ADC_MULTIPLIER           (3.0f * 3.3f * 1000)
 
 class WaveshareBoard : public mesh::MainBoard {
 protected:
+  float adc_mult = ADC_MULTIPLIER;
   uint8_t startup_reason;
 
 public:
   void begin();
+  void sleep(uint32_t secs) override;
   uint8_t getStartupReason() const override { return startup_reason; }
 
   void attachDynamicPrefs(KeyValueStore* prefs) { }  // no-op
@@ -50,9 +62,28 @@ public:
     }
     raw = raw / BATTERY_SAMPLES;
 
-    return (ADC_MULTIPLIER * raw) / 4096;
+    // adc_mult is already a full-scale millivolt multiplier (ADC_MULTIPLIER ~= 9900),
+    // matching the convention used by every other board: (mult * raw) / 4096 -> mV.
+    return (adc_mult * raw) / 4096;
 #else
     return 0;
+#endif
+  }
+
+  bool setAdcMultiplier(float multiplier) override {
+#if defined(PIN_VBAT_READ) && defined(ADC_MULTIPLIER)
+    adc_mult = (multiplier == 0.0f) ? ADC_MULTIPLIER : multiplier;
+    return true;
+#else
+    return false;
+#endif
+  }
+
+  float getAdcMultiplier() const override {
+#if defined(PIN_VBAT_READ) && defined(ADC_MULTIPLIER)
+    return (adc_mult == 0.0f) ? ADC_MULTIPLIER : adc_mult;
+#else
+    return 0.0f;
 #endif
   }
 
@@ -62,3 +93,60 @@ public:
 
   bool startOTAUpdate(const char *id, char reply[]) override;
 };
+
+// Clock / core-voltage profiles. The whole set lives here so a single place owns the
+// ordering rule: coming *up*, raise the voltage and let it settle before raising the
+// clock; going *down*, lower the clock first and only drop the voltage if it took.
+// Getting that backwards under-volts the core at the higher frequency.
+// The voltage half compiles in only with -D MLK_RP2040_LOWPOWER.
+#if defined(ARDUINO_ARCH_RP2040)
+#ifndef RP2040_SLEEP_CLOCK_MHZ
+  #define RP2040_SLEEP_CLOCK_MHZ 18
+#endif
+
+#ifndef RP2040_ACTIVE_CLOCK_MHZ
+  #ifdef RP2040_CPU_FREQ_MHZ
+    #define RP2040_ACTIVE_CLOCK_MHZ RP2040_CPU_FREQ_MHZ
+  #else
+    #define RP2040_ACTIVE_CLOCK_MHZ 125
+  #endif
+#endif
+
+inline bool rp2040_apply_clock_profile(uint32_t clock_mhz) {
+  if (!set_sys_clock_khz(clock_mhz * KHZ, false)) {
+    // Requested frequency not achievable: clk_sys is unchanged, so leave the
+    // derived clocks alone rather than re-deriving them from a wrong base.
+    return false;
+  }
+
+  // Keep SPI, ADC and RTC on coherent clock sources after changing clk_sys.
+  clock_configure(clk_peri,
+                  0,
+                  CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+                  clock_mhz * MHZ,
+                  clock_mhz * MHZ);
+  clock_configure(clk_adc, 0,
+                  CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                  clock_mhz * MHZ, clock_mhz * MHZ);
+  clock_configure(clk_rtc, 0, CLOCKS_CLK_RTC_CTRL_AUXSRC_VALUE_XOSC_CLKSRC, 12 * MHZ, 46875);
+  return true;
+}
+
+#ifdef MLK_RP2040_LOWPOWER
+inline void rp2040_enter_sleep_profile() {
+  // Only drop core voltage if the clock actually came down; otherwise we'd under-volt
+  // the core while it is still running at the higher active frequency.
+  if (rp2040_apply_clock_profile(RP2040_SLEEP_CLOCK_MHZ)) {
+    vreg_set_voltage(VREG_VOLTAGE_0_90);
+  }
+}
+#endif
+
+inline void rp2040_restore_active_profile() {
+#ifdef MLK_RP2040_LOWPOWER
+  vreg_set_voltage(VREG_VOLTAGE_DEFAULT);
+  busy_wait_us(200);
+#endif
+  rp2040_apply_clock_profile(RP2040_ACTIVE_CLOCK_MHZ);
+}
+#endif
