@@ -65,6 +65,14 @@ public:
   virtual bool getBootloaderVersion(char* version, size_t max_len) { return false; }
   virtual bool startOTAUpdate(const char* id, char reply[]) { return false; }   // not supported
 
+  /**
+   * \brief  True while a firmware update session is armed or in progress on this board.
+   *
+   * Power management must not run while one is: dropping the clock, the core voltage or
+   * USB mid-transfer loses data. Boards with no such session always answer false.
+   */
+  virtual bool isOTASessionActive() const { return false; }
+
   // Power management interface (boards with power management override these)
   virtual bool isExternalPowered() { return false; }
   virtual uint16_t getBootVoltage() { return 0; }
