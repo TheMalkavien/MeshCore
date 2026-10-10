@@ -2,6 +2,7 @@
 
 #include <RadioLib.h>
 #include "MeshCore.h"
+#include "RXPowerSaving.h"   // MC_TCXO_DELAY_US
 
 class CustomSX1262 : public SX1262 {
   uint32_t _preambleMillis = 66;
@@ -10,7 +11,39 @@ class CustomSX1262 : public SX1262 {
   bool _headerSeen = false;
 
   public:
+    // The sleep -> RX transition RadioLib subtracts from a duty-cycle sleep.
+    // Protected in the RadioLib base, so the RXPS layer reads it through here.
+    uint32_t getTcxoDelay() const { return tcxoDelay; }
+
     CustomSX1262(Module *mod) : SX1262(mod) { }
+
+    // RadioLib's begin() installs its own 5000 us TCXO startup delay and
+    // setTCXO() does not recalibrate, so MeshCore's value has to be written
+    // afterwards and the RC calibrations redone against the new clock-gating
+    // window. Overriding begin() puts that in one place: every variant reaches
+    // the radio through this class, whether it calls std_init() or begin()
+    // directly, so no target.cpp or variant .ini has to know about it.
+    int16_t begin(float freq = 434.0, float bw = 125.0, uint8_t sf = 9, uint8_t cr = 7,
+                  uint8_t syncWord = RADIOLIB_SX126X_SYNC_WORD_PRIVATE, int8_t power = 10,
+                  uint16_t preambleLength = 8, float tcxoVoltage = 1.6,
+                  bool useRegulatorLDO = false) {
+      int16_t state = SX1262::begin(freq, bw, sf, cr, syncWord, power, preambleLength,
+                                    tcxoVoltage, useRegulatorLDO);
+      if (state == RADIOLIB_ERR_NONE) state = applyMeshCoreTcxoDelay();
+      return state;
+    }
+
+    // Read tcxoVoltage back from the chip object rather than from the argument:
+    // begin() zeroes it when it falls back to an XTAL, and re-asserting a TCXO
+    // supply on DIO3 for a board that has none would be worse than a long delay.
+    int16_t applyMeshCoreTcxoDelay() {
+      if (tcxoVoltage <= 0.0f) return RADIOLIB_ERR_NONE;
+      int16_t err = setTCXO(tcxoVoltage, MC_TCXO_DELAY_US);
+      if (err != RADIOLIB_ERR_NONE) return err;
+      err = calibrate(RADIOLIB_SX126X_CALIBRATE_ALL);
+      delay(50);
+      return err;
+    }
 
   #ifdef RP2040_PLATFORM
     bool std_init(SPIClassRP2040* spi = NULL)
@@ -75,7 +108,7 @@ class CustomSX1262 : public SX1262 {
       setDio2AsRfSwitch(SX126X_DIO2_AS_RF_SWITCH);
   #endif
   #ifdef SX126X_RX_BOOSTED_GAIN
-      setRxBoostedGainModeRetained(SX126X_RX_BOOSTED_GAIN);
+      setRxBoostedGainMode(SX126X_RX_BOOSTED_GAIN);
   #endif
   #if defined(SX126X_RXEN) || defined(SX126X_TXEN)
     #ifndef SX126X_RXEN
@@ -100,38 +133,30 @@ class CustomSX1262 : public SX1262 {
       return true;  // success
     }
 
-    // Persist register 0x08AC across warm sleep/RxDutyCycle. SX1262 datasheet
-    // section 9.6 requires the retention list at 0x029F..0x02A1 to contain the
-    // RX gain register address. RadioLib 7.7+ also does this internally, but
-    // writing it explicitly keeps the contract clear and covers older 7.x.
-    int16_t setRxBoostedGainModeRetained(bool enabled) {
-      int16_t status = SX1262::setRxBoostedGainMode(enabled);
-      RADIOLIB_ASSERT(status);
-
-      constexpr uint16_t RX_GAIN_RETENTION_0 = 0x029F;
-      constexpr uint16_t RX_GAIN_REGISTER = 0x08AC;
-      const uint8_t retention[] = {
-          0x01,
-          (uint8_t)((RX_GAIN_REGISTER >> 8) & 0xFF),
-          (uint8_t)(RX_GAIN_REGISTER & 0xFF),
-      };
-      return writeRegister(RX_GAIN_RETENTION_0, retention, sizeof(retention));
-    }
-
-    // BUSY high means the chip is in an RxDutyCycle sleep/transition window.
-    // Avoid issuing SPI transactions until the next listening window.
-    bool isChipBusy() {
-      const uint32_t busy = this->mod->getGpio();
-      return busy != RADIOLIB_NC && this->mod->hal->digitalRead(busy);
-    }
-
     int16_t startReceive() override {
       // include the PREAMBLE_DETECTED irq bit in reported flags
       return SX1262::startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED), RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
     }
 
+    int16_t startReceiveDutyCycle(uint32_t rxPeriod, uint32_t sleepPeriod,
+                                  RadioLibIrqFlags_t irqFlags = RADIOLIB_IRQ_RX_DEFAULT_FLAGS,
+                                  RadioLibIrqFlags_t irqMask = RADIOLIB_IRQ_RX_DEFAULT_MASK) {
+      int16_t state = SX1262::startReceiveDutyCycle(rxPeriod, sleepPeriod, irqFlags, irqMask);
+      if (state == RADIOLIB_ERR_NONE) {
+        // RadioLib stages RX through standby, which leaves a host-controlled
+        // RXEN switch in IDLE. Set it back to RX for the whole duty-cycle;
+        // boards without an external RXEN table are unaffected.
+        this->mod->setRfSwitchState(Module::MODE_RX);
+      }
+      return state;
+    }
+
+    bool isChipBusy() {
+      uint32_t busy = this->mod->getGpio();
+      return busy != RADIOLIB_NC && this->mod->hal->digitalRead(busy);
+    }
+
     bool isReceiving() {
-      if (isChipBusy()) return false;
       uint32_t irq = getIrqFlags();
       bool preamble = irq & RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED; // bit 2
       bool header   = irq & RADIOLIB_SX126X_IRQ_HEADER_VALID;      // bit 4
@@ -174,6 +199,21 @@ class CustomSX1262 : public SX1262 {
       return false;
     }
 
+    int16_t stopRTC() {
+      uint8_t rtcStop = 0x00;
+      int16_t state = writeRegister(RADIOLIB_SX126X_REG_RTC_CTRL, &rtcStop, 1);
+      RADIOLIB_ASSERT(state);
+
+      uint8_t rtcEvent = 0;
+      state = readRegister(RADIOLIB_SX126X_REG_EVENT_MASK, &rtcEvent, 1);
+      RADIOLIB_ASSERT(state);
+
+      rtcEvent |= 0x02;
+      return writeRegister(RADIOLIB_SX126X_REG_EVENT_MASK, &rtcEvent, 1);
+    }
+
+    bool isHeaderSeen() const { return _headerSeen; }
+
     void setPreambleMillis(uint32_t preambleMillis) {
       _preambleMillis = preambleMillis;
       MESH_DEBUG_PRINTLN("Set _preambleMillis=%u", _preambleMillis);
@@ -183,20 +223,7 @@ class CustomSX1262 : public SX1262 {
       MESH_DEBUG_PRINTLN("Set _maxPayloadMillis=%u", _maxPayloadMillis);
     }
 
-    // Stop the RTC left running by RxDutyCycle. Without this errata sequence,
-    // a pending timeout event can silently abort the following RX, TX or CAD.
-    int16_t stopRTC() {
-      uint8_t rtc_stop = 0x00;
-      int16_t status = writeRegister(RADIOLIB_SX126X_REG_RTC_CTRL, &rtc_stop, 1);
-      RADIOLIB_ASSERT(status);
-
-      uint8_t rtc_event = 0;
-      status = readRegister(RADIOLIB_SX126X_REG_EVENT_MASK, &rtc_event, 1);
-      RADIOLIB_ASSERT(status);
-
-      rtc_event |= 0x02;
-      return writeRegister(RADIOLIB_SX126X_REG_EVENT_MASK, &rtc_event, 1);
-    }
+    int16_t setRxBoostedGainModeRetained(bool en) { return SX1262::setRxBoostedGainMode(en, true); }
 
     bool getRxBoostedGainMode() {
       uint8_t rxGain = 0;

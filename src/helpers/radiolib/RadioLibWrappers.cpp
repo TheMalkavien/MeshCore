@@ -274,12 +274,65 @@ void RadioLibWrapper::startRecv() {
 }
 
 int RadioLibWrapper::startReceiveMode() {
-  return _radio->startReceive();
+  // Periodic calibration switches RXPS to continuous RX. Re-check at the
+  // hardware transition so a preamble that arrived after the scheduler's
+  // idle check is not aborted by stopReceiveDutyCycle().
+  if (_nf_calib_active && _rx_ps_armed && isPacketPendingOrReceiving()) {
+    return RADIOLIB_ERR_NONE;
+  }
+  if (_rx_ps_armed) stopReceiveDutyCycle();
+  if (!_rx_ps_enabled || _nf_calib_active || _rx_hold_continuous) {
+    _rx_ps_armed = false;
+    _rx_ps_last_error = RADIOLIB_ERR_NONE;
+    return _radio->startReceive();
+  }
+
+  if (!_rx_ps_arm_retry.canAttempt()) {
+    // arming has failed repeatedly; stop paying for a doomed SPI round-trip on
+    // every RX restart. A config change (setRxPowerSaving) re-enables retries.
+    _rx_ps_armed = false;
+    return _radio->startReceive();
+  }
+
+  const RadioLibIrqFlags_t irq_flags =
+      RADIOLIB_IRQ_RX_DEFAULT_FLAGS |
+      (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED);
+  const RadioLibIrqFlags_t irq_mask =
+      (1UL << RADIOLIB_IRQ_RX_DONE) |
+      (1UL << RADIOLIB_IRQ_TIMEOUT) |
+      (1UL << RADIOLIB_IRQ_CRC_ERR) |
+      (1UL << RADIOLIB_IRQ_HEADER_ERR);
+
+  uint32_t eff_rx_us = _rx_ps_rx_us;
+  uint32_t eff_sleep_us = _rx_ps_sleep_us;
+  int16_t err = armDutyCycle(irq_flags, irq_mask, &eff_rx_us, &eff_sleep_us);
+  if (err == RADIOLIB_ERR_NONE) {
+    _rx_ps_armed = true;
+    _rx_ps_last_error = RADIOLIB_ERR_NONE;
+    _rx_ps_arm_retry.recordSuccess();
+    _rx_ps_eff_rx_us = eff_rx_us;
+    _rx_ps_eff_sleep_us = eff_sleep_us;
+    return err;
+  }
+
+  _rx_ps_armed = false;
+  _rx_ps_last_error = err;
+  _rx_ps_eff_rx_us = 0;
+  _rx_ps_eff_sleep_us = 0;
+  n_rx_ps_arm_failures++;
+  _rx_ps_arm_retry.recordFailure();
+  MESH_DEBUG_PRINTLN("RadioLibWrapper: startReceiveDutyCycle(%d), continuous RX fallback", err);
+  int16_t fallback_err = _radio->startReceive();
+  if (fallback_err != RADIOLIB_ERR_NONE) _rx_ps_last_error = fallback_err;
+  return fallback_err;
 }
 
 void RadioLibWrapper::stopReceiveDutyCycle() {
-  _radio->standby();
+  int16_t err = stopDutyCycleHardware();
   _rx_ps_armed = false;
+  _rx_ps_eff_rx_us = 0;
+  _rx_ps_eff_sleep_us = 0;
+  if (err != RADIOLIB_ERR_NONE) _rx_ps_last_error = err;
 }
 
 bool RadioLibWrapper::isPacketReady() {
@@ -311,6 +364,8 @@ bool RadioLibWrapper::setRxPowerSaving(bool enabled, uint32_t rx_us, uint32_t sl
     return false;
   }
 
+  _rx_ps_arm_retry.reset();
+  _rx_ps_last_error = RADIOLIB_ERR_NONE;
   _rx_ps_enabled = enabled;
   _rx_ps_rx_us = rx_us;
   _rx_ps_sleep_us = sleep_us;
@@ -320,7 +375,7 @@ bool RadioLibWrapper::setRxPowerSaving(bool enabled, uint32_t rx_us, uint32_t sl
 
   // Leave a completed packet and an in-flight TX untouched. Otherwise switch
   // modes immediately; the next recvRaw() performs the actual re-arm.
-  if ((state & STATE_INT_READY) == 0 && (state & ~STATE_INT_READY) != STATE_TX_WAIT) {
+  if (!isPacketPendingOrReceiving() && (state & ~STATE_INT_READY) != STATE_TX_WAIT) {
     if (_rx_ps_armed || (state & ~STATE_INT_READY) == STATE_RX) stopReceiveDutyCycle();
     state = STATE_IDLE;
   }
@@ -506,4 +561,27 @@ PacketMillis RadioLibWrapper::calcMaxPacketMillis(uint8_t sf, float bw, uint8_t 
   if (cr >= 5 && cr < 8) { payload_us = (payload_us * 8) / cr; }
 
   return PacketMillis {(preamble_us + 999) / 1000, (payload_us + 999) / 1000};
+}
+
+void RadioLibWrapper::requestRestartRecv() {
+  noInterrupts();
+  if ((state & ~STATE_INT_READY) != STATE_TX_WAIT) {
+    state &= STATE_INT_READY;   // STATE_IDLE, but keep a pending interrupt
+  }
+  interrupts();
+}
+
+bool RadioLibWrapper::isPacketPendingOrReceiving() {
+  return (state & STATE_INT_READY) != 0 || isReceivingPacket();
+}
+
+RxPowerSavingStatus RadioLibWrapper::getRxPowerSavingStatus() const {
+  RxPowerSavingStatus status;
+  status.supported = supportsRxPowerSaving();
+  status.armed = _rx_ps_armed;
+  status.last_error = _rx_ps_last_error;
+  status.arm_failures = n_rx_ps_arm_failures;
+  status.effective_rx_us = _rx_ps_eff_rx_us;
+  status.effective_sleep_us = _rx_ps_eff_sleep_us;
+  return status;
 }

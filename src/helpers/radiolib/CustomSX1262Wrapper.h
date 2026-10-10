@@ -9,12 +9,19 @@
 #endif
 
 class CustomSX1262Wrapper : public RadioLibWrapper {
-  bool _rx_boosted_cache;
-  bool _rx_boosted_valid;
-
+  bool _rx_boosted_cache = false;
+  bool _rx_boosted_valid = false;
 public:
-  CustomSX1262Wrapper(CustomSX1262& radio, mesh::MainBoard& board)
-      : RadioLibWrapper(radio, board), _rx_boosted_cache(false), _rx_boosted_valid(false) { }
+  // Ask the radio rather than assume RadioLib's 5000 us default: startReceive-
+  // DutyCycle subtracts tcxoDelay + 1000 from the sleep and the register
+  // underflows below that, so the floor is a property of this board's TCXO. A
+  // board without one can duty cycle with a far shorter sleep. The 100 us on
+  // top clears the 15.625 us register tick that must remain.
+  uint32_t rxPowerSavingTransitionUs() const override {
+    return ((CustomSX1262 *)_radio)->getTcxoDelay() + 1000;
+  }
+
+  CustomSX1262Wrapper(CustomSX1262& radio, mesh::MainBoard& board) : RadioLibWrapper(radio, board) { }
 
   void setParams(float freq, float bw, uint8_t sf, uint8_t cr) override {
     prepareForRadioConfig();
@@ -24,14 +31,21 @@ public:
     ((CustomSX1262 *)_radio)->setBandwidth(bw);
     ((CustomSX1262 *)_radio)->setCodingRate(cr);
     updatePreamble(sf);
+    applyDefaultRxPowerSaving(sf, bw);
     PacketMillis pm = calcMaxPacketMillis(sf, bw, cr, preambleLengthForSF(sf));
     ((CustomSX1262 *)_radio)->setPreambleMillis(pm.preambleMillis);
     ((CustomSX1262 *)_radio)->setMaxPayloadMillis(pm.payloadMillis);
   }
 
-  bool isReceivingPacket() override { 
+  bool isReceivingPacket() override {
+    // While duty-cycling, BUSY marks the sleep phase: probing IRQ flags over
+    // SPI there could wake the chip and break the cycle. Only skip the probe
+    // in that case - outside RXPS this must stay a real channel check, since
+    // Dispatcher::checkSend() relies on it to avoid transmitting over others.
+    if (_rx_ps_armed && ((CustomSX1262 *)_radio)->isChipBusy()) return false;
     return ((CustomSX1262 *)_radio)->isReceiving();
   }
+  bool isReceivingHeader() override { return ((CustomSX1262 *)_radio)->isHeaderSeen(); }
   bool isChipBusy() override {
     return ((CustomSX1262 *)_radio)->isChipBusy();
   }
@@ -49,46 +63,9 @@ public:
     ((CustomSX1262 *)_radio)->sleep(false);
   }
 
-  bool supportsRxPowerSaving() const override {
-#if defined(WITH_SX1262_RX_POWER_SAVING)
-    return true;
-#else
-    return false;
-#endif
-  }
+  bool supportsRxPowerSaving() const override { return true; }
 
 protected:
-  int startReceiveMode() override {
-    if (_rx_ps_armed) stopReceiveDutyCycle();
-    if (!_rx_ps_enabled || _nf_calib_active) return _radio->startReceive();
-
-    const RadioLibIrqFlags_t irq_flags = RADIOLIB_IRQ_RX_DEFAULT_FLAGS;
-    const RadioLibIrqFlags_t irq_mask =
-        (1UL << RADIOLIB_IRQ_RX_DONE) |
-        (1UL << RADIOLIB_IRQ_TIMEOUT) |
-        (1UL << RADIOLIB_IRQ_CRC_ERR) |
-        (1UL << RADIOLIB_IRQ_HEADER_ERR);
-
-    int err = ((CustomSX1262 *)_radio)->startReceiveDutyCycle(
-        _rx_ps_rx_us, _rx_ps_sleep_us, irq_flags, irq_mask);
-    if (err == RADIOLIB_ERR_NONE) {
-      _rx_ps_armed = true;
-      return err;
-    }
-
-    MESH_DEBUG_PRINTLN("CustomSX1262Wrapper: startReceiveDutyCycle(%d), continuous RX fallback", err);
-    _radio->standby();
-    ((CustomSX1262 *)_radio)->stopRTC();
-    _rx_ps_armed = false;
-    return _radio->startReceive();
-  }
-
-  void stopReceiveDutyCycle() override {
-    _radio->standby();
-    ((CustomSX1262 *)_radio)->stopRTC();
-    _rx_ps_armed = false;
-  }
-
   bool radioDeepInit() override {
     if (!((CustomSX1262 *)_radio)->std_init()) return false;
     if (_rx_boosted_valid) {
@@ -96,13 +73,23 @@ protected:
     }
     return true;
   }
-
-public:
-  void doResetAGC() override {
-    prepareForRadioConfig();
-    sx126xResetAGC((SX126x *)_radio, getRxBoostedGainMode());
+  int16_t armDutyCycle(RadioLibIrqFlags_t irq_flags, RadioLibIrqFlags_t irq_mask,
+                       uint32_t* eff_rx_us, uint32_t* eff_sleep_us) override {
+    // RadioLib programs the SX126x with exactly what we ask for (it only
+    // subtracts the wake-up transition from the sleep period internally).
+    *eff_rx_us = _rx_ps_rx_us;
+    *eff_sleep_us = _rx_ps_sleep_us;
+    return ((CustomSX1262 *)_radio)->startReceiveDutyCycle(
+        _rx_ps_rx_us, _rx_ps_sleep_us, irq_flags, irq_mask);
   }
 
+  int16_t stopDutyCycleHardware() override {
+    int16_t standby_err = _radio->standby();
+    int16_t rtc_err = ((CustomSX1262 *)_radio)->stopRTC();
+    return standby_err != RADIOLIB_ERR_NONE ? standby_err : rtc_err;
+  }
+
+public:
   bool setRxBoostedGainMode(bool en) override {
     prepareForRadioConfig();
     const bool ok = ((CustomSX1262 *)_radio)->setRxBoostedGainModeRetained(en) == RADIOLIB_ERR_NONE;
@@ -115,4 +102,6 @@ public:
   bool getRxBoostedGainMode() const override {
     return _rx_boosted_valid ? _rx_boosted_cache : ((CustomSX1262 *)_radio)->getRxBoostedGainMode();
   }
+
+  void doResetAGC() override { sx126xResetAGC((SX126x *)_radio, getRxBoostedGainMode()); }
 };

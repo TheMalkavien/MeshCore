@@ -944,7 +944,8 @@ bool MyMesh::applyRxPowerSavingPrefs() {
 
   if (_prefs.rx_ps_enabled &&
       !meshcore::rxps::calculateLevel(_prefs.rx_ps_level, _prefs.sf, _prefs.bw,
-                                     _prefs.rx_ps_preamble, &rx_us, &sleep_us)) {
+                                     _prefs.rx_ps_preamble, &rx_us, &sleep_us, radio_driver.rxPowerSavingCaptureCostSymbols(),
+                                    radio_driver.rxPowerSavingTransitionUs())) {
     MESH_DEBUG_PRINTLN("RXPS: invalid profile level=%u preamble=%u sf=%u bw=%d",
                        (unsigned)_prefs.rx_ps_level, (unsigned)_prefs.rx_ps_preamble,
                        (unsigned)_prefs.sf, (int)_prefs.bw);
@@ -2365,13 +2366,20 @@ void MyMesh::checkCLIRescueCmd() {
       uint32_t rx_us = 0;
       uint32_t sleep_us = 0;
       meshcore::rxps::calculateLevel(_prefs.rx_ps_level, _prefs.sf, _prefs.bw,
-                                    _prefs.rx_ps_preamble, &rx_us, &sleep_us);
+                                    _prefs.rx_ps_preamble, &rx_us, &sleep_us, radio_driver.rxPowerSavingCaptureCostSymbols(),
+                                    radio_driver.rxPowerSavingTransitionUs());
       Serial.printf("  > rxps %s, level %u, preamble %u, %lu/%lu us, armed=%s, wd=%lu/%lu\n",
                     _prefs.rx_ps_enabled ? "on" : "off", (unsigned)_prefs.rx_ps_level,
                     (unsigned)_prefs.rx_ps_preamble, (unsigned long)rx_us, (unsigned long)sleep_us,
                     radio_driver.isRxPowerSavingArmed() ? "yes" : "no",
                     (unsigned long)radio_driver.getRxPsWatchdogSoftCount(),
                     (unsigned long)radio_driver.getRxPsWatchdogHardCount());
+      const RxPowerSavingStatus status = radio_driver.getRxPowerSavingStatus();
+      Serial.printf("  > effective=%lu/%lu us, err=%d, arm_failures=%lu%s\n",
+                    (unsigned long)status.effective_rx_us,
+                    (unsigned long)status.effective_sleep_us, status.last_error,
+                    (unsigned long)status.arm_failures,
+                    _prefs.rx_ps_level >= 9 ? ", unguarded profile" : "");
 #if defined(HELTEC_LORA_V4)
       Serial.println("  > note: RXPS cycles the SX1262 only; the external FEM/LNA remains in its selected mode");
 #endif

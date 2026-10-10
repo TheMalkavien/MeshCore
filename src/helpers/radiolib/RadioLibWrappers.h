@@ -12,7 +12,7 @@ struct PacketMillis {
   uint32_t payloadMillis;   // header-valid   -> rx-done deadline
 };
 
-class RadioLibWrapper : public mesh::Radio {
+class RadioLibWrapper : public mesh::Radio, public RxPowerSavingControl {
 protected:
   PhysicalLayer* _radio;
   mesh::MainBoard* _board;
@@ -24,6 +24,10 @@ protected:
   int32_t _floor_sample_sum;
   uint8_t _preamble_sf;
 
+  uint32_t _rx_ps_eff_rx_us = 0, _rx_ps_eff_sleep_us = 0;
+  int16_t _rx_ps_last_error = RADIOLIB_ERR_NONE;
+  uint32_t n_rx_ps_arm_failures = 0;
+  RxPowerSavingArmRetryState _rx_ps_arm_retry;
   bool _rx_ps_enabled;
   bool _rx_ps_armed;
   bool _rx_hold_continuous;
@@ -71,12 +75,25 @@ protected:
     _params_valid = true;
   }
   virtual int startReceiveMode();
+  void requestRestartRecv();
+  bool isPacketPendingOrReceiving();
+  virtual int16_t armDutyCycle(RadioLibIrqFlags_t irq_flags,
+                               RadioLibIrqFlags_t irq_mask,
+                               uint32_t* eff_rx_us, uint32_t* eff_sleep_us) {
+    (void)irq_flags;
+    (void)irq_mask;
+    (void)eff_rx_us;
+    (void)eff_sleep_us;
+    return RADIOLIB_ERR_UNSUPPORTED;
+  }
+  virtual int16_t stopDutyCycleHardware() { return _radio->standby(); }
   virtual void stopReceiveDutyCycle();
   virtual bool isPacketReady();
   virtual bool isChipBusy() { return false; }
   virtual bool radioDeepInit() { return false; }
   float packetScoreInt(float snr, int sf, int packet_len);
   virtual bool isReceivingPacket() =0;
+  virtual bool isReceivingHeader() { return true; }
   virtual void doResetAGC();
 
 public:
@@ -104,6 +121,9 @@ public:
   bool supportsRxPowerSaving() const override { return false; }
   bool setRxPowerSaving(bool enabled, uint32_t rx_us, uint32_t sleep_us) override;
   bool prepareForSleep();
+  void applyDefaultRxPowerSaving(uint8_t, float) {}
+  RxPowerSavingStatus getRxPowerSavingStatus() const override;
+  bool isRxPowerSavingCalibrationActive() const override { return _nf_calib_active; }
   bool isChannelActive();
 
   bool isReceiving() override {
@@ -143,7 +163,7 @@ public:
   bool isWatchdogObserving() const { return _wd_observe_until != 0; }
   bool isCalibratingNoiseFloor() const { return _nf_calib_active; }
   bool isNoiseFloorSampling() const;
-  void resetStats() { n_recv = n_sent = n_recv_errors = n_wd_soft = n_wd_hard = 0; }
+  void resetStats() { n_recv = n_sent = n_recv_errors = n_wd_soft = n_wd_hard = n_rx_ps_arm_failures = 0; _rx_ps_arm_retry.reset(); }
 
   // final: these must return the metadata cached by recvRaw() before the RX
   // re-arm. A subclass reading the chip live would report the wrong packet's
