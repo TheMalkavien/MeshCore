@@ -1,4 +1,5 @@
 #include "RXPowerSaving.h"
+#include <math.h>
 
 static uint32_t ceilRxPowerSavingValue(float value) {
   uint32_t rounded = (uint32_t)value;
@@ -81,7 +82,9 @@ bool calcRxPowerSavingLevel(uint8_t level, uint8_t sf, float bw, uint8_t preambl
                             float capture_cost_symbols, uint32_t transition_us) {
   if (rx_us == nullptr || sleep_us == nullptr || level < 1 ||
       level > RX_POWERSAVING_RISKY_WORKING_MAX_LEVEL || sf < 5 || sf > 12 ||
-      bw <= 0.0f || (preamble != 16 && preamble != 32)) {
+      !isfinite(bw) || bw < 7.8f || bw > 500.0f ||
+      !isfinite(capture_cost_symbols) || capture_cost_symbols <= 0 ||
+      transition_us > RX_POWERSAVING_MAX_PERIOD_US || (preamble != 16 && preamble != 32)) {
     return false;
   }
   const bool unguarded = isRxPowerSavingUnguardedLevel(level);
@@ -218,7 +221,7 @@ void normalizeRxPowerSavingConfig(RxPowerSavingConfig* config, uint8_t sf, float
     config->preamble = RX_POWERSAVING_PROFILE_PREAMBLE;
   }
   ensureRxPowerSavingDefaults(&config->rx_us, &config->sleep_us);
-  recalcRxPowerSavingFromLevel(config->level, sf, bw, config->preamble,
+  if (config->level != 0 && !recalcRxPowerSavingFromLevel(config->level, sf, bw, config->preamble,
                                &config->rx_us, &config->sleep_us, capture_cost_symbols,
-                               transition_us);
+                               transition_us)) config->enabled = 0;
 }
