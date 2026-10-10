@@ -30,6 +30,14 @@ uint32_t Mesh::getCADFailRetryDelay() const {
   return _rng->nextInt(1, 4)*120;
 }
 
+uint32_t Mesh::getCADFailForceJitter() const {
+  // Scaled to airtime so the spread is comparable to one packet. A jitter much smaller than
+  // a packet does not actually separate two nodes that both hit the deadline at the same
+  // moment, which is the whole point of having one.
+  uint32_t air = _radio->getEstAirtimeFor(MAX_TRANS_UNIT);
+  return _rng->nextInt(0, 5) * (air / 4);
+}
+
 int Mesh::searchPeersByHash(const uint8_t* hash) {
   return 0;  // not found
 }
