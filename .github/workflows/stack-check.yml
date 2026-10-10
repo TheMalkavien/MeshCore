@@ -11,6 +11,7 @@ on:
   push:
     branches:
       - feature/core-enhancements
+      - feature/lbt-collision-avoidance
       - feature/repeater-ping
       - feature/repeater-flood-retry
       - feature/lora-ota
@@ -68,12 +69,16 @@ jobs:
           git config user.name  "stack-check"
           git config user.email "stack-check@localhost"
           git checkout --detach FETCH_HEAD
+          echo "upstream base: $(git rev-parse HEAD)"
+          merge_log="$RUNNER_TEMP/stack-merge.log"
           fail=0
           for b in ${{ steps.order.outputs.branches }}; do
-            if git merge --no-edit --no-ff "origin/$b" >/dev/null 2>&1; then
+            echo "merging $b at $(git rev-parse origin/$b)"
+            if git merge --no-edit --no-ff "origin/$b" >"$merge_log" 2>&1; then
               echo "::notice::$b merges cleanly"
             else
               echo "::error::$b conflicts with the branches merged before it"
+              cat "$merge_log"
               git diff --diff-filter=U --name-only | sed 's/^/  /'
               git merge --abort
               fail=1
