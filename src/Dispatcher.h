@@ -127,6 +127,11 @@ public:
   virtual Packet* removeOutboundByIdx(int i) = 0;
   virtual void queueInbound(Packet* packet, uint32_t scheduled_for) = 0;
   virtual Packet* getNextInbound(uint32_t now) = 0;
+
+  // Earliest scheduled_for (absolute millis) among queued packets, or 0xFFFFFFFF if the
+  // queue is empty. Used by the low-power idle to know when the next packet becomes due.
+  virtual uint32_t getNextOutboundSchedule() const { return 0xFFFFFFFF; }
+  virtual uint32_t getNextInboundSchedule() const { return 0xFFFFFFFF; }
 };
 
 typedef uint32_t  DispatcherAction;
@@ -291,6 +296,8 @@ public:
   bool tryParsePacket(Packet* pkt, const uint8_t* raw, int len);
 
 private:
+  // Milliseconds until the nearest scheduled wake, capped; 0 = work already due (do not sleep).
+  uint32_t idleSleepMillis(uint32_t now) const;
   void checkRecv();
   void checkSend();
 };
