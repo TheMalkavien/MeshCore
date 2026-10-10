@@ -257,6 +257,7 @@ void RadioLibWrapper::startRecv() {
   int err = startReceiveMode();
   if (err == RADIOLIB_ERR_NONE) {
     state = STATE_RX;
+    if (_nf_calib_active && !_rx_ps_armed) _nf_sample_from = millis() + NF_CALIB_SETTLE_MS;
   } else {
     MESH_DEBUG_PRINTLN("RadioLibWrapper: error: startReceive(%d)", err);
   }
@@ -521,12 +522,14 @@ void RadioLibWrapper::startFloorBatch() {
 }
 
 bool RadioLibWrapper::prepareForSleep() {
+  if ((state & ~STATE_INT_READY) == STATE_TX_WAIT) return true;
   if (state & STATE_INT_READY) return true;
   if ((state & ~STATE_INT_READY) != STATE_RX) startRecv();
   return (state & STATE_INT_READY) != 0 || state != STATE_RX || _nf_calib_active;
 }
 void RadioLibWrapper::applyDefaultRxPowerSaving(uint8_t sf, float bw) {
-#if defined(RXPS_DEFAULT_ENABLED) && RXPS_DEFAULT_ENABLED
+#if (defined(RXPS_DEFAULT_ENABLED) && RXPS_DEFAULT_ENABLED) || \
+    (!defined(RXPS_DEFAULT_ENABLED) && defined(MLK_RP2040_LOWPOWER) && MLK_RP2040_LOWPOWER)
   uint32_t rx_us, sleep_us;
   if (supportsRxPowerSaving() && calcRxPowerSavingLevel(
       RX_POWERSAVING_BALANCED_LEVEL, sf, bw, RX_POWERSAVING_PROFILE_PREAMBLE,

@@ -1456,10 +1456,10 @@ void MyMesh::handleCmdFrame(size_t len) {
       savePrefs();
 
       radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-  normalizeRxPowerSavingConfig(&_prefs.rx_ps, _prefs.sf, _prefs.bw,
+      normalizeRxPowerSavingConfig(&_prefs.rx_ps, _prefs.sf, _prefs.bw,
                               radio_driver.rxPowerSavingCaptureCostSymbols(),
                               radio_driver.rxPowerSavingTransitionUs());
-  radio_driver.setRxPowerSaving(_prefs.rx_ps.enabled, _prefs.rx_ps.rx_us, _prefs.rx_ps.sleep_us);
+      radio_driver.setRxPowerSaving(_prefs.rx_ps.enabled, _prefs.rx_ps.rx_us, _prefs.rx_ps.sleep_us);
       MESH_DEBUG_PRINTLN("OK: CMD_SET_RADIO_PARAMS: f=%d, bw=%d, sf=%d, cr=%d", freq, bw, (uint32_t)sf,
                          (uint32_t)cr);
 
@@ -2089,6 +2089,15 @@ void MyMesh::enterCLIRescue() {
 }
 
 bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char* reply) {
+  while (*command == ' ') command++; // skip leading spaces
+
+  if (strlen(command) > 4 && command[2] == '|') { // optional prefix (for companion radio CLI)
+    memcpy(reply, command, 3);                    // reflect the prefix back
+    reply += 3;
+    *reply = 0;
+    command += 3;
+  }
+
   if (strcmp(command, "get rxps") == 0) {
     RXPowerSavingCLI::get(&_prefs.rx_ps, &radio_driver, _prefs.sf, _prefs.bw, reply, 160);
     return true;
@@ -2097,15 +2106,6 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
     if (RXPowerSavingCLI::set(command + 9, _prefs.sf, _prefs.bw,
                             &_prefs.rx_ps, &radio_driver, reply, 160)) savePrefs();
     return true;
-  }
-
-  while (*command == ' ') command++; // skip leading spaces
-
-  if (strlen(command) > 4 && command[2] == '|') { // optional prefix (for companion radio CLI)
-    memcpy(reply, command, 3);                    // reflect the prefix back
-    reply += 3;
-    *reply = 0;
-    command += 3;
   }
 
   if (_prefs.getRadioPrefs()->handleCommand(command, sender_timestamp, reply)) {  // is radio CLI command?
