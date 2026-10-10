@@ -139,6 +139,8 @@ jobs:
         include:
           - branch: feature/core-enhancements
             env: waveshare_rp2040_lora_repeater
+          - branch: feature/lbt-collision-avoidance
+            env: waveshare_rp2040_lora_repeater
           - branch: feature/repeater-ping
             env: waveshare_rp2040_lora_repeater
           - branch: feature/repeater-flood-retry
