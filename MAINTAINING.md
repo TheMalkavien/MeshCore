@@ -438,3 +438,19 @@ upstream project.
 
 `rp2040-lowpower`, `companion-tools` and `packaging/mlk-defaults` are legitimately
 fork-specific and will stay.
+
+
+## RX power saving v2
+
+`feature/rxps-v2` is based on `feature/core-enhancements` and belongs in the
+integration after `feature/rp2040-lowpower` / `feature/lora-ota`. It introduces
+shared SX1262/LR1110 duty-cycle support, preserved receive-header deadlines and
+radio IRQ hooks. Those driver changes overlap the existing LBT and RP2040
+branches: the resolved merge in `review/rxps-v2-integration` preserves their
+changes and is the build-verified reference for these overlaps. As with any
+restack conflict, inspect the resolution and build before publishing.
+
+`feature/rxps-v2-esp32` carries the adaptation on top of `HTv4LowPower`, including
+its event loops, receive metadata handling and watchdog. `feature/rxps-v2-tracker`
+carries the T1000-E corrections on top of `sensor_tracker`. They stay separate
+from the patch_public stack.
