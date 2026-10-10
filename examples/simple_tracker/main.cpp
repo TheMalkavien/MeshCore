@@ -163,4 +163,7 @@ void loop() {
     the_mesh.queueImmediateCycle("button");
   }
   rtc_clock.tick();
+#if defined(NRF52_PLATFORM)
+  delay(2);  // block the ready task briefly while GPS/serial remain responsive
+#endif
 }

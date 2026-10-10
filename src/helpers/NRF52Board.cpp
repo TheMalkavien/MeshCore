@@ -5,6 +5,7 @@
 #include <nrf.h>
 #include <nrf_gpio.h>
 #include <nrf_soc.h>
+#include <nrf_nvic.h>
 
 static BLEDfu bledfu;
 
@@ -20,7 +21,8 @@ static void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
   MESH_DEBUG_PRINTLN("BLE client disconnected");
 }
 
-#if defined(NRF_RTC2) && defined(RTC2_IRQn)
+// RTC2_IRQn is a CMSIS enum value, not a preprocessor macro.
+#if defined(NRF_RTC2)
 namespace {
 volatile bool g_nrf52_sleep_rtc_fired = false;
 bool g_nrf52_sleep_rtc_initialized = false;
@@ -423,7 +425,7 @@ void NRF52Board::sleep(uint32_t secs) {
     wake_deadline_ms = millis() + (uint32_t)delta_ms;
   }
 
-  #if defined(NRF_RTC2) && defined(RTC2_IRQn)
+  #if defined(NRF_RTC2)
   if (secs > 0) nrf52_sleep_timer_arm(secs);
   #endif
 
@@ -461,7 +463,7 @@ void NRF52Board::sleep(uint32_t secs) {
       bool wake_from_deadline = false;
       bool wake_from_button = false;
       bool wake_from_vbus = false;
-    #if defined(NRF_RTC2) && defined(RTC2_IRQn)
+    #if defined(NRF_RTC2)
       wake_from_timer = (secs > 0) && g_nrf52_sleep_rtc_fired;
     #endif
       wake_from_deadline = (secs > 0) && ((int32_t)(millis() - wake_deadline_ms) >= 0);
@@ -479,7 +481,7 @@ void NRF52Board::sleep(uint32_t secs) {
   }
   #endif
 
-  #if defined(NRF_RTC2) && defined(RTC2_IRQn)
+  #if defined(NRF_RTC2)
   if (secs > 0) nrf52_sleep_timer_disarm();
   #endif
 }
