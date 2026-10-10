@@ -63,7 +63,7 @@ retry fallback over 7680 parameter combinations. On a native compiler:
     ./rxps-tests
 
 To verify the tracker timer, inspect the firmware symbols for RTC2_IRQHandler
-and nrf52_sleep_timer_arm. Then test a short interval on hardware, button/USB
+(a strong symbol; timer helpers may be inlined). Then test a short interval on hardware, button/USB
 wakeup, radio TX/RX after wake and GPS power gating before a long battery run.
 
 ## Branches
@@ -76,3 +76,31 @@ packaging/mlk-defaults: restack registration and maintenance documentation.
 
 The original patch_public worktree and its uncommitted changes are untouched.
 Nothing has been pushed, flashed or measured on hardware.
+
+
+## Verified build run: 2026-10-10
+
+All six selected PlatformIO builds passed:
+
+| Branch | Environment |
+| --- | --- |
+| review/rxps-v2-integration | RAK_WisMesh_Tag_companion_radio_ble |
+| review/rxps-v2-integration | t1000e_companion_radio_ble |
+| review/rxps-v2-integration | waveshare_rp2040_lora_repeater_lowpower |
+| feature/rxps-v2-esp32 | Heltec_v3_companion_radio_ble_idf |
+| feature/rxps-v2-esp32 | heltec_v4_companion_radio_ble_idf |
+| feature/rxps-v2-tracker | t1000e_tracker |
+
+The native C++ invariants test passed 7296 guarded geometries; another 384
+combinations were correctly unavailable. Input validation, stale timing rejection
+and three-failure retry fallback also passed. Both RXPS branches use the same
+calculator implementation.
+
+The linked tracker ELF exposes a strong (`T`) RTC2_IRQHandler symbol, replacing
+the framework's weak handler. The compilation also checks the SoftDevice-aware
+NVIC calls. Radio-off sleep and the GPS power gating remain in the tracker.
+
+The ESP32 task event-loop, PM and BLE transport source files have no differences
+from HTv4LowPower. The RP2040 integration retains the existing Dispatcher deadlines,
+MCU clock/voltage profile and OTA behavior. Restack shell syntax and merge order
+were checked. No RF loss, current draw or battery lifetime was measured.
