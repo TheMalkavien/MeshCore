@@ -27,6 +27,8 @@ INTEGRATION_ENVS = [
     "waveshare_rp2040_lora_repeater_ota_esp32",
     "Heltec_v3_repeater",
     "Heltec_v3_companion_radio_usb",
+    "RAK_WisMesh_Tag_companion_radio_ble",
+    "t1000e_companion_radio_ble",
 ]
 
 

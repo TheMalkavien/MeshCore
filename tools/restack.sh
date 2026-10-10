@@ -44,10 +44,9 @@ INTEGRATION=${INTEGRATION:-patch_public}
 # See do_rebase() for why the old bases must be captured before anything moves.
 STACK=(
   "feature/core-enhancements    : $BASE"
-  # Rooted on $BASE rather than on core-enhancements: it is a self-contained fix to the
-  # listen-before-talk gate, so it stays offerable upstream as-is. The cost is that it and
-  # core-enhancements both edit Dispatcher.{h,cpp}, so integrate resolves that overlap.
-  "feature/lbt-collision-avoidance : $BASE"
+  # Activity/deadline reporting, calibration and IRQ hooks are shared with RXPS
+  # and RP2040 in core-enhancements. LBT owns only the dispatch policy above them.
+  "feature/lbt-collision-avoidance : feature/core-enhancements"
   "feature/repeater-ping        : feature/core-enhancements"
   "feature/repeater-flood-retry : feature/repeater-ping"
   "feature/rp2040-lowpower      : feature/core-enhancements"
@@ -59,12 +58,11 @@ STACK=(
 
 # Merge order into the integration branch. Order matters: the two chains must go
 # in dependency order, and packaging stays last so its distribution defaults win.
-# lbt-collision-avoidance goes first because it is the only other branch rooted on
-# $BASE, so its merge is always a trivial one and the overlap with core-enhancements
-# is resolved once, in core-enhancements' merge.
+# Merge shared interfaces before their consumers. No integration-only conflict
+# resolution or local rerere cache is needed to reconstruct the stack in CI.
 MERGE_ORDER=(
-  feature/lbt-collision-avoidance
   feature/core-enhancements
+  feature/lbt-collision-avoidance
   feature/repeater-ping
   feature/repeater-flood-retry
   feature/rp2040-lowpower

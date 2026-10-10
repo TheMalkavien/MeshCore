@@ -34,6 +34,8 @@ away and rebuilt. That is what keeps its history readable, and what makes
 ```
 upstream/dev
  └─ feature/core-enhancements          shared hardening + the hooks the others need
+     ├─ feature/lbt-collision-avoidance  dispatch policy using shared radio hooks
+     ├─ feature/rxps-v2                 SX1262/LR1110 receive duty cycle
      ├─ feature/repeater-ping           'ping' CLI command
      │   └─ feature/repeater-flood-retry   conditional flood retry
      ├─ feature/rp2040-lowpower         low-power idle, clock/voltage profiles
@@ -67,6 +69,7 @@ both sit on does.
 | `Dispatcher::nextAppWake()` | `ping` reports its in-flight deadline, `flood-retry` its earliest retry, `rp2040-lowpower` consults both |
 | `MainBoard::isOTASessionActive()` | `lora-ota` overrides it, `rp2040-lowpower` refuses to sleep while it is true |
 | `CommonCLI::getCommandPrefixLen()` | `ping` reflects the client's token on async replies, `lora-ota` recognises its own commands through it — and the repeater, room server and sensor all strip it |
+| Radio activity/airtime reporting, noise-floor calibration and weak radio IRQ/sleep hooks | `lbt-collision-avoidance`, `rp2040-lowpower`, `rxps-v2` |
 
 Each of these arrived the same way: as a conflict during `integrate`, between
 two branches that had both grown a copy. **That is the signal.** When two of
@@ -442,13 +445,17 @@ fork-specific and will stay.
 
 ## RX power saving v2
 
-`feature/rxps-v2` is based on `feature/core-enhancements` and belongs in the
-integration after `feature/rp2040-lowpower` / `feature/lora-ota`. It introduces
-shared SX1262/LR1110 duty-cycle support, preserved receive-header deadlines and
-radio IRQ hooks. Those driver changes overlap the existing LBT and RP2040
-branches: the resolved merge in `review/rxps-v2-integration` preserves their
-changes and is the build-verified reference for these overlaps. As with any
-restack conflict, inspect the resolution and build before publishing.
+`feature/rxps-v2` and `feature/lbt-collision-avoidance` are based on
+`feature/core-enhancements`. Shared radio activity/airtime reporting, calibration
+and weak IRQ/sleep hooks belong to that parent; RXPS owns duty-cycle support,
+LBT owns the dispatch policy, and RP2040 owns MCU sleep and clock/voltage policy.
+This prevents driver and interface conflicts when rebuilding the stack without
+a local rerere cache. LBT previously branched directly from upstream; its parent
+and the merge order in `tools/restack.sh` now reflect the shared dependency.
+
+The earlier resolved merge in `review/rxps-v2-integration` remains a reference
+for the validated radio behavior. A production integration is regenerated from
+the source branches on `upstream/dev`, rather than copying that merge history.
 
 `feature/rxps-v2-esp32` carries the adaptation on top of `HTv4LowPower`, including
 its event loops, receive metadata handling and watchdog. `feature/rxps-v2-tracker`
