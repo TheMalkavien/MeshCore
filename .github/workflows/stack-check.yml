@@ -15,6 +15,7 @@ on:
       - feature/repeater-flood-retry
       - feature/lora-ota
       - feature/rp2040-lowpower
+      - feature/rxps-v2
       - tools/companion-tools
       - packaging/mlk-defaults
   schedule:
@@ -104,6 +105,8 @@ jobs:
           - waveshare_rp2040_lora_repeater_ota_esp32
           - Heltec_v3_repeater
           - Heltec_v3_companion_radio_usb
+          - RAK_WisMesh_Tag_companion_radio_ble
+          - t1000e_companion_radio_ble
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -139,6 +142,8 @@ jobs:
             env: waveshare_rp2040_lora_repeater
           - branch: feature/rp2040-lowpower
             env: waveshare_rp2040_lora_repeater_lowpower
+          - branch: feature/rxps-v2
+            env: t1000e_companion_radio_ble
     steps:
       - uses: actions/checkout@v6
         with:
