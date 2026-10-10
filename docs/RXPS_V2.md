@@ -74,8 +74,10 @@ feature/rxps-v2-tracker: corrections based on sensor_tracker.
 review/rxps-v2-integration: resolved candidate based on patch_public.
 packaging/mlk-defaults: restack registration and maintenance documentation.
 
-The original patch_public worktree and its uncommitted changes are untouched.
-Nothing has been pushed, flashed or measured on hardware.
+Production targets are `patch_public` for the common radio/RP2040 changes,
+`HTv4LowPower` for the ESP32 adaptation, and `sensor_tracker` for the tracker.
+The feature branches remain the source of truth. Production promotion preserves
+uncommitted local changes and uses the firmware code validated below.
 
 
 ## Verified build run: 2026-10-10
