@@ -76,6 +76,9 @@ public:
   bool isReceivingPacket() override {
     return ((CustomLR2021 *)_radio)->isReceiving();
   }
+  bool isReceivingHeader() override {
+    return ((CustomLR2021 *)_radio)->isHeaderSeen();
+  }
 
   float getCurrentRSSI() override {
     float rssi = -110;

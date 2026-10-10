@@ -26,6 +26,9 @@ public:
   bool isReceivingPacket() override { 
     return ((CustomSX1268 *)_radio)->isReceiving();
   }
+  bool isReceivingHeader() override {
+    return ((CustomSX1268 *)_radio)->isHeaderSeen();
+  }
   float getCurrentRSSI() override {
     return ((CustomSX1268 *)_radio)->getRSSI(false);
   }
