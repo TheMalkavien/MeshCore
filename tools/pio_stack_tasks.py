@@ -106,12 +106,12 @@ def _run_tools_tests(*_args, **_kwargs):
 TASKS = [
     ("stack-check", _restack("check"),
      "1. Check (read-only)",
-     "How far behind upstream, and whether the seven branches still merge. "
+     "How far behind upstream, and whether the source branches still merge. "
      "Touches nothing."),
 
     ("stack-rebase", _restack("rebase"),
      "2. Rebase onto upstream",
-     "Restacks all seven branches onto their parents. REWRITES your branches. "
+     "Restacks all source branches onto their parents. REWRITES your branches. "
      "All-or-nothing: never rebase one by hand first."),
 
     ("stack-integrate", _restack("integrate"),
@@ -126,7 +126,7 @@ TASKS = [
 
     ("stack-push", _restack("push"),
      "5. Push to origin",
-     "Force-pushes the seven branches and patch_public. Shows what moves and asks "
+     "Force-pushes the source branches and patch_public. Shows what moves and asks "
      "first. It cannot tell whether you ran step 4 - if you did not, say no."),
 
     ("stack-tests", _run_tools_tests,

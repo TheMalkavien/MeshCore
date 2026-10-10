@@ -16,8 +16,8 @@ Three kinds of objects. Confusing them is the only way to get into trouble.
 | | what it is | do you edit it? |
 |---|---|---|
 | `upstream/dev` | the moving floor, from `meshcore-dev/MeshCore` | never |
-| the 7 feature branches | **the source of truth** — one feature each | yes, this is where you work |
-| `patch_public` | **a build artifact**, regenerated from the 7 | never directly |
+| the source branches | **the source of truth** — one feature each | yes, this is where you work |
+| `patch_public` | **a build artifact**, regenerated from the stack | never directly |
 
 `patch_public` is never edited and never merged into incrementally. It is thrown
 away and rebuilt. That is what keeps its history readable, and what makes
@@ -89,7 +89,7 @@ these.
 
 **Never `git pull` or `git merge upstream` into a stack branch.** Branches must
 stay linear on top of their parent. A merge commit inside one desynchronises the
-stack (that branch is up to date, the other six are not) and makes the next
+stack (that branch is up to date, the others are not) and makes the next
 rebase drop the merge and replay badly. Updating from upstream is
 `./tools/restack.sh rebase`, applied to the *whole* stack, never to one branch.
 
@@ -97,7 +97,7 @@ rebase drop the merge and replay badly. Updating from upstream is
 computes every branch's old base from the state it finds. If you have already
 moved one, its old tip is no longer an ancestor of its children, the computed
 bases are wrong, and the parent's commits get replayed a second time on top of
-themselves. It is all-or-nothing: let the script do all seven, or none.
+themselves. It is all-or-nothing: let the script do the whole stack, or none.
 
 > This includes "just this one branch, to get past a conflict". If you do end up
 > rebasing by hand — resolving a conflict the script stopped on is exactly that —
@@ -152,11 +152,11 @@ Same commands without PlatformIO — `Ctrl+Shift+P` → **Tasks: Run Task** →
 
 | task | what it does | destructive? |
 |---|---|---|
-| **Stack: check (read-only)** | how far behind upstream, and whether the 7 still merge | no |
-| **Stack: rebase onto upstream** | restacks all seven onto their parents | **rewrites branches** |
+| **Stack: check (read-only)** | how far behind upstream, and whether the source branches still merge | no |
+| **Stack: rebase onto upstream** | restacks all source branches onto their parents | **rewrites branches** |
 | **Stack: regenerate patch_public** | rebuilds the integration branch (asks first) | **rewrites `patch_public`** |
-| **Stack: build integration** | builds 5 environments | no |
-| **Stack: push to origin** | force-pushes the seven branches and `patch_public` | **rewrites published history** |
+| **Stack: build integration** | builds the 7 integration environments | no |
+| **Stack: push to origin** | force-pushes the source branches and `patch_public` | **rewrites published history** |
 | **Stack: update from upstream (full)** | rebase + regenerate + build — never pushes | **rewrites branches** |
 | **Stack: run tools unit tests** | the Python tests | no |
 
@@ -175,7 +175,7 @@ This is the whole of it. There is no separate "update dev" step.
 
 ```bash
 ./tools/restack.sh check       # 1. read-only. Nothing is touched.
-./tools/restack.sh rebase      # 2. rewrites all seven branches
+./tools/restack.sh rebase      # 2. rewrites all source branches
 ./tools/restack.sh integrate   # 3. rebuilds patch_public (asks for confirmation)
                                # 4. build - Stack: build integration
 ./tools/restack.sh push        # 5. publishes the whole set (asks for confirmation)
@@ -235,7 +235,7 @@ old base is already the parent's tip, and moves on.
 ### Example — a conflict during `integrate`
 
 ```
-== merging 7 branches onto a4ab7f0e
+== merging 9 branches onto a4ab7f0e
   feature/core-enhancements          ok
   feature/repeater-ping              ok
   feature/repeater-flood-retry       conflict
@@ -271,7 +271,7 @@ branch has no legitimate claim on those lines.
 ./tools/restack.sh push
 ```
 
-All seven branches were rewritten, so this is a force push. It lists what moves,
+All source branches were rewritten, so this is a force push. It lists what moves,
 warns that it cannot tell whether you built, and asks before doing anything. It
 uses `--force-with-lease`, never plain `--force`: that refuses if someone (or
 another machine of yours) pushed in the meantime.
@@ -386,13 +386,13 @@ is the right answer; they almost certainly do not need OTA or ping.
 ## 7. CI
 
 [`.github/workflows/stack-check.yml`](.github/workflows/stack-check.yml) runs on
-push to any of the 7 branches, **nightly**, and on demand. The nightly run is the
+push to any source branch, **nightly**, and on demand. The nightly run is the
 point: upstream drift breaks the stack silently, and a push trigger alone would
 never notice.
 
 | job | question it answers |
 |---|---|
-| `integrate` | do the 7 still merge onto current upstream, in order? |
+| `integrate` | do the source branches still merge onto current upstream, in order? |
 | `build-integration` | does the merged result actually compile? |
 | `build-branches` | does each branch still stand on its own? |
 | `test-tools` | do the Python tests pass? |
@@ -430,7 +430,7 @@ Two consequences of that choice, neither serious:
 
 ## 8. The real goal
 
-No tooling makes a 7-branch stack free to maintain. The only way to lower the
+No tooling makes a patch stack free to maintain. The only way to lower the
 cost is to make the stack **shorter**.
 
 `feature/core-enhancements`, `feature/repeater-ping` and
