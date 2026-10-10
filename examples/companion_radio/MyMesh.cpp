@@ -1,3 +1,4 @@
+#include <helpers/radiolib/RXPowerSavingCLI.h>
 #include "MyMesh.h"
 
 #include <Arduino.h> // needed for PlatformIO
@@ -913,6 +914,9 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   memset(send_scope.key, 0, sizeof(send_scope.key));
   send_unscoped = false;
 
+#if defined(RXPS_DEFAULT_ENABLED) && RXPS_DEFAULT_ENABLED
+  _prefs.rx_ps.enabled = 1;
+#endif
   // defaults
   _prefs.airtime_factor = 1.0;
   _prefs.tx_delay_factor = 0.5f;
@@ -1003,6 +1007,10 @@ void MyMesh::begin() {
   _store->loadChannels(this);
 
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  normalizeRxPowerSavingConfig(&_prefs.rx_ps, _prefs.sf, _prefs.bw,
+                              radio_driver.rxPowerSavingCaptureCostSymbols(),
+                              radio_driver.rxPowerSavingTransitionUs());
+  radio_driver.setRxPowerSaving(_prefs.rx_ps.enabled, _prefs.rx_ps.rx_us, _prefs.rx_ps.sleep_us);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
 
@@ -1448,6 +1456,10 @@ void MyMesh::handleCmdFrame(size_t len) {
       savePrefs();
 
       radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  normalizeRxPowerSavingConfig(&_prefs.rx_ps, _prefs.sf, _prefs.bw,
+                              radio_driver.rxPowerSavingCaptureCostSymbols(),
+                              radio_driver.rxPowerSavingTransitionUs());
+  radio_driver.setRxPowerSaving(_prefs.rx_ps.enabled, _prefs.rx_ps.rx_us, _prefs.rx_ps.sleep_us);
       MESH_DEBUG_PRINTLN("OK: CMD_SET_RADIO_PARAMS: f=%d, bw=%d, sf=%d, cr=%d", freq, bw, (uint32_t)sf,
                          (uint32_t)cr);
 
@@ -2077,6 +2089,16 @@ void MyMesh::enterCLIRescue() {
 }
 
 bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char* reply) {
+  if (strcmp(command, "get rxps") == 0) {
+    RXPowerSavingCLI::get(&_prefs.rx_ps, &radio_driver, _prefs.sf, _prefs.bw, reply, 160);
+    return true;
+  }
+  if (strncmp(command, "set rxps ", 9) == 0) {
+    if (RXPowerSavingCLI::set(command + 9, _prefs.sf, _prefs.bw,
+                            &_prefs.rx_ps, &radio_driver, reply, 160)) savePrefs();
+    return true;
+  }
+
   while (*command == ' ') command++; // skip leading spaces
 
   if (strlen(command) > 4 && command[2] == '|') { // optional prefix (for companion radio CLI)

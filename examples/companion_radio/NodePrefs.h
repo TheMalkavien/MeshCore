@@ -3,6 +3,7 @@
 #include <helpers/ConfigSerializer.h>
 #include <helpers/CommonRadioPrefs.h>
 #include <helpers/DynamicConfigSerializer.h>
+#include <helpers/radiolib/RXPowerSaving.h>
 
 #define TELEM_MODE_DENY            0
 #define TELEM_MODE_ALLOW_FLAGS     1     // use contact.flags
@@ -13,6 +14,7 @@
 
 class NodePrefs : public ConfigSerializer {  // persisted to file
 public:
+  RxPowerSavingConfig rx_ps;
   float airtime_factor = 0;
   char node_name[32];
   double node_lat = 0, node_lon = 0;
@@ -64,6 +66,11 @@ private:
     NodePrefs* _parent;
   protected:
     void structure() override {
+      def("rxps", _parent->rx_ps.enabled);
+      def("rxps_level", _parent->rx_ps.level);
+      def("rxps_preamble", _parent->rx_ps.preamble);
+      def("rxps_rx_us", _parent->rx_ps.rx_us);
+      def("rxps_sleep_us", _parent->rx_ps.sleep_us);
       def("freq", _parent->freq);
       def("bw", _parent->bw);
       def("sf", _parent->sf);
