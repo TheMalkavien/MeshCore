@@ -51,6 +51,7 @@ STACK=(
   "feature/repeater-ping        : feature/core-enhancements"
   "feature/repeater-flood-retry : feature/repeater-ping"
   "feature/rp2040-lowpower      : feature/core-enhancements"
+  "feature/rxps-v2             : feature/core-enhancements"
   "feature/lora-ota             : feature/rp2040-lowpower"
   "tools/companion-tools        : feature/core-enhancements"
   "packaging/mlk-defaults       : feature/core-enhancements"
@@ -68,6 +69,7 @@ MERGE_ORDER=(
   feature/repeater-flood-retry
   feature/rp2040-lowpower
   feature/lora-ota
+  feature/rxps-v2
   tools/companion-tools
   packaging/mlk-defaults
 )
