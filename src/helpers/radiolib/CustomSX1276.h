@@ -72,6 +72,12 @@ class CustomSX1276 : public SX1276 {
         | RH_RF95_MODEM_STATUS_HEADER_INFO_VALID)) != 0;
     }
 
+    // Signal-detect and header-valid are separate live bits, so the two busy conditions can
+    // be told apart here too. No latching needed: this reads current modem status.
+    bool isHeaderSeen() {
+      return (getModemStatus() & RH_RF95_MODEM_STATUS_HEADER_INFO_VALID) != 0;
+    }
+
     int tryScanChannel() {
       // start CAD
       int16_t state = startChannelScan();
