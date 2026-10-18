@@ -19,6 +19,17 @@ const OTA_BIN_OP = {
 // est tronquée et la cible rejette silencieusement chaque write (vérifié sur
 // le terrain avec 160). 132 garde une marge et reste la valeur éprouvée.
 const OTA_BINARY_MAX_CHUNK = 132;
+// Silence après un STATUS resté sans réponse, avant d'émettre à nouveau : délai
+// de réponse de la cible (40 ms), écoute avant émission (jusqu'à ~400 ms), puis
+// la réponse elle-même (~50 ms à SF5). En dessous, une réponse tardive percute
+// la requête suivante.
+const OTA_STATUS_QUIET_MS = 700;
+// Réparation par NACK sélectif : tentatives de STATUS de confirmation après un
+// renvoi, rounds au plus par bloc, et rounds consécutifs sans progrès tolérés
+// avant de se replier sur le rembobinage.
+const OTA_REPAIR_STATUS_ATTEMPTS = 3;
+const OTA_REPAIR_MAX_ROUNDS = 12;
+const OTA_REPAIR_MAX_STALLS = 3;
 const CMD_GET_DEVICE_TIME = 5;
 const CMD_RESET_PATH = 13;
 const CMD_SET_DEVICE_TIME = 6;
@@ -777,7 +788,69 @@ function parseOtaStatus(text) {
       }
     }
   }
+  // Bitmap complet (cibles annonçant 'mb=1', sur demande) : ' mb=<base>:<chunk>:<hex>',
+  // un bit par emplacement de chunk du bloc courant (1 = incomplet), bit de poids
+  // faible d'abord, 4 bits par chiffre hexa. Contrairement à 'miss=' (8 trous au
+  // plus, sans la fin de bloc), il est exhaustif.
+  const mbM = /\bmb=(\d+):(\d+):([0-9a-f]+)/i.exec(text || "");
+  if (mbM) {
+    const base = Number.parseInt(mbM[1], 10);
+    const chunk = Number.parseInt(mbM[2], 10);
+    const blkM = /blk=(\d+)/.exec(text || "");
+    const blockEnd = base + (blkM ? Number.parseInt(blkM[1], 10) : Number.POSITIVE_INFINITY);
+    const bits = mbM[3];
+    const slots = bits.length * 4;
+    const missing = [];
+    let runStart = -1;
+    for (let s = 0; s <= slots; s += 1) {
+      const bit = s < slots ? (Number.parseInt(bits[s >> 2], 16) >> (s & 3)) & 1 : 0;
+      if (bit && runStart < 0) runStart = s;
+      if (!bit && runStart >= 0) {
+        const off = base + (runStart * chunk);
+        const end = Math.min(base + (s * chunk), blockEnd);   // dernier emplacement partiel
+        if (end > off) missing.push({ off, len: end - off });
+        runStart = -1;
+      }
+    }
+    status.missing = missing;
+    status.exhaustive = true;
+  }
   return status;
+}
+
+// Table des vecteurs attendue par une image RP2040, lue dans ses premiers octets.
+// Image standard : boot2 de 256 octets, vecteurs à +0x100. Image liée derrière un
+// bootloader (flasheur ESP32, dual OTA) : vecteurs à 0. Le reset handler suit la
+// table, sa page de 4 Ko donne l'origine. 0 si ce n'est pas une image RP2040.
+// Même règle que RP2040OTAController (imageVectorTable), qui annonce 'vtor='.
+function rp2040ImageVectorTable(bytes) {
+  if (!bytes || bytes.length < 0x108) return 0;
+  const looks = (o) => {
+    const sp = parseU32LE(bytes, o) >>> 0;
+    const reset = parseU32LE(bytes, o + 4) >>> 0;
+    const addr = (reset & ~1) >>> 0;
+    return (sp & 3) === 0 && sp >= 0x20000000 && sp <= 0x20082000
+      && (reset & 1) === 1 && addr >= 0x10000000 && addr < 0x11000000;
+  };
+  if (looks(0)) return (parseU32LE(bytes, 4) & ~0xfff) >>> 0;
+  if (looks(0x100)) return (((parseU32LE(bytes, 0x104) & ~0xfff) >>> 0) + 0x100) >>> 0;
+  return 0;
+}
+
+function describeRp2040Layout(vtor) {
+  switch (vtor >>> 0) {
+    case 0x10000100: return "standard (0x10000000)";
+    case 0x10004000: return "derrière le flasheur ESP32 (0x10004000, env _ota_esp32)";
+    case 0x10007000: return "dual OTA (0x10007000, env _dual_ota_lora)";
+    case 0: return "non reconnue (pas une image RP2040 brute)";
+    default: return `vecteurs à 0x${(vtor >>> 0).toString(16)}`;
+  }
+}
+
+function throwIfWrongImage(replyText) {
+  if (/wrong image/i.test(String(replyText || ""))) {
+    throw new Error(`Image refusée par la cible : ${String(replyText).trim()}`);
+  }
 }
 
 function parseOtaOffsetError(text) {
@@ -3285,13 +3358,21 @@ async function getOtaStatus(targetHex, timeoutSec = 10) {
   return { reply: null, status: null, error: lastErr };
 }
 
-async function getOtaStatusBinary(targetFullKeyHex, maxAttempts = 2, timeoutMs = 4000) {
+// opts.bitmapChunk : demande le bitmap complet des trous (cibles 'mb=1'). Les
+// cibles plus anciennes ignorent ces deux octets et répondent comme avant.
+// opts.quietMs : silence avant une nouvelle tentative. Après un timeout, la
+// réponse peut encore arriver (délai de réponse, écoute avant émission, flush) :
+// relancer aussitôt la fait entrer en collision avec la requête suivante.
+async function getOtaStatusBinary(targetFullKeyHex, maxAttempts = 2, timeoutMs = 4000, opts = {}) {
+  const statusPayload = opts.bitmapChunk
+    ? Uint8Array.of(0x01, opts.bitmapChunk & 0xff)
+    : new Uint8Array();
   let lastErr = null;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     let res = await client.sendOtaBinaryCmd(
       targetFullKeyHex,
       OTA_BIN_OP.STATUS,
-      new Uint8Array(),
+      statusPayload,
       true,
       timeoutMs,
       250
@@ -3309,7 +3390,7 @@ async function getOtaStatusBinary(targetFullKeyHex, maxAttempts = 2, timeoutMs =
       res = await client.sendOtaBinaryCmd(
         targetFullKeyHex,
         OTA_BIN_OP.STATUS,
-        new Uint8Array(),
+        statusPayload,
         true,
         timeoutMs,
         250
@@ -3319,7 +3400,7 @@ async function getOtaStatusBinary(targetFullKeyHex, maxAttempts = 2, timeoutMs =
       return { reply: res.replyText, status: parseOtaStatus(res.replyText), error: null };
     }
     lastErr = res.error;
-    if (attempt + 1 < maxAttempts) await sleep(150 * (attempt + 1));
+    if (attempt + 1 < maxAttempts) await sleep(opts.quietMs ?? (150 * (attempt + 1)));
   }
   return { reply: null, status: null, error: lastErr };
 }
@@ -3543,6 +3624,17 @@ async function runBinaryOta(params) {
   let classicReplayBytes = 0;
   let resyncEvents = 0;
   let selectiveNackCapability = null;
+  // 'mb=1' dans la réponse START : la cible sait répondre au STATUS par un
+  // bitmap complet des trous. Annoncé seulement par les firmwares récents.
+  let bitmapCapable = false;
+  const statusOpts = () => (bitmapCapable
+    ? { bitmapChunk: chunkSize, quietMs: OTA_STATUS_QUIET_MS }
+    : { quietMs: OTA_STATUS_QUIET_MS });
+  const clampMissing = (list) => (list || [])
+    .filter((r) => r.off >= 0 && r.off < fwSize && r.len > 0)
+    .map((r) => ({ off: r.off, len: Math.min(r.len, fwSize - r.off) }));
+  const sameRanges = (a, b) => a.length === b.length
+    && a.every((r, i) => r.off === b[i].off && r.len === b[i].len);
   otaBusyStats.events = 0;
   otaBusyStats.sleepMs = 0;
 
@@ -3740,6 +3832,28 @@ async function runBinaryOta(params) {
           + `de ${targetFlushBlock} octets.`
         );
       }
+
+      if (/\bmb=1\b/.test(startReply) && chunkSize <= 255) {
+        bitmapCapable = true;
+        appendLog("Bitmap des trous: supporté par la cible (liste exhaustive, fin de bloc comprise).");
+      }
+
+      // 'vtor=' : disposition flash de la cible. Une image liée pour une autre
+      // disposition ne démarrerait pas ; on la refuse avant d'envoyer quoi que
+      // ce soit (la cible la refuserait aussi, mais seulement après réception).
+      const vtorMatch = /\bvtor=([0-9a-f]{8})\b/i.exec(startReply);
+      const rawImage = firmwareVariants?.raw?.bytes;
+      if (vtorMatch && rawImage) {
+        const targetVtor = Number.parseInt(vtorMatch[1], 16) >>> 0;
+        const imageVtor = rp2040ImageVectorTable(rawImage);
+        if (imageVtor !== targetVtor) {
+          throw new Error(
+            `Image incompatible avec la cible : image ${describeRp2040Layout(imageVtor)}, `
+            + `cible ${describeRp2040Layout(targetVtor)}. Envoie le build correspondant à la cible.`
+          );
+        }
+        appendLog(`Disposition flash: ${describeRp2040Layout(targetVtor)}, identique pour l'image.`);
+      }
     }
 
     if (startRes.routeFlood !== undefined) {
@@ -3770,7 +3884,7 @@ async function runBinaryOta(params) {
         Uint8Array.of(ackEvery & 0xff),
         md5Bytes
       );
-      const beginRes = await client.sendOtaBinaryCmd(
+      const sendBegin = () => client.sendOtaBinaryCmd(
         targetFullKeyHex,
         OTA_BIN_OP.BEGIN,
         beginPayload,
@@ -3778,6 +3892,21 @@ async function runBinaryOta(params) {
         8000,
         500
       );
+      let beginRes = await sendBegin();
+      if (beginRes.error?.startsWith("timeout waiting binary reply")) {
+        // Le BEGIN a pu être appliqué et seule sa réponse perdue : on demande
+        // avant de le renvoyer, un second BEGIN sur une session active
+        // échouerait ("already running").
+        await sleep(OTA_STATUS_QUIET_MS);
+        const st = await getOtaStatusBinary(targetFullKeyHex, 3, statusTimeout, { quietMs: OTA_STATUS_QUIET_MS });
+        if (st.status && st.status.total === fwSize) {
+          appendLog("BEGIN sans réponse mais appliqué (confirmé par STATUS).");
+          beginRes = { replyText: "OK - OTA begin" };
+        } else if (/\barmed\b/i.test(String(st.reply || ""))) {
+          appendLog("BEGIN perdu (cible encore armée) : nouvel envoi…");
+          beginRes = await sendBegin();
+        }
+      }
       if (beginRes.error) {
         throw new Error(`OTA begin failed (binary): ${beginRes.error}`);
       }
@@ -3897,7 +4026,8 @@ async function runBinaryOta(params) {
         updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
 
         attempt += 1;
-        const st = await getOtaStatusBinary(targetFullKeyHex, 1, quickStatusTimeout);
+        const st = await getOtaStatusBinary(targetFullKeyHex, 1, quickStatusTimeout, statusOpts());
+        throwIfWrongImage(st.reply);
         if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
           const srvOffset = st.status.done;
           if (srvOffset !== offset) {
@@ -3920,7 +4050,7 @@ async function runBinaryOta(params) {
 
         if (attempt < writeMaxRetries) {
           appendLog(`Retry write (binary) at offset ${offset} (${attempt}/${writeMaxRetries}): ${failure}`);
-          await sleep(120 * attempt);
+          await sleep(st.error ? OTA_STATUS_QUIET_MS : 120 * attempt);
           continue;
         }
 
@@ -3977,13 +4107,13 @@ async function runBinaryOta(params) {
         let checkpointOk = false;
         failure = "checkpoint status missing";
         const checkpointStartMs = performance.now();
+        // Les cibles 'mb=1' écrivent le bloc complet en flash en répondant à ce
+        // STATUS (plus en plein flux) : leur réponse peut prendre ce temps-là.
+        const checkpointTimeout = Math.max(bitmapCapable ? 3000 : 1500, checkpointTimeoutMs, statusTimeout);
 
         for (let attempt = 1; attempt <= checkpointMaxRetries; attempt += 1) {
-          const st = await getOtaStatusBinary(
-            targetFullKeyHex,
-            1,
-            Math.max(1500, checkpointTimeoutMs, statusTimeout)
-          );
+          const st = await getOtaStatusBinary(targetFullKeyHex, 1, checkpointTimeout, statusOpts());
+          throwIfWrongImage(st.reply);
           if (st.status && st.status.total === fwSize && st.status.done <= fwSize) {
             let srvDone = st.status.done;
 
@@ -3998,28 +4128,54 @@ async function runBinaryOta(params) {
             // trou(s) et nous liste les octets manquants — on ne réémet que
             // ça. Si la liste est vide ou absente (cible ancienne), on
             // retombe sur le rembobinage classique à 'done' ci-dessous.
-            let missing = (st.status.missing || [])
-              .filter((r) => r.off >= 0 && r.len > 0 && r.off + r.len <= fwSize);
+            let missing = clampMissing(st.status.missing);
+            let lastReply = st.reply;
             let repairRounds = 0;
-            while (missing.length > 0 && repairRounds < 6 && !otaCancelRequested) {
+            let stalledRounds = 0;
+            let statusLost = false;
+            while (missing.length > 0 && repairRounds < OTA_REPAIR_MAX_ROUNDS && !otaCancelRequested) {
               repairRounds += 1;
               const holeBytes = missing.reduce((a, r) => a + r.len, 0);
               appendLog(
                 `Réparation ciblée: ${missing.length} trou(s), ${holeBytes} octets `
-                + `(round ${repairRounds}, done ${srvDone}/${fwSize}) | status=${st.reply}`
+                + `(round ${repairRounds}, done ${srvDone}/${fwSize}) | status=${lastReply}`
               );
               await resendMissingRanges(missing);
-              const st2 = await getOtaStatusBinary(targetFullKeyHex, 1, quickStatusTimeout);
+              // Confirmation aussi patiente qu'un checkpoint : un seul STATUS court
+              // raté suffisait à faire renvoyer tout le bloc, alors que la cible
+              // avait déjà l'essentiel des réparations.
+              const st2 = await getOtaStatusBinary(
+                targetFullKeyHex, OTA_REPAIR_STATUS_ATTEMPTS, checkpointTimeout, statusOpts());
+              throwIfWrongImage(st2.reply);
               if (!(st2.status && st2.status.total === fwSize && st2.status.done <= fwSize)) {
+                statusLost = true;
+                failure = st2.error || (st2.reply ? `status=${st2.reply}` : "status perdu après réparation");
                 break;
               }
-              const newMissing = (st2.status.missing || [])
-                .filter((r) => r.off >= 0 && r.len > 0 && r.off + r.len <= fwSize);
-              const newHoleBytes = newMissing.reduce((a, r) => a + r.len, 0);
-              const progressed = st2.status.done > srvDone || newHoleBytes < holeBytes;
+              const newMissing = clampMissing(st2.status.missing);
+              // Progrès = la liste a changé. Comparer les octets totaux était faux
+              // avec une liste plafonnée : une fois les premiers trous comblés,
+              // les suivants apparaissent et le total peut remonter.
+              const progressed = st2.status.done > srvDone || !sameRanges(newMissing, missing);
               srvDone = st2.status.done;
               missing = newMissing;
-              if (!progressed) break;  // le rembobinage classique prendra le relais
+              lastReply = st2.reply;
+              stalledRounds = progressed ? 0 : stalledRounds + 1;
+              if (stalledRounds >= OTA_REPAIR_MAX_STALLS) break;  // repli sur le rembobinage
+            }
+
+            // STATUS de confirmation perdu : on ne rembobine pas pour autant (la
+            // cible a sans doute reçu la plupart des réparations). On redemande
+            // l'état au round de checkpoint suivant, qui relit les trous restants.
+            if (statusLost) {
+              if (attempt < checkpointMaxRetries) {
+                appendLog(
+                  `Retry checkpoint status (binary) après réparation at offset ${offset} `
+                  + `(${attempt}/${checkpointMaxRetries}): ${failure}`
+                );
+                await sleep(OTA_STATUS_QUIET_MS);
+              }
+              continue;
             }
 
             // behind = des chunks ont réellement été perdus en l'air.
@@ -4030,7 +4186,7 @@ async function runBinaryOta(params) {
             const ahead = srvDone > offset;
             if (behind) {
               chunkServerRejects += estimateRejectedChunks(offset, srvDone, chunkSize);
-              noteResync(offset, srvDone, "checkpoint", st.reply);
+              noteResync(offset, srvDone, "checkpoint", lastReply);
             } else if (ahead) {
               appendLog(`Serveur en avance (${srvDone}/${fwSize}), rattrapage sans pénalité`);
             }
@@ -4076,7 +4232,7 @@ async function runBinaryOta(params) {
           if (attempt < checkpointMaxRetries) {
             appendLog(`Retry checkpoint status (binary) at offset ${offset} (${attempt}/${checkpointMaxRetries}): ${failure}`);
             updateLiveMetrics("binary_req", offset, fwSize, tStart, chunkWriteAttempts, chunkWriteFailures, chunkServerRejects);
-            await sleep(120 * attempt);
+            await sleep(OTA_STATUS_QUIET_MS + (150 * attempt));
           }
         }
 
