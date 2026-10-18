@@ -193,6 +193,11 @@ protected:
     pending_login = pending_status = pending_telemetry = pending_discovery = pending_req = 0;
   }
 
+  // Receive-path settings exposed as custom vars (see CMD_GET_CUSTOM_VARS).
+  int getFemRxGain();
+  bool setFemRxGain(bool enable);
+  bool setRxPowerSavingVar(const char* name, const char* value);
+
 public:
   void savePrefs() {
     _prefs.node_lat = sensors.node_lat;

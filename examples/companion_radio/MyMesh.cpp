@@ -1875,6 +1875,25 @@ void MyMesh::handleCmdFrame(size_t len) {
       strcpy(dp, sensors.getSettingValue(i));
       dp = strchr(dp, 0);
     }
+    // Receive-path settings. They persist under keys other builds share, so a
+    // value an earlier image left behind (RXPS duty-cycling, LNA in bypass)
+    // silently costs range on weak links. Listing them keeps that visible.
+    char rx_vars[48];
+    int n = 0;
+    if (radio_driver.supportsRxPowerSaving()) {
+      n = snprintf(rx_vars, sizeof(rx_vars), "rxps:%u,rxps_level:%u",
+                   _prefs.rx_ps.enabled ? 1u : 0u, (unsigned)_prefs.rx_ps.level);
+    }
+    int fem_rxgain = getFemRxGain();
+    if (fem_rxgain >= 0 && n >= 0 && n < (int)sizeof(rx_vars)) {
+      n += snprintf(&rx_vars[n], sizeof(rx_vars) - n, "%sfem_rxgain:%d", n ? "," : "", fem_rxgain);
+    }
+    size_t used = dp - (char *)&out_frame[1];
+    if (n > 0 && used + 1 + (size_t)n <= MAX_FRAME_SIZE - 1) {
+      if (used) *dp++ = ',';
+      strcpy(dp, rx_vars);
+      dp = strchr(dp, 0);
+    }
     _serial->writeFrame(out_frame, dp - (char *)out_frame);
   } else if (cmd_frame[0] == CMD_SET_CUSTOM_VAR && len >= 4) {
     cmd_frame[len] = 0;
@@ -1882,7 +1901,16 @@ void MyMesh::handleCmdFrame(size_t len) {
     char *np = strchr(sp, ':'); // look for separator char
     if (np) {
       *np++ = 0; // modify 'cmd_frame', replace ':' with null
-      bool success = sensors.setSettingValue(sp, np);
+      bool success;
+      if (strcmp(sp, "rxps") == 0 || strcmp(sp, "rxps_level") == 0) {
+        success = setRxPowerSavingVar(sp, np);
+      } else if (strcmp(sp, "fem_rxgain") == 0) {
+        success = (strcmp(np, "1") == 0 || strcmp(np, "on") == 0) ? setFemRxGain(true)
+                : (strcmp(np, "0") == 0 || strcmp(np, "off") == 0) ? setFemRxGain(false)
+                : false;
+      } else {
+        success = sensors.setSettingValue(sp, np);
+      }
       if (success) {
         #if ENV_INCLUDE_GPS == 1
         // Update node preferences for GPS settings
@@ -2086,6 +2114,59 @@ void MyMesh::enterCLIRescue() {
   _cli_rescue = true;
   cli_command[0] = 0;
   Serial.println("========= CLI Rescue =========");
+}
+
+// The FEM LNA belongs to the board, which stores the choice and exposes it on its
+// CLI; relaying keeps the app's custom var and 'radio.fem.rxgain' in step.
+// Returns -1 when the board has no controllable LNA.
+int MyMesh::getFemRxGain() {
+  char reply[40];
+  reply[0] = 0;
+  if (!board.handleCommand("get radio.fem.rxgain", 0, reply) || reply[0] != '>') return -1;
+  return strcmp(reply, "> on") == 0 ? 1 : 0;
+}
+
+bool MyMesh::setFemRxGain(bool enable) {
+  char reply[64];
+  reply[0] = 0;
+  if (!board.handleCommand(enable ? "set radio.fem.rxgain on" : "set radio.fem.rxgain off", 0, reply) ||
+      memcmp(reply, "OK", 2) != 0) {
+    return false;
+  }
+  if (_prefs.isDirty()) savePrefs();
+  return true;
+}
+
+// rxps:0|1 and rxps_level:<n>, mapped onto the CLI so the same validation and
+// SF/BW geometry apply. Turning it back on keeps the stored level and preamble.
+bool MyMesh::setRxPowerSavingVar(const char* name, const char* value) {
+  const RxPowerSavingConfig& cfg = _prefs.rx_ps;
+  int level = cfg.level;   // 0 when only raw periods were ever set
+  bool off = false;
+  if (strcmp(name, "rxps") == 0) {
+    off = strcmp(value, "0") == 0 || strcmp(value, "off") == 0;
+    if (!off && strcmp(value, "1") != 0 && strcmp(value, "on") != 0) return false;
+  } else {
+    level = atoi(value);
+    if (level < 1 || level > RX_POWERSAVING_RISKY_WORKING_MAX_LEVEL) return false;
+  }
+
+  char arg[32];
+  if (off) {
+    strcpy(arg, "off");
+  } else if (level < 1) {
+    strcpy(arg, "balanced");
+  } else if (cfg.preamble == 16 || cfg.preamble == 32) {
+    snprintf(arg, sizeof(arg), "level %d preamble %u", level, (unsigned)cfg.preamble);
+  } else {
+    snprintf(arg, sizeof(arg), "level %d", level);
+  }
+  char reply[160];
+  if (!RXPowerSavingCLI::set(arg, _prefs.sf, _prefs.bw, &_prefs.rx_ps, &radio_driver, reply, sizeof(reply))) {
+    return false;
+  }
+  savePrefs();
+  return true;
 }
 
 bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char* reply) {
