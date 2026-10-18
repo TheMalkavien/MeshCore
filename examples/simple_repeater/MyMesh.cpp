@@ -466,6 +466,7 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
       strcpy((char*)&reply_data[4], "Err - admin required");
       return 4 + strlen((char*)&reply_data[4]);
     }
+    noteOtaTraffic();
     if (payload_len < 2) {
       strcpy((char*)&reply_data[4], "Err - bad OTA req");
       return 4 + strlen((char*)&reply_data[4]);
@@ -1326,7 +1327,17 @@ void MyMesh::clearStats() {
   ((SimpleMeshTables *)getTables())->resetStats();
 }
 
+// 'ota ...' and 'start ota' (text transport), after the optional '<hex>|'
+// reply-matching prefix the web client adds.
+static bool isOtaCliCommand(const char *c) {
+  const char *bar = strchr(c, '|');
+  if (bar && bar - c <= 4) c = bar + 1;
+  while (*c == ' ') c++;
+  return memcmp(c, "ota", 3) == 0 || memcmp(c, "start ota", 9) == 0;
+}
+
 void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply) {
+  if (isOtaCliCommand(command)) noteOtaTraffic();
   if (region_load_active) {
     if (StrHelper::isBlank(command)) {  // empty/blank line, signal to terminate 'load' operation
       region_map = temp_map;  // copy over the temp instance as new current map
@@ -1459,18 +1470,13 @@ void MyMesh::loop() {
     if (temp_radio_for_ota) temp_radio_ota_quiet_since = millis() | 1;   // 0 means 'not watching'
   }
 
-  // A preset set up for a firmware update ('tempradio ...,ota') is dropped as soon
-  // as no update session has been open for TEMP_RADIO_OTA_IDLE_MILLIS - none
-  // started, or the last one ended or failed - instead of leaving the node
-  // unreachable on the short preset until the tempradio timeout (often 20 min).
-  bool ota_preset_idle = false;
-  if (temp_radio_ota_quiet_since) {
-    if (board.isOTASessionActive()) {
-      temp_radio_ota_quiet_since = millis() | 1;
-    } else if (millis() - temp_radio_ota_quiet_since > TEMP_RADIO_OTA_IDLE_MILLIS) {
-      ota_preset_idle = true;
-    }
-  }
+  // A preset set up for a firmware update ('tempradio ...,ota') is dropped once no
+  // OTA traffic has arrived for TEMP_RADIO_OTA_IDLE_MILLIS: none ever came, or the
+  // client stopped - finished, failed, or lost mid-transfer with the session still
+  // open. Otherwise the node stays unreachable on the short preset until the
+  // tempradio timeout (often 20 min). A live transfer talks far more often.
+  const bool ota_preset_idle = temp_radio_ota_quiet_since
+      && millis() - temp_radio_ota_quiet_since > TEMP_RADIO_OTA_IDLE_MILLIS;
 
   if (revert_radio_at && (ota_preset_idle || millisHasNowPassed(revert_radio_at))) { // revert radio params to orig
     revert_radio_at = 0;                                        // clear timer
