@@ -1424,14 +1424,18 @@ void MyMesh::loop() {
 
   mesh::Mesh::loop();
 
-  if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
+  // No adverts during a firmware update: each one is a transmit the node cannot
+  // receive through, landing in the middle of the client's chunk stream. A due
+  // advert simply goes out once the session ends.
+  const bool ota_quiet = board.isOTASessionActive();
+  if (!ota_quiet && next_flood_advert && millisHasNowPassed(next_flood_advert)) {
     mesh::Packet *pkt = createSelfAdvert();
     uint32_t delay_millis = 0;
     if (pkt) sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
 
     updateFloodAdvertTimer(); // schedule next flood advert
     updateAdvertTimer();      // also schedule local advert (so they don't overlap)
-  } else if (next_local_advert && millisHasNowPassed(next_local_advert)) {
+  } else if (!ota_quiet && next_local_advert && millisHasNowPassed(next_local_advert)) {
     mesh::Packet *pkt = createSelfAdvert();
     if (pkt) sendZeroHop(pkt);
 
