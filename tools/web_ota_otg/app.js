@@ -3929,6 +3929,17 @@ async function runBinaryOta(params) {
       if (vtorMatch && rawImage) {
         const targetVtor = Number.parseInt(vtorMatch[1], 16) >>> 0;
         const imageVtor = rp2040ImageVectorTable(rawImage);
+        // Firmware du 18/10 (1re version de ce contrôle) : il annonçait l'adresse
+        // de la copie RAM de la table des vecteurs, et refuse donc toute image
+        // dès ses premiers octets. Inutile d'envoyer : seul un flash hors LoRa
+        // (flasheur ESP32 ou USB) peut le remplacer.
+        if (targetVtor >= 0x20000000 && targetVtor < 0x30000000) {
+          throw new Error(
+            `La cible annonce vtor=${vtorMatch[1]} (adresse en RAM) : son firmware a un défaut `
+            + "qui lui fait refuser toute image par OTA LoRa. Mets-la à jour une fois hors LoRa "
+            + "(flasheur ESP32 : stage1 puis stage2, ou USB) avec un firmware corrigé."
+          );
+        }
         if (imageVtor !== targetVtor) {
           throw new Error(
             `Image incompatible avec la cible : image ${describeRp2040Layout(imageVtor)}, `
@@ -5530,7 +5541,10 @@ async function applyTempRadioPresetForOta(targetHex, preset) {
     appendLog("Warning: preset radio client actuel indisponible, restauration finale impossible.");
   }
 
-  const cmd = `tempradio ${formatRadioValue(preset.freq)},${formatRadioValue(preset.bw)},${preset.sf},${preset.cr},${preset.timeoutMins}`;
+  // ',ota' : les cibles récentes abandonnent ce preset dès que plus aucune
+  // session OTA n'est ouverte depuis 2 min, au lieu d'attendre la durée
+  // complète. Les plus anciennes ne lisent que 5 champs et l'ignorent.
+  const cmd = `tempradio ${formatRadioValue(preset.freq)},${formatRadioValue(preset.bw)},${preset.sf},${preset.cr},${preset.timeoutMins},ota`;
   appendLog(
     `Applying OTA temp preset: target=${formatRadioValue(preset.freq)}MHz/${formatRadioValue(preset.bw)}kHz/SF${preset.sf}/CR${preset.cr} `
     + `(${preset.timeoutMins} min)`

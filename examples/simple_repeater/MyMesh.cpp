@@ -86,6 +86,12 @@ extern "C" bool meshcore_board_usb_is_connected(void) {
 #ifndef OTA_TXT_ACK_DELAY
   #define OTA_TXT_ACK_DELAY 0
 #endif
+// See MyMesh::loop(): how long a 'tempradio ...,ota' preset outlives the last
+// open update session (or the switch, if none ever opened).
+#ifndef TEMP_RADIO_OTA_IDLE_MILLIS
+  #define TEMP_RADIO_OTA_IDLE_MILLIS (2UL * 60UL * 1000UL)
+#endif
+
 #ifndef OTA_SERVER_RESPONSE_DELAY_MILLIS
   #define OTA_SERVER_RESPONSE_DELAY_MILLIS 40
 #endif
@@ -1000,6 +1006,8 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   next_local_advert = next_flood_advert = 0;
   dirty_contacts_expiry = 0;
   set_radio_at = revert_radio_at = 0;
+  temp_radio_for_ota = false;
+  temp_radio_ota_quiet_since = 0;
   _logging = false;
   region_load_active = false;
   recv_pkt_region = NULL;
@@ -1134,6 +1142,8 @@ void MyMesh::applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, 
   pending_bw = bw;
   pending_sf = sf;
   pending_cr = cr;
+  temp_radio_for_ota = false;        // set again by setTempRadioForOta() for 'tempradio ...,ota'
+  temp_radio_ota_quiet_since = 0;
 
   revert_radio_at = futureMillis(2000 + timeout_mins * 60 * 1000); // schedule when to revert radio params
 }
@@ -1446,10 +1456,25 @@ void MyMesh::loop() {
     set_radio_at = 0;                                     // clear timer
     radio_driver.setParams(pending_freq, pending_bw, pending_sf, pending_cr);
     MESH_DEBUG_PRINTLN("Temp radio params");
+    if (temp_radio_for_ota) temp_radio_ota_quiet_since = millis() | 1;   // 0 means 'not watching'
   }
 
-  if (revert_radio_at && millisHasNowPassed(revert_radio_at)) { // revert radio params to orig
+  // A preset set up for a firmware update ('tempradio ...,ota') is dropped as soon
+  // as no update session has been open for TEMP_RADIO_OTA_IDLE_MILLIS - none
+  // started, or the last one ended or failed - instead of leaving the node
+  // unreachable on the short preset until the tempradio timeout (often 20 min).
+  bool ota_preset_idle = false;
+  if (temp_radio_ota_quiet_since) {
+    if (board.isOTASessionActive()) {
+      temp_radio_ota_quiet_since = millis() | 1;
+    } else if (millis() - temp_radio_ota_quiet_since > TEMP_RADIO_OTA_IDLE_MILLIS) {
+      ota_preset_idle = true;
+    }
+  }
+
+  if (revert_radio_at && (ota_preset_idle || millisHasNowPassed(revert_radio_at))) { // revert radio params to orig
     revert_radio_at = 0;                                        // clear timer
+    temp_radio_ota_quiet_since = 0;
     radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
     MESH_DEBUG_PRINTLN("Radio params restored");
   }
