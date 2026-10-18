@@ -22,7 +22,10 @@ public:
     }
     return best;
   }
-  mesh::Packet* itemAt(int i) const { return _table[i]; }
+  mesh::Packet* itemAt(int i) const {
+    if (i < 0 || i >= _num) return NULL;
+    return _table[i];
+  }
   mesh::Packet* removeByIdx(int i);
 };
 

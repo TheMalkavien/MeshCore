@@ -982,7 +982,7 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
       int results_offset = 0;
       uint8_t results_buffer[130];
       for(int index = 0; index < count && index + offset < neighbours_count; index++){
-        
+
         // stop if we can't fit another entry in results
         int entry_size = pubkey_prefix_length + 4 + 1;
         if(results_offset + entry_size > sizeof(results_buffer)){
@@ -1421,7 +1421,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
     memcpy(&sender_timestamp, data, 4); // timestamp (by sender's RTC clock - which could be wrong)
     uint8_t flags = (data[4] >> 2);        // message attempt number, and other flags
 
-    if (!(flags == TXT_TYPE_PLAIN || flags == TXT_TYPE_CLI_DATA)) {
+    if (!(flags == TXT_TYPE_PLAIN || flags == TXT_TYPE_CLI_DATA || flags == TXT_TYPE_CLI_COMMAND)) {
       MESH_DEBUG_PRINTLN("onPeerDataRecv: unsupported text type received: flags=%02x", (uint32_t)flags);
     } else if (sender_timestamp >= client->last_timestamp) { // prevent replay attacks
       bool is_retry = (sender_timestamp == client->last_timestamp);
@@ -1511,6 +1511,7 @@ void MyMesh::onControlDataRecv(mesh::Packet* packet) {
   uint8_t type = packet->payload[0] & 0xF0;    // just test upper 4 bits
   if (type == CTL_TYPE_NODE_DISCOVER_REQ && packet->payload_len >= 6
       && !_prefs.disable_fwd && discover_limiter.allow(rtc_clock.getCurrentTime())
+      && !isHiddenNode()   // this node wishes to NOT be discoverable
   ) {
     int i = 1;
     uint8_t  filter = packet->payload[i++];
@@ -1631,6 +1632,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.flood_max_advert = 8;
   _prefs.interference_threshold = 0; // disabled
   _prefs.cad_enabled = 0;            // hardware CAD before TX (off by default; 'set cad on')
+  _prefs.loop_detect = LOOP_DETECT_MINIMAL;
   _prefs.multi_acks = 1;             // default: send one extra ACK per hop for better ACK delivery
 
   // bridge defaults
@@ -1713,8 +1715,8 @@ void MyMesh::begin(FILESYSTEM *fs) {
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
                      radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
-  board.setLoRaFemLnaEnabled(_prefs.radio_fem_rxgain);
-  board.setLoRaFemPaGainEnabled(_prefs.radio_fem_txgain);
+
+  board.attachDynamicPrefs(_prefs.getCustom());
 
   updateAdvertTimer();
   updateFloodAdvertTimer();

@@ -2,6 +2,7 @@
 
 #include <MeshCore.h>
 #include <Arduino.h>
+#include <helpers/KeyValueStore.h>
 #include <helpers/RP2040OTA.h>
 
 #if defined(ARDUINO_ARCH_RP2040)
@@ -21,6 +22,8 @@ protected:
 public:
   void begin();
   uint8_t getStartupReason() const override { return startup_reason; }
+
+  void attachDynamicPrefs(KeyValueStore* prefs) { }  // no-op
 
   void onBeforeTransmit() override {
     digitalWrite(LED_BUILTIN, HIGH);   // turn TX LED on

@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <MeshCore.h>
+#include <helpers/KeyValueStore.h>
 #include <helpers/RP2040OTA.h>
 
 // from https://github.com/RAKWireless/RAK11300-AT-Command-Firmware/blob/9c48409a43620a828d653501d536473200aa33af/RAK11300-AT-Arduino/batt.cpp#L17-L19
@@ -53,4 +54,5 @@ public:
     return ota.handleBinaryCommand(opcode, payload, payload_len, reply);
   }
   bool isOTASessionActive() const override { return ota.isSleepInhibited(); }
+  void attachDynamicPrefs(KeyValueStore* prefs) { }  // no-op
 };

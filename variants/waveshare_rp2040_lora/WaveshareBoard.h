@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <MeshCore.h>
+#include <helpers/KeyValueStore.h>
 #include <helpers/RP2040OTA.h>
 
 #if defined(ARDUINO_ARCH_RP2040)
@@ -30,21 +31,22 @@
  *    BAT- -----+
  */
 #ifndef PIN_VBAT_READ
-  #define PIN_VBAT_READ          26
+  #define PIN_VBAT_READ          28
 #endif
 #define BATTERY_SAMPLES          8
 #define ADC_MULTIPLIER           (3.0f * 3.3f * 1000)
 
 class WaveshareBoard : public mesh::MainBoard {
 protected:
-  uint8_t startup_reason;
   float adc_mult = ADC_MULTIPLIER;
-  RP2040OTAController ota;
+  uint8_t startup_reason;
 
 public:
   void begin();
   void sleep(uint32_t secs) override;
   uint8_t getStartupReason() const override { return startup_reason; }
+
+  void attachDynamicPrefs(KeyValueStore* prefs) { }  // no-op
 
 #ifdef P_LORA_TX_LED
   void onBeforeTransmit() override { digitalWrite(P_LORA_TX_LED, HIGH); }
@@ -68,29 +70,24 @@ public:
     return 0;
 #endif
   }
+
   bool setAdcMultiplier(float multiplier) override {
 #if defined(PIN_VBAT_READ) && defined(ADC_MULTIPLIER)
-     if (multiplier == 0.0f) {
-      adc_mult = ADC_MULTIPLIER;}
-    else {
-      adc_mult = multiplier;
-    }
+    adc_mult = (multiplier == 0.0f) ? ADC_MULTIPLIER : multiplier;
     return true;
 #else
     return false;
 #endif
   }
+
   float getAdcMultiplier() const override {
 #if defined(PIN_VBAT_READ) && defined(ADC_MULTIPLIER)
-    if (adc_mult == 0.0f) {
-      return ADC_MULTIPLIER;
-    } else {
-      return adc_mult;
-    }
+    return (adc_mult == 0.0f) ? ADC_MULTIPLIER : adc_mult;
 #else
     return 0.0f;
 #endif
   }
+
   const char *getManufacturerName() const override { return "Waveshare RP2040-LoRa"; }
 
   void reboot() override { rp2040.reboot(); }
@@ -99,8 +96,16 @@ public:
   bool handleOTACommand(const char *command, char reply[]) override;
   bool handleOTABinaryCommand(uint8_t opcode, const uint8_t *payload, size_t payload_len, char reply[]) override;
   bool isOTASessionActive() const override { return ota.isSleepInhibited(); }
+
+protected:
+  RP2040OTAController ota;
 };
 
+// Clock / core-voltage profiles. The whole set lives here so a single place owns the
+// ordering rule: coming *up*, raise the voltage and let it settle before raising the
+// clock; going *down*, lower the clock first and only drop the voltage if it took.
+// Getting that backwards under-volts the core at the higher frequency.
+// The voltage half compiles in only with -D MLK_RP2040_LOWPOWER.
 #if defined(ARDUINO_ARCH_RP2040)
 #ifndef RP2040_SLEEP_CLOCK_MHZ
   #define RP2040_SLEEP_CLOCK_MHZ 18
@@ -114,10 +119,6 @@ public:
   #endif
 #endif
 
-#ifndef RP2040_OTA_CLOCK_MHZ
-  #define RP2040_OTA_CLOCK_MHZ 125
-#endif
-
 inline bool rp2040_apply_clock_profile(uint32_t clock_mhz) {
   if (!set_sys_clock_khz(clock_mhz * KHZ, false)) {
     // Requested frequency not achievable: clk_sys is unchanged, so leave the
@@ -127,10 +128,10 @@ inline bool rp2040_apply_clock_profile(uint32_t clock_mhz) {
 
   // Keep SPI, ADC and RTC on coherent clock sources after changing clk_sys.
   clock_configure(clk_peri,
-                  0,                                      // No glitchless mux
+                  0,
                   CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
-                  clock_mhz * MHZ,                        // Input frequency
-                  clock_mhz * MHZ);                       // Output frequency
+                  clock_mhz * MHZ,
+                  clock_mhz * MHZ);
   clock_configure(clk_adc, 0,
                   CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
                   clock_mhz * MHZ, clock_mhz * MHZ);
@@ -155,6 +156,13 @@ inline void rp2040_restore_active_profile() {
 #endif
   rp2040_apply_clock_profile(RP2040_ACTIVE_CLOCK_MHZ);
 }
+
+// Flash programming and the sustained SPI traffic of an OTA transfer both want the
+// full system clock, whatever the board runs at normally. Same ordering rule as
+// rp2040_restore_active_profile(): voltage up and settled before the clock.
+#ifndef RP2040_OTA_CLOCK_MHZ
+  #define RP2040_OTA_CLOCK_MHZ 125
+#endif
 
 inline void rp2040_enter_ota_profile() {
 #ifdef MLK_RP2040_LOWPOWER

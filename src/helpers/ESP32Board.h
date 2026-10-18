@@ -16,6 +16,7 @@
 #include "esp_system.h"
 #include <esp_attr.h>
 #include <driver/rtc_io.h>
+#include <helpers/KeyValueStore.h>
 
 class ESP32Board : public mesh::MainBoard {
 protected:
@@ -51,6 +52,8 @@ public:
     Wire.begin();
   #endif    
   }
+
+  void attachDynamicPrefs(KeyValueStore* prefs) { }  // no-op
 
   // Temperature from ESP32 MCU
   float getMCUTemperature() override {
@@ -198,39 +201,27 @@ public:
   }
 };
 
-// ESP-IDF only preserves system time across deep sleep. A crash, watchdog,
-// brownout or software reboot loses it, and the node then runs from a 2024 seed
-// until something re-syncs it -- on a GPS build that means paying for an extra
-// acquisition window, and in the meantime every advert carries a bogus
-// timestamp. Mirror the clock into RTC slow memory, which survives every reset
-// short of an actual power cycle.
-#define RTC_TIME_SEED     1715770351  // 15 May 2024, 8:50pm
-#define RTC_BACKUP_MAGIC  0xAA55CC33
-
 static RTC_NOINIT_ATTR uint32_t _rtc_backup_time;
 static RTC_NOINIT_ATTR uint32_t _rtc_backup_magic;
+#define RTC_BACKUP_MAGIC  0xAA55CC33
+#define RTC_TIME_MIN      1772323200  // 1 Mar 2026
 
 class ESP32RTCClock : public mesh::RTCClock {
-  static void backupTime(uint32_t now) {
-    // RTC slow memory is undefined after a power cycle, so a restore is only
-    // trusted when both the magic and a plausible timestamp are present.
-    if (now < RTC_TIME_SEED) return;
-    if (now == _rtc_backup_time && _rtc_backup_magic == RTC_BACKUP_MAGIC) return;
-    _rtc_backup_time = now;
-    _rtc_backup_magic = RTC_BACKUP_MAGIC;
-  }
-
 public:
   ESP32RTCClock() { }
   void begin() {
-    if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
-      return;  // system time already carried over by ESP-IDF
+    esp_reset_reason_t reason = esp_reset_reason();
+    if (reason == ESP_RST_DEEPSLEEP) {
+      return;  // ESP-IDF preserves system time across deep sleep
     }
-
+    // All other resets (power-on, crash, WDT, brownout) lose system time.
+    // Restore from RTC backup if valid, otherwise use hardcoded seed.
     struct timeval tv;
-    tv.tv_sec = (_rtc_backup_magic == RTC_BACKUP_MAGIC && _rtc_backup_time >= RTC_TIME_SEED)
-                    ? (time_t)_rtc_backup_time
-                    : (time_t)RTC_TIME_SEED;
+    if (_rtc_backup_magic == RTC_BACKUP_MAGIC && _rtc_backup_time > RTC_TIME_MIN) {
+      tv.tv_sec = _rtc_backup_time;
+    } else {
+      tv.tv_sec = RTC_TIME_MIN;
+    }
     tv.tv_usec = 0;
     settimeofday(&tv, NULL);
   }
@@ -244,10 +235,16 @@ public:
     tv.tv_sec = time;
     tv.tv_usec = 0;
     settimeofday(&tv, NULL);
-    backupTime(time);
+    _rtc_backup_time = time;
+    _rtc_backup_magic = RTC_BACKUP_MAGIC;
   }
   void tick() override {
-    backupTime(getCurrentTime());
+    time_t now;
+    time(&now);
+    if (now > RTC_TIME_MIN && (uint32_t)now != _rtc_backup_time) {
+      _rtc_backup_time = (uint32_t)now;
+      _rtc_backup_magic = RTC_BACKUP_MAGIC;
+    }
   }
 };
 

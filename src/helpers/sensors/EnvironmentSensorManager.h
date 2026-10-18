@@ -56,6 +56,7 @@ public:
   // True only while actively acquiring a fix (GPS UART is streaming NMEA and
   // must be serviced frequently; also holds off auto light-sleep via a PM lock).
   bool isGPSFixWindowActive() const { return gps_fix_window_active; }
+  bool isGPSDetected() const override { return gps_detected; }
   #else
   EnvironmentSensorManager(){};
   #endif
