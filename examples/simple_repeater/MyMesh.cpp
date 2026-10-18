@@ -598,6 +598,13 @@ void MyMesh::markFloodHeard(const mesh::Packet* pkt) {
 
 void MyMesh::processFloodRetries() {
 #if ENABLE_FLOOD_CONDITIONAL_RETRY == 1
+  if (board.isOTASessionActive()) {
+    // Each retry is a transmit the node cannot receive through, landing in the
+    // middle of a firmware update stream. Drop them rather than defer: a flood
+    // retried minutes later, after the transfer, is no use to anyone.
+    for (auto& slot : _flood_retry) slot.active = 0;
+    return;
+  }
   for (int i = 0; i < (int)(sizeof(_flood_retry) / sizeof(_flood_retry[0])); i++) {
     auto& slot = _flood_retry[i];
     if (!slot.active || !millisHasNowPassed(slot.next_retry_at)) {
