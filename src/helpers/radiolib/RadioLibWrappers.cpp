@@ -271,7 +271,11 @@ int16_t RadioLibWrapper::startReceiveMode() {
     return RADIOLIB_ERR_NONE;
   }
   if (_rx_ps_armed) stopReceiveDutyCycle();
-  if (!_rx_ps_enabled || _nf_calib_active) {
+  // A firmware update streams chunks back to back, often on a short-preamble
+  // preset at the edge of range: duty-cycled RX only gets part of each preamble
+  // and misses the weak ones. Receive continuously while a session is open;
+  // the first RX restart after it closes re-arms the duty cycle.
+  if (!_rx_ps_enabled || _nf_calib_active || _board->isOTASessionActive()) {
     _rx_ps_armed = false;
     _rx_ps_last_error = RADIOLIB_ERR_NONE;
     return _radio->startReceive();
