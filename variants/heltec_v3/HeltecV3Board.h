@@ -17,8 +17,6 @@
 #define  PIN_ADC_CTRL_ACTIVE    LOW
 #define  PIN_ADC_CTRL_INACTIVE  HIGH
 
-#include <driver/rtc_io.h>
-
 class HeltecV3Board : public ESP32Board {
 private:
   bool adc_active_state;
@@ -80,10 +78,8 @@ public:
     esp_deep_sleep_start();   // CPU halts here and never returns!
   }
 
-  void powerOff() override {
-    enterDeepSleep(0);
-  }
-
+  // Duty-cycled sleep for simple_tracker (wakes on LoRa/button). powerOff() is left to
+  // ESP32Board, which powers the radio down and arms no wake source.
   uint16_t getBattMilliVolts() override {
     analogReadResolution(10);
     digitalWrite(PIN_ADC_CTRL, adc_active_state);

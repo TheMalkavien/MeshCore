@@ -74,11 +74,7 @@ float t1000e_get_temperature(void) {
 #ifdef PIN_3V3_EN
   int prev_3v3 = digitalRead(PIN_3V3_EN);
 #endif
-#ifdef SENSOR_EN
-  int prev_sensor = digitalRead(SENSOR_EN);
-#endif
   digitalWrite(PIN_3V3_EN, HIGH);
-  digitalWrite(SENSOR_EN, HIGH);
   analogReference(AR_INTERNAL_3_0);
   analogReadResolution(12);
   delay(10);
@@ -87,9 +83,6 @@ float t1000e_get_temperature(void) {
   ntc_v = (1000.0 * AREF_VOLTAGE * analogRead(TEMP_SENSOR)) / 4096;
 #ifdef PIN_3V3_EN
   digitalWrite(PIN_3V3_EN, prev_3v3 ? HIGH : LOW);
-#endif
-#ifdef SENSOR_EN
-  digitalWrite(SENSOR_EN, prev_sensor ? HIGH : LOW);
 #endif
 
   return get_heater_temperature(vcc_v, ntc_v);
@@ -102,19 +95,12 @@ uint32_t t1000e_get_light(void) {
 #ifdef PIN_3V3_EN
   int prev_3v3 = digitalRead(PIN_3V3_EN);
 #endif
-#ifdef SENSOR_EN
-  int prev_sensor = digitalRead(SENSOR_EN);
-#endif
   digitalWrite(PIN_3V3_EN, HIGH);
-  digitalWrite(SENSOR_EN, HIGH);
   analogReference(AR_INTERNAL_3_0);
   analogReadResolution(12);
   delay(10);
   lux_v = 1000 * analogRead(LUX_SENSOR) * AREF_VOLTAGE / 4096;
   lux = get_light_lv(lux_v);
-#ifdef SENSOR_EN
-  digitalWrite(SENSOR_EN, prev_sensor ? HIGH : LOW);
-#endif
 #ifdef PIN_3V3_EN
   digitalWrite(PIN_3V3_EN, prev_3v3 ? HIGH : LOW);
 #endif

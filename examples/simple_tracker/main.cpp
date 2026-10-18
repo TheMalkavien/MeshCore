@@ -97,7 +97,7 @@ static void processSerialCommands() {
 
   char reply[240];
   TRACKER_DBG("cmd: %s", command);
-  the_mesh.handleCommand(0, command, reply);
+  the_mesh.handleCommand(NULL, 0, command, reply);  // no sender over serial
   if (reply[0]) {
     TRACKER_DBG("reply: %s", reply);
   }

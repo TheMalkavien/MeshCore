@@ -2,6 +2,7 @@
 #include "t1000e_sensors.h"
 #include "target.h"
 #include <helpers/sensors/MicroNMEALocationProvider.h>
+#include <helpers/sensors/AirohaSleep.h>
 
 T1000eBoard board;
 
@@ -319,7 +320,6 @@ void T1000SensorManager::loop() {
       node_lat = ((double)_nmea->getLatitude())/1000000.;
       node_lon = ((double)_nmea->getLongitude())/1000000.;
       node_altitude = ((double)_nmea->getAltitude()) / 1000.0;
-      //Serial.printf("lat %f lon %f\r\n", _lat, _lon);
     }
     next_gps_update = millis() + 1000;
   }
@@ -339,7 +339,7 @@ const char* T1000SensorManager::getSettingValue(int i) const {
 bool T1000SensorManager::setSettingValue(const char* name, const char* value) {
   if (strcmp(name, "gps") == 0) {
     if (strcmp(value, "0") == 0) {
-      sleep_gps(); // sleep for faster fix !
+      stop_gps();
     } else {
       start_gps();
     }
