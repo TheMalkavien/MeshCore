@@ -184,7 +184,7 @@ do_rebase() {
   fi
 }
 
-# Rebuilds the integration branch in a scratch ref, so a failure leaves the real
+# Rebuilds the integration branch on a detached HEAD, so a failure leaves the real
 # branch untouched.
 do_integrate() {
   require_clean_tree
@@ -195,9 +195,21 @@ do_integrate() {
       "$(git log -1 --format=%s "$INTEGRATION" | cut -c1-60)"
     confirm "continue?"
   fi
-  local tmp="refs/heads/_restack_tmp"
-  git branch -f _restack_tmp "$BASE" >/dev/null
-  git checkout --quiet _restack_tmp
+  # git refuses to move a branch checked out in another worktree, and would
+  # leave that worktree's files stale if it did - so run from there instead.
+  local here owner
+  here=$(git rev-parse --show-toplevel)
+  owner=$(git worktree list --porcelain | awk -v ref="branch refs/heads/$INTEGRATION" '
+    /^worktree / { wt = substr($0, 10) }
+    $0 == ref    { print wt }')
+  if [ -n "$owner" ] && [ "$owner" != "$here" ]; then
+    echo "$INTEGRATION is checked out in another worktree: $owner" >&2
+    echo "run 'integrate' from there, or switch that worktree to another branch" >&2
+    exit 1
+  fi
+  # Build on a detached HEAD: a named scratch branch, left behind by an
+  # interrupted run, would block every later one.
+  git checkout --quiet --detach "$BASE"
 
   say "merging ${#MERGE_ORDER[@]} branches onto $(git rev-parse --short $BASE)"
   for b in "${MERGE_ORDER[@]}"; do
@@ -212,9 +224,7 @@ do_integrate() {
     fi
   done
 
-  git branch -f "$INTEGRATION" _restack_tmp
-  git checkout --quiet "$INTEGRATION"
-  git branch -D _restack_tmp >/dev/null
+  git checkout --quiet -B "$INTEGRATION"
   say "$INTEGRATION regenerated at $(git rev-parse --short HEAD)"
   echo "  NOTE: this rewrites $INTEGRATION. Branches that descend from it"
   echo "        (mqtt_espnow_multibridge, HTv4LowPower, ...) need re-basing too."
