@@ -220,7 +220,7 @@ Options pour l'utilisateur, de la plus simple à la plus robuste :
    pour confirmer que la cible répond sans relais avant de lancer quoi que ce soit.
 6. (Optionnel) renseigner `Mot de passe` pour faire un login avant OTA.
 7. Sélectionner le firmware `.bin`, `.bin.gz`, `.uf2`, ou `.hex` / `.zip` (nRF52).
-8. (Optionnel) activer `Preset OTA temporaire` et régler `freq,bw,sf,cr` (défaut : `869.4,250,5,5`).
+8. (Optionnel) activer `Preset OTA temporaire` et régler `freq,bw,sf,cr` (défaut : `869.525,250,6,5` : canal 250 kHz entièrement dans la sous-bande 869,40-869,65 MHz à 27 dBm, et SF6 qui gagne ~2,5 dB sur SF5 sans ralentir un transfert de toute façon limité par le BLE).
 9. Cliquer `Lancer l'OTA`.
 
 ## Réglages
