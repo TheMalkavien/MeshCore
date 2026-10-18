@@ -30,6 +30,7 @@ const OTA_STATUS_QUIET_MS = 700;
 const OTA_REPAIR_STATUS_ATTEMPTS = 3;
 const OTA_REPAIR_MAX_ROUNDS = 12;
 const OTA_REPAIR_MAX_STALLS = 3;
+const OTA_END_ATTEMPTS = 3;
 const CMD_GET_DEVICE_TIME = 5;
 const CMD_RESET_PATH = 13;
 const CMD_SET_DEVICE_TIME = 6;
@@ -4361,19 +4362,43 @@ async function runBinaryOta(params) {
       }
     }
 
-    const endRes = await client.sendOtaBinaryCmd(
-      targetFullKeyHex,
-      OTA_BIN_OP.END,
-      new Uint8Array(),
-      true,
-      12000,
-      500
-    );
-    if (endRes.error) {
-      throw new Error(`OTA end failed (binary): ${endRes.error}`);
+    // END se rejoue : sa réponse se perd comme n'importe quel paquet, et un
+    // seul END sans réponse faisait échouer une OTA entièrement transférée.
+    // La cible referme la session en validant l'image : un END répété après
+    // un premier resté sans réponse reçoit donc « OTA not started ». Comme la
+    // session était encore ouverte juste avant, c'est que le premier END a
+    // abouti et que seule sa réponse s'est perdue.
+    let endOk = false;
+    let endFailure = "";
+    for (let attempt = 1; attempt <= OTA_END_ATTEMPTS && !otaCancelRequested; attempt += 1) {
+      const endRes = await client.sendOtaBinaryCmd(
+        targetFullKeyHex,
+        OTA_BIN_OP.END,
+        new Uint8Array(),
+        true,
+        12000,
+        500
+      );
+      if (!endRes.error && isOkOtaReply(endRes.replyText)) {
+        endOk = true;
+        break;
+      }
+      if (!endRes.error && attempt > 1 && /not started/i.test(endRes.replyText || "")) {
+        appendLog("END : réponse du premier END perdue, la cible a déjà refermé la session (image validée).");
+        endOk = true;
+        break;
+      }
+      if (!endRes.error) {
+        throw new Error(`OTA end failed (binary): ${endRes.replyText}`);
+      }
+      endFailure = endRes.error;
+      if (attempt < OTA_END_ATTEMPTS) {
+        appendLog(`END sans réponse (${attempt}/${OTA_END_ATTEMPTS}): ${endRes.error} — nouvel essai.`);
+        await sleep(OTA_STATUS_QUIET_MS);
+      }
     }
-    if (!isOkOtaReply(endRes.replyText)) {
-      throw new Error(`OTA end failed (binary): ${endRes.replyText}`);
+    if (!endOk) {
+      throw new Error(`OTA end failed (binary): ${endFailure || "annulé"}`);
     }
     shouldCleanupTargetOta = false;
 
