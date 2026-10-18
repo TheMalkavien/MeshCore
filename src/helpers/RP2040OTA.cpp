@@ -5,7 +5,6 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <Updater.h>
-#include <hardware/structs/scb.h>
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
@@ -237,6 +236,19 @@ static uint32_t imageVectorTable(const uint8_t *p, size_t len) {
   return 0;
 }
 
+// Start of this node's own image in flash (every linker script defines it at
+// the FLASH origin: 0x10000000, 0x10004000 behind the ESP32 flasher, 0x10007000
+// for dual OTA).
+extern "C" uint8_t __flash_binary_start[];
+
+// The layout this node runs from: the same rule applied to its own image, so it
+// compares like for like with an incoming one. Not VTOR: the SDK copies the
+// vector table to RAM at boot (runtime_init_install_ram_vector_table), and VTOR
+// then reads 0x20000000 on every build - which made every image look foreign.
+static uint32_t nodeVectorTable() {
+  return imageVectorTable(__flash_binary_start, 0x108);
+}
+
 // Refuses, as soon as the first bytes are in, an image linked for another flash
 // layout: a standard image on a node behind the ESP32 flasher or the dual OTA
 // shim (or the reverse) does not boot. Better to stop now than after a transfer.
@@ -245,8 +257,8 @@ bool RP2040OTAController::checkImageVectors(char reply[]) {
   _image_checked = true;
   if (_stage[0] == 0x1f && _stage[1] == 0x8b) return true;   // gzip: decompressed by the bootloader
   const uint32_t image_vtor = imageVectorTable(_stage, stagePrefix());
-  const uint32_t node_vtor = scb_hw->vtor;
-  if (image_vtor == node_vtor) return true;
+  const uint32_t node_vtor = nodeVectorTable();
+  if (node_vtor == 0 || image_vtor == node_vtor) return true;   // own layout unknown: do not block
   snprintf(_last_error, sizeof(_last_error), "Err - wrong image: vtor %08lx, node %08lx",
            (unsigned long) image_vtor, (unsigned long) node_vtor);
   OTA_DEBUG_PRINTLN("%s", _last_error);
@@ -375,7 +387,7 @@ bool RP2040OTAController::startSession(const char *id, char reply[]) {
   // mb=1: STATUS can answer with a complete miss bitmap (see appendMissBitmap).
   // vtor=: where this node's vector table lives, so the client can refuse an
   // image linked for another flash layout before sending it.
-  const unsigned long vtor = (unsigned long) scb_hw->vtor;
+  const unsigned long vtor = (unsigned long) nodeVectorTable();
   FSInfo fs_info;
   if (LittleFS.info(fs_info) && fs_info.totalBytes >= fs_info.usedBytes) {
     uint32_t free_kb = (uint32_t)((fs_info.totalBytes - fs_info.usedBytes) / 1024ULL);
