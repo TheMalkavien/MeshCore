@@ -32,7 +32,10 @@ class CustomLR1110 : public LR1110 {
       if (err != RADIOLIB_ERR_NONE) return err;
       err = calibrate(0x3F);          // all blocks; setTCXO moved the gating window
       delay(50);
-      return err;
+      if (err != RADIOLIB_ERR_NONE) return err;
+      // 0x3F includes IMG, which falls back to the 902-928 MHz band; restore it for
+      // the real one, as lr11x0ResetAGC() does (4 MHz span = RadioLib's default).
+      return calibrateImageRejection(freqMHz - 4.0f, freqMHz + 4.0f);
     }
 
     size_t getPacketLength(bool update) override {
