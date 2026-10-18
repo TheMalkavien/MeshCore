@@ -28,7 +28,9 @@ private:
     uint16_t start;
     uint16_t end;
   };
-  static const int MAX_STAGE_RANGES = 24;
+  // A lossy block can be split into many received runs; when the table is full
+  // a received chunk has to be dropped and is then reported missing. 4 bytes each.
+  static const int MAX_STAGE_RANGES = 64;
 
   bool _armed;
   bool _active;
@@ -44,6 +46,8 @@ private:
   size_t _stage_base;
   StageRange _stage_ranges[MAX_STAGE_RANGES];
   uint8_t _stage_range_count;
+  bool _image_checked;
+  char _last_error[72];   // why the last session was dropped; reported by 'status' until the next start
 
   static const char *skipSpaces(const char *p);
   static bool decodeHex(const char *hex, size_t hex_len, uint8_t *out, size_t max_out, size_t *out_len);
@@ -55,7 +59,11 @@ private:
   size_t stageExtent() const;
   size_t stagePrefix() const;
   bool insertStageRange(size_t start, size_t end);
+  bool stageCovers(size_t start, size_t end) const;
   void appendMissList(char reply[], size_t max_len) const;
+  void appendMissBitmap(char reply[], size_t max_len, uint8_t chunk) const;
+  void buildStatus(char reply[], uint8_t bitmap_chunk);
+  bool checkImageVectors(char reply[]);
   void abortUpdate();
   bool sessionExpired() const;
   void expireIfIdle();

@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <Updater.h>
+#include <hardware/structs/scb.h>
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,8 +47,11 @@
 // granularity when staging is unavailable.
 #define OTA_UPDATER_INTERNAL_BLOCK 4096
 
+// Off by default: these go to USB Serial, and a host that holds the port open
+// without reading makes each print block for up to a second - mid-transfer,
+// that is a deaf receiver.
 #ifndef RP2040_OTA_SERIAL_DEBUG
-  #define RP2040_OTA_SERIAL_DEBUG 1
+  #define RP2040_OTA_SERIAL_DEBUG 0
 #endif
 
 #if RP2040_OTA_SERIAL_DEBUG
@@ -61,6 +65,7 @@ RP2040OTAController::RP2040OTAController() {
   _stage_size = 0;
   _stage_base = 0;
   _stage_range_count = 0;
+  _last_error[0] = 0;
   clearState();
 }
 
@@ -81,6 +86,7 @@ void RP2040OTAController::clearState() {
   _stage_size = 0;
   _stage_base = 0;
   _stage_range_count = 0;
+  _image_checked = false;
 }
 
 size_t RP2040OTAController::stageExtent() const {
@@ -128,21 +134,126 @@ void RP2040OTAController::appendMissList(char reply[], size_t max_len) const {
   size_t len = strlen(reply);
   int added = 0;
   size_t hole_start = 0;
-  for (int k = 0; k < _stage_range_count; k++) {
-    if (_stage_ranges[k].start > hole_start) {
+  const size_t extent = stageExtent();
+  // One pass past the last range reports the hole between it and the end of
+  // the block too: without it the tail of a block was never listed and had to
+  // be recovered by a rewind.
+  for (int k = 0; k <= _stage_range_count; k++) {
+    size_t next_start = k < _stage_range_count ? _stage_ranges[k].start : extent;
+    if (next_start > hole_start) {
       char item[32];
       snprintf(item, sizeof(item), "%s%lu+%lu",
                added == 0 ? " miss=" : ",",
                (unsigned long)(_stage_base + hole_start),
-               (unsigned long)(_stage_ranges[k].start - hole_start));
+               (unsigned long)(next_start - hole_start));
       size_t item_len = strlen(item);
       if (len + item_len >= max_len) break;
       strcpy(reply + len, item);
       len += item_len;
       if (++added >= 8) break;
     }
-    hole_start = _stage_ranges[k].end;
+    if (k < _stage_range_count) hole_start = _stage_ranges[k].end;
   }
+}
+
+bool RP2040OTAController::stageCovers(size_t start, size_t end) const {
+  for (int k = 0; k < _stage_range_count; k++) {
+    if (_stage_ranges[k].start <= start && _stage_ranges[k].end >= end) return true;
+  }
+  return false;
+}
+
+// ' mb=<base>:<chunk>:<hex>' - one bit per client chunk slot of the current
+// block, slot i = [base + i*chunk, +chunk), set when it is not fully received.
+// Least significant bit first, four bits per hex digit. Unlike the hole list it
+// is complete (every slot, tail included) in ~32 chars for a 16 KiB block of
+// 132 B chunks. Omitted when it does not fit; the client then has 'done'.
+void RP2040OTAController::appendMissBitmap(char reply[], size_t max_len, uint8_t chunk) const {
+  const size_t extent = stageExtent();
+  if (extent == 0 || chunk == 0) return;
+  const size_t slots = (extent + chunk - 1) / chunk;
+  const size_t digits = (slots + 3) / 4;
+  size_t len = strlen(reply);
+  char head[32];
+  int n = snprintf(head, sizeof(head), " mb=%lu:%u:", (unsigned long) _stage_base, (unsigned int) chunk);
+  if (n <= 0 || len + (size_t) n + digits >= max_len) return;
+  strcpy(reply + len, head);
+  char *dst = reply + len + n;
+  static const char kHex[] = "0123456789abcdef";
+  for (size_t d = 0; d < digits; d++) {
+    uint8_t nibble = 0;
+    for (size_t b = 0; b < 4; b++) {
+      size_t slot = d * 4 + b;
+      if (slot >= slots) break;
+      size_t start = slot * chunk;
+      size_t end = start + chunk < extent ? start + chunk : extent;
+      if (!stageCovers(start, end)) nibble |= (uint8_t)(1u << b);
+    }
+    dst[d] = kHex[nibble];
+  }
+  dst[digits] = 0;
+}
+
+// A complete block is written to flash here, when the client asks for status,
+// rather than from the write that completed it. The write usually arrives in
+// the middle of a burst, and a flush keeps interrupts off for ~0.25 s (up to
+// ~2 s): every chunk behind it was lost. A client waiting for this reply is
+// silent, so nothing is missed.
+void RP2040OTAController::buildStatus(char reply[], uint8_t bitmap_chunk) {
+  if (_active) {
+    if (_stage_size > 0 && !flushStage(reply)) return;   // reply set by the failed flush
+    sprintf(reply, "OTA active %lu/%lu nack=miss blk=%u",
+            (unsigned long) _received_size, (unsigned long) _expected_size,
+            (unsigned int) flushBlockBytes());
+    if (bitmap_chunk) {
+      appendMissBitmap(reply, 150, bitmap_chunk);
+    } else {
+      appendMissList(reply, 140);
+    }
+  } else if (_armed) {
+    strcpy(reply, "OTA armed");
+  } else if (_last_error[0]) {
+    strcpy(reply, _last_error);
+  } else {
+    strcpy(reply, "OTA idle");
+  }
+}
+
+// Address of the vector table an image expects to run from, read from its first
+// bytes. A standard image starts with the 256 B boot2 and keeps its vectors at
+// +0x100; images linked behind a bootloader (ESP32 flasher, dual OTA) start with
+// them. The reset handler follows the table, so its 4 KiB page is the link origin.
+// 0 when the bytes do not look like an RP2040 image.
+static uint32_t imageVectorTable(const uint8_t *p, size_t len) {
+  auto rd = [p](size_t o) { uint32_t v; memcpy(&v, p + o, 4); return v; };
+  auto looks = [&](size_t o) {
+    if (len < o + 8) return false;
+    uint32_t sp = rd(o), reset = rd(o + 4), addr = reset & ~1u;
+    return (sp & 3u) == 0 && sp >= 0x20000000u && sp <= 0x20082000u
+        && (reset & 1u) && addr >= 0x10000000u && addr < 0x11000000u;
+  };
+  if (looks(0)) return rd(4) & ~0xFFFu;
+  if (looks(0x100)) return (rd(0x104) & ~0xFFFu) + 0x100;
+  return 0;
+}
+
+// Refuses, as soon as the first bytes are in, an image linked for another flash
+// layout: a standard image on a node behind the ESP32 flasher or the dual OTA
+// shim (or the reverse) does not boot. Better to stop now than after a transfer.
+bool RP2040OTAController::checkImageVectors(char reply[]) {
+  if (_image_checked || _stage_base != 0 || stagePrefix() < 0x108) return true;
+  _image_checked = true;
+  if (_stage[0] == 0x1f && _stage[1] == 0x8b) return true;   // gzip: decompressed by the bootloader
+  const uint32_t image_vtor = imageVectorTable(_stage, stagePrefix());
+  const uint32_t node_vtor = scb_hw->vtor;
+  if (image_vtor == node_vtor) return true;
+  snprintf(_last_error, sizeof(_last_error), "Err - wrong image: vtor %08lx, node %08lx",
+           (unsigned long) image_vtor, (unsigned long) node_vtor);
+  OTA_DEBUG_PRINTLN("%s", _last_error);
+  abortUpdate();
+  clearState();
+  strcpy(reply, _last_error);
+  return false;
 }
 
 size_t RP2040OTAController::flushBlockBytes() const {
@@ -249,6 +360,7 @@ bool RP2040OTAController::startSession(const char *id, char reply[]) {
   }
 
   clearState();
+  _last_error[0] = 0;
   _armed = true;
   _last_activity_millis = millis();
 
@@ -260,14 +372,18 @@ bool RP2040OTAController::startSession(const char *id, char reply[]) {
     OTA_DEBUG_PRINTLN("stage buffer alloc failed, falling back to %u", OTA_UPDATER_INTERNAL_BLOCK);
   }
 
+  // mb=1: STATUS can answer with a complete miss bitmap (see appendMissBitmap).
+  // vtor=: where this node's vector table lives, so the client can refuse an
+  // image linked for another flash layout before sending it.
+  const unsigned long vtor = (unsigned long) scb_hw->vtor;
   FSInfo fs_info;
   if (LittleFS.info(fs_info) && fs_info.totalBytes >= fs_info.usedBytes) {
     uint32_t free_kb = (uint32_t)((fs_info.totalBytes - fs_info.usedBytes) / 1024ULL);
-    sprintf(reply, "OK - OTA ready (%lukB free, blk=%u, nack=miss)",
-            (unsigned long) free_kb, (unsigned int) flushBlockBytes());
+    sprintf(reply, "OK - OTA ready (%lukB free, blk=%u, nack=miss, mb=1, vtor=%08lx)",
+            (unsigned long) free_kb, (unsigned int) flushBlockBytes(), vtor);
     OTA_DEBUG_PRINTLN("session armed, free=%lu kB, blk=%u", (unsigned long) free_kb, (unsigned int) flushBlockBytes());
   } else {
-    sprintf(reply, "OK - OTA ready (blk=%u, nack=miss)", (unsigned int) flushBlockBytes());
+    sprintf(reply, "OK - OTA ready (blk=%u, nack=miss, mb=1, vtor=%08lx)", (unsigned int) flushBlockBytes(), vtor);
     OTA_DEBUG_PRINTLN("session armed, fs info unavailable");
   }
   return true;
@@ -286,16 +402,7 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
   }
 
   if (strncmp(sub, "status", 6) == 0 && (sub[6] == 0 || sub[6] == ' ')) {
-    if (_active) {
-      sprintf(reply, "OTA active %lu/%lu nack=miss blk=%u",
-              (unsigned long) _received_size, (unsigned long) _expected_size,
-              (unsigned int) flushBlockBytes());
-      appendMissList(reply, 140);
-    } else if (_armed) {
-      strcpy(reply, "OTA armed");
-    } else {
-      strcpy(reply, "OTA idle");
-    }
+    buildStatus(reply, 0);
     return true;
   }
 
@@ -572,6 +679,13 @@ bool RP2040OTAController::writeChunk(size_t offset, const uint8_t *chunk, size_t
 
       size_t extent = stageExtent();
       size_t win_end = _stage_base + extent;
+      if (extent != 0 && off >= win_end && stagePrefix() == extent) {
+        // The complete block normally waits for the STATUS that flushes it.
+        // Data for the next one means the client moved on without asking:
+        // flush now rather than drop it.
+        if (!flushStage(reply)) return true;  // reply set by the failed flush
+        continue;
+      }
       if (extent == 0 || off >= win_end) {
         if (!consumed_any) {
           OTA_DEBUG_PRINTLN("write rejected: bad offset %lu expected %lu",
@@ -604,9 +718,7 @@ bool RP2040OTAController::writeChunk(size_t offset, const uint8_t *chunk, size_t
       remaining -= n;
       consumed_any = true;
       _received_size = _stage_base + stagePrefix();
-      if (stagePrefix() == extent && !flushStage(reply)) {
-        return true;  // reply set by the failed flush
-      }
+      if (!checkImageVectors(reply)) return true;  // session dropped, reply set
     }
   } else {
     if (!was_contiguous) {
@@ -755,8 +867,15 @@ bool RP2040OTAController::handleBinaryCommand(uint8_t opcode, const uint8_t *pay
     case BIN_OP_END:
       return handleCommand("end", reply);
 
-    case BIN_OP_STATUS:
-      return handleCommand("status", reply);
+    case BIN_OP_STATUS: {
+      // Optional payload <flags:u8><chunk:u8>: flags bit 0 asks for the miss
+      // bitmap over the client's chunk slots. Older clients send nothing and get
+      // the hole list.
+      uint8_t bitmap_chunk = 0;
+      if (payload_len >= 2 && (payload[0] & 0x01)) bitmap_chunk = payload[1];
+      buildStatus(reply, bitmap_chunk);
+      return true;
+    }
 
     case BIN_OP_ABORT:
       return handleCommand("abort", reply);
