@@ -18,7 +18,7 @@ Resume succinct des ecarts du fork `patch_public` par rapport a `upstream/main` 
 
 ## Outil web OTA
 
-- Ajout du prototype `tools/web_ota_otg/` pour lancer une OTA distante depuis un navigateur.
+- L'outil `tools/web_ota_otg/` (OTA distante depuis un navigateur) est maintenu dans la branche `feature/lora-ota` (et donc `patch_public`) : utiliser celui-la.
 - Connexion au companion via USB (`Web Serial` ou `WebUSB`) ou via BLE (`Web Bluetooth`).
 - Le client web tente d'abord l'OTA binaire, puis bascule en OTA texte si necessaire.
 - Support d'un preset radio OTA temporaire et d'un auto-reglage des parametres (`chunk`, `ack_every`, timeouts) selon le preset radio actif.
