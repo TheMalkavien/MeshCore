@@ -3713,9 +3713,16 @@ async function runBinaryOta(params) {
   const statusOpts = () => (bitmapCapable
     ? { bitmapChunk: chunkSize, quietMs: OTA_STATUS_QUIET_MS }
     : { quietMs: OTA_STATUS_QUIET_MS });
-  const clampMissing = (list) => (list || [])
-    .filter((r) => r.off >= 0 && r.off < fwSize && r.len > 0)
-    .map((r) => ({ off: r.off, len: Math.min(r.len, fwSize - r.off) }));
+  // Seuls les octets déjà envoyés (< sentEnd) peuvent être des trous : une
+  // cible 'mb=1' qui vient de valider un bloc décrit déjà le bloc suivant,
+  // vide puisqu'on ne l'a pas encore émis. Le « réparer » ferait passer tout
+  // le reste du transfert par la boucle de réparation.
+  const clampMissing = (list, sentEnd = fwSize) => {
+    const end = Math.min(sentEnd, fwSize);
+    return (list || [])
+      .filter((r) => r.off >= 0 && r.off < end && r.len > 0)
+      .map((r) => ({ off: r.off, len: Math.min(r.len, end - r.off) }));
+  };
   const sameRanges = (a, b) => a.length === b.length
     && a.every((r, i) => r.off === b[i].off && r.len === b[i].len);
   otaBusyStats.events = 0;
@@ -4222,7 +4229,7 @@ async function runBinaryOta(params) {
             // trou(s) et nous liste les octets manquants — on ne réémet que
             // ça. Si la liste est vide ou absente (cible ancienne), on
             // retombe sur le rembobinage classique à 'done' ci-dessous.
-            let missing = clampMissing(st.status.missing);
+            let missing = clampMissing(st.status.missing, offset);
             let lastReply = st.reply;
             let repairRounds = 0;
             let stalledRounds = 0;
@@ -4246,7 +4253,7 @@ async function runBinaryOta(params) {
                 failure = st2.error || (st2.reply ? `status=${st2.reply}` : "status perdu après réparation");
                 break;
               }
-              const newMissing = clampMissing(st2.status.missing);
+              const newMissing = clampMissing(st2.status.missing, offset);
               // Progrès = la liste a changé. Comparer les octets totaux était faux
               // avec une liste plafonnée : une fois les premiers trous comblés,
               // les suivants apparaissent et le total peut remonter.
