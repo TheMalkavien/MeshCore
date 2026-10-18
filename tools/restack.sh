@@ -195,18 +195,21 @@ do_integrate() {
       "$(git log -1 --format=%s "$INTEGRATION" | cut -c1-60)"
     confirm "continue?"
   fi
-  # git refuses to move a branch checked out in another worktree, and would
-  # leave that worktree's files stale if it did - so run from there instead.
-  local here owner
+  # git refuses to move a branch checked out in another worktree from here, so
+  # when one owns it, the result is checked out over there instead - which also
+  # keeps that worktree's files in step. That needs its tree clean too.
+  local here owner orig
   here=$(git rev-parse --show-toplevel)
   owner=$(git worktree list --porcelain | awk -v ref="branch refs/heads/$INTEGRATION" '
     /^worktree / { wt = substr($0, 10) }
     $0 == ref    { print wt }')
-  if [ -n "$owner" ] && [ "$owner" != "$here" ]; then
-    echo "$INTEGRATION is checked out in another worktree: $owner" >&2
-    echo "run 'integrate' from there, or switch that worktree to another branch" >&2
+  [ "$owner" = "$here" ] && owner=""
+  if [ -n "$owner" ] && { ! git -C "$owner" diff --quiet || ! git -C "$owner" diff --cached --quiet; }; then
+    echo "$INTEGRATION is checked out in $owner, which has uncommitted changes" >&2
+    echo "commit or stash them there first" >&2
     exit 1
   fi
+  orig=$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)
   # Build on a detached HEAD: a named scratch branch, left behind by an
   # interrupted run, would block every later one.
   git checkout --quiet --detach "$BASE"
@@ -224,8 +227,16 @@ do_integrate() {
     fi
   done
 
-  git checkout --quiet -B "$INTEGRATION"
-  say "$INTEGRATION regenerated at $(git rev-parse --short HEAD)"
+  local result
+  result=$(git rev-parse HEAD)
+  if [ -n "$owner" ]; then
+    git -C "$owner" checkout --quiet -B "$INTEGRATION" "$result"
+    git checkout --quiet "$orig"
+    echo "  (checked out in $owner)"
+  else
+    git checkout --quiet -B "$INTEGRATION"
+  fi
+  say "$INTEGRATION regenerated at $(git rev-parse --short "$result")"
   echo "  NOTE: this rewrites $INTEGRATION. Branches that descend from it"
   echo "        (mqtt_espnow_multibridge, HTv4LowPower, ...) need re-basing too."
   echo "  NOTE: nothing is pushed, and nothing is built. Build before you trust it."
