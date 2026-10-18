@@ -1475,8 +1475,10 @@ void MyMesh::loop() {
   // client stopped - finished, failed, or lost mid-transfer with the session still
   // open. Otherwise the node stays unreachable on the short preset until the
   // tempradio timeout (often 20 min). A live transfer talks far more often.
+  // Signed compare: the '| 1' marker can put the stamp 1 ms in the future, and an
+  // unsigned difference would then wrap and drop the preset mid-transfer.
   const bool ota_preset_idle = temp_radio_ota_quiet_since
-      && millis() - temp_radio_ota_quiet_since > TEMP_RADIO_OTA_IDLE_MILLIS;
+      && (int32_t)(millis() - temp_radio_ota_quiet_since) > (int32_t)TEMP_RADIO_OTA_IDLE_MILLIS;
 
   if (revert_radio_at && (ota_preset_idle || millisHasNowPassed(revert_radio_at))) { // revert radio params to orig
     revert_radio_at = 0;                                        // clear timer
