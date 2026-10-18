@@ -247,6 +247,21 @@ void MyMesh::accumulatePingStats() {
   pending_ping.rsnr_sum += pending_ping.remote_snr;
 }
 
+// Prints hundredths as "[-]W.FF". Not %f: RP2040 builds link newlib-nano without
+// float printf, where %f prints nothing at all, and pulling it in costs ~7 KB of
+// flash. SNRs are quarter-dB integers anyway, so this is exact.
+static char* printCentis(char* p, int32_t centis) {
+  uint32_t a = centis < 0 ? (uint32_t)(-centis) : (uint32_t)centis;
+  return p + sprintf(p, "%s%lu.%02lu", centis < 0 ? "-" : "",
+                     (unsigned long)(a / 100), (unsigned long)(a % 100));
+}
+
+// Mean of quarter-dB samples, in hundredths, rounded half away from zero.
+static int32_t avgQuarterCentis(int32_t sum, uint16_t n) {
+  int32_t num = sum * 25;
+  return (num >= 0 ? num + n / 2 : num - n / 2) / n;
+}
+
 // One per-ping result line. For a single ping (count==1) the legacy format is preserved.
 void MyMesh::formatPingLine(char* out) const {
   char* p = out;
@@ -257,11 +272,10 @@ void MyMesh::formatPingLine(char* out) const {
     strcpy(p, "timeout");
     return;
   }
-  sprintf(p,
-          "rtt=%lums snr_rx=%.2f snr_tx=%.2f",
-          pending_ping.last_rtt,
-          pending_ping.local_snr / 4.0f,
-          pending_ping.remote_snr / 4.0f);
+  p += sprintf(p, "rtt=%lums snr_rx=", pending_ping.last_rtt);
+  p = printCentis(p, pending_ping.local_snr * 25);
+  p += sprintf(p, " snr_tx=");
+  printCentis(p, pending_ping.remote_snr * 25);
 }
 
 // Global summary over the whole session.
@@ -278,10 +292,18 @@ void MyMesh::formatPingSummary(char* out) const {
   if (recv > 0) {
     p += sprintf(p, " rtt=%lu/%lu/%lu ms",
                  pending_ping.rtt_min, pending_ping.rtt_sum / recv, pending_ping.rtt_max);
-    p += sprintf(p, " snr_rx=%.2f/%.2f/%.2f",
-                 pending_ping.lsnr_min / 4.0f, (pending_ping.lsnr_sum / (float)recv) / 4.0f, pending_ping.lsnr_max / 4.0f);
-    sprintf(p, " snr_tx=%.2f/%.2f/%.2f",
-            pending_ping.rsnr_min / 4.0f, (pending_ping.rsnr_sum / (float)recv) / 4.0f, pending_ping.rsnr_max / 4.0f);
+    p += sprintf(p, " snr_rx=");
+    p = printCentis(p, pending_ping.lsnr_min * 25);
+    *p++ = '/';
+    p = printCentis(p, avgQuarterCentis(pending_ping.lsnr_sum, recv));
+    *p++ = '/';
+    p = printCentis(p, pending_ping.lsnr_max * 25);
+    p += sprintf(p, " snr_tx=");
+    p = printCentis(p, pending_ping.rsnr_min * 25);
+    *p++ = '/';
+    p = printCentis(p, avgQuarterCentis(pending_ping.rsnr_sum, recv));
+    *p++ = '/';
+    printCentis(p, pending_ping.rsnr_max * 25);
   }
 }
 
