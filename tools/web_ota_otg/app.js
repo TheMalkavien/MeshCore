@@ -2620,6 +2620,7 @@ let lastPlanSummary = "";
 // par navigateur. Le mot de passe cible et le fichier firmware sont exclus
 // deliberement.
 const PREFS_KEY = "meshcore-web-ota.prefs.v1";
+const PREFS_VERSION = 2;
 const PREF_VALUE_FIELDS = [
   "connectionMode", "baudrate", "tcpTarget", "targetKey",
   "tempRadioFreq", "tempRadioBw", "tempRadioSf", "tempRadioCr", "tempRadioMins",
@@ -2636,7 +2637,10 @@ function setAdvancedOpen(open) {
 
 function savePrefs() {
   try {
-    const data = { advancedOpen: Boolean(ui.advancedBody?.classList.contains("open")) };
+    const data = {
+      prefsVersion: PREFS_VERSION,
+      advancedOpen: Boolean(ui.advancedBody?.classList.contains("open")),
+    };
     for (const key of PREF_VALUE_FIELDS) {
       if (ui[key]) data[key] = String(ui[key].value ?? "");
     }
@@ -2657,6 +2661,13 @@ function loadPrefs() {
     data = null;
   }
   if (!data || typeof data !== "object") return;
+  // v1 -> v2 : le preset OTA par défaut passe de 869.4/SF5 à 869.525/SF6. Une
+  // valeur restée égale à l'ancien défaut n'a pas été choisie : on la laisse au
+  // nouveau. Une valeur réglée à la main est conservée.
+  if ((Number(data.prefsVersion) || 1) < 2) {
+    if (data.tempRadioFreq === "869.4") delete data.tempRadioFreq;
+    if (data.tempRadioSf === "5") delete data.tempRadioSf;
+  }
   for (const key of PREF_VALUE_FIELDS) {
     if (ui[key] && typeof data[key] === "string") ui[key].value = data[key];
   }
@@ -2664,6 +2675,78 @@ function loadPrefs() {
     if (ui[key] && typeof data[key] === "boolean") ui[key].checked = data[key];
   }
   setAdvancedOpen(Boolean(data.advancedOpen));
+}
+
+// Restauration en attente du companion. Preset radio, airtime factor et RXPS
+// sont enregistrés en flash par le companion : une OTA interrompue (BLE coupé,
+// onglet fermé, plantage) le laissait sur le preset court, à 100 % de duty
+// cycle, jusqu'à intervention manuelle. On note ce qu'il faudra remettre avant
+// chaque changement, et on le remet au prochain branchement de CE companion.
+const PENDING_RESTORE_KEY = "meshcore-web-ota.pending-restore.v1";
+
+function loadPendingRestore() {
+  try {
+    const rec = JSON.parse(localStorage.getItem(PENDING_RESTORE_KEY) || "null");
+    return rec && typeof rec === "object" ? rec : null;
+  } catch {
+    return null;
+  }
+}
+
+function savePendingRestore(rec) {
+  try {
+    if (rec) localStorage.setItem(PENDING_RESTORE_KEY, JSON.stringify(rec));
+    else localStorage.removeItem(PENDING_RESTORE_KEY);
+  } catch {
+    // Stockage indisponible : on perd seulement la reprise après interruption.
+  }
+}
+
+function notePendingRestore(patch) {
+  const companionKey = String(lastSelfInfo?.public_key || "");
+  if (!companionKey) return;
+  const rec = loadPendingRestore();
+  const base = rec && rec.companionKey === companionKey ? rec : { companionKey };
+  savePendingRestore({ ...base, ...patch, savedAt: Date.now() });
+}
+
+async function recoverPendingCompanionRestore(selfInfo) {
+  const rec = loadPendingRestore();
+  if (!rec || !selfInfo?.public_key || rec.companionKey !== selfInfo.public_key) return;
+  appendLog("Une OTA précédente s'est interrompue avant de restaurer ce companion : restauration…");
+  let ok = true;
+  if (rec.preset) {
+    const r = await client.setLocalRadioParams(rec.preset.freq, rec.preset.bw, rec.preset.sf, rec.preset.cr, 0);
+    if (r.ok) {
+      applySelfRadioPresetToCache(rec.preset);
+      appendLog(`Preset radio companion restauré: ${formatRadioPresetText(rec.preset)}.`);
+    } else {
+      ok = false;
+      appendLog(`Warning: restauration du preset radio échouée (${r.error}).`);
+    }
+  }
+  if (rec.tuning) {
+    const r = await client.setTuningParams(rec.tuning.rx_delay_base, rec.tuning.airtime_factor);
+    if (r.ok) {
+      appendLog(`Airtime factor companion restauré (${rec.tuning.airtime_factor}).`);
+    } else {
+      ok = false;
+      appendLog(`Warning: restauration de l'airtime factor échouée (${r.error}).`);
+    }
+  }
+  if (rec.rxps) {
+    const r = await client.setCustomVar("rxps", "1");
+    if (r.ok) {
+      appendLog("RXPS companion réactivé.");
+    } else {
+      ok = false;
+      appendLog(`Warning: réactivation du RXPS échouée (${r.error}).`);
+    }
+  }
+  if (ok) {
+    savePendingRestore(null);
+    showToast("Réglages du companion restaurés après une OTA interrompue", "ok");
+  }
 }
 
 function attachPrefsPersistence() {
@@ -4917,6 +5000,38 @@ async function refreshKnownRepeaters(logToConsole = false) {
 // D'ou la sonde de verification : constater une reponse est le seul moyen de
 // savoir que les DEUX sens fonctionnent en direct.
 let forcedDirectPath = null; // { fullKey, contact, prevLen, prevPath, applied }
+// Chemin d'origine photographié avant toute étape qui le réécrit (login rattrapé
+// en flood, amorçage) : sans lui, la restauration finale remettait le chemin
+// réappris en cours de route, jamais celui de l'utilisateur.
+let originalPathSnapshot = null; // { fullKey, prevLen, prevPath }
+
+// Remet le chemin photographié quand aucun forçage ne l'a pris en charge :
+// forçage désactivé (l'amorçage a quand même purgé le chemin), ou échec avant
+// l'étape de forçage.
+async function restoreUnusedPathSnapshot() {
+  const snap = originalPathSnapshot;
+  originalPathSnapshot = null;
+  if (!snap || !client?.connected) return;
+  const contact = await fetchContactRecord(snap.fullKey, true);
+  if (!contact || Number(contact.out_path_len) === snap.prevLen) return;
+  const res = await client.setContactOutPath(contact, snap.prevLen, snap.prevPath);
+  appendLog(res.ok
+    ? `Chemin d'origine restauré vers ${targetKeyPreview(snap.fullKey)}.`
+    : `Warning: restauration du chemin d'origine echouee (${res.error}).`);
+  updateTargetPathLine();
+}
+
+async function snapshotOriginalTargetPath(fullKeyHex) {
+  const contact = await fetchContactRecord(fullKeyHex, true);
+  originalPathSnapshot = contact
+    ? {
+      fullKey: normalizeHex(contact.public_key).slice(0, 64),
+      prevLen: Number(contact.out_path_len),
+      prevPath: hexToBytes(contact.out_path || ""),
+    }
+    : null;
+  return originalPathSnapshot;
+}
 
 function contactIsDirectPath(contact) {
   const len = Number(contact?.out_path_len);
@@ -4989,13 +5104,16 @@ async function forceDirectPathToTarget(fullKeyHex, reason = "ota") {
     );
   }
 
-  const prevLen = Number(contact.out_path_len);
-  const prevPath = hexToBytes(contact.out_path || "");
+  const contactKey = normalizeHex(contact.public_key).slice(0, 64);
+  const snap = originalPathSnapshot?.fullKey === contactKey ? originalPathSnapshot : null;
+  originalPathSnapshot = null;
+  const prevLen = snap ? snap.prevLen : Number(contact.out_path_len);
+  const prevPath = snap ? snap.prevPath : hexToBytes(contact.out_path || "");
   // Zero saut en conservant la taille de hash du noeud : ecrire un 0 brut
   // forcerait le contact en mode hash 1 octet.
-  const directLen = directPathLenFrom(prevLen);
+  const directLen = directPathLenFrom(Number(contact.out_path_len));
   forcedDirectPath = {
-    fullKey: normalizeHex(contact.public_key).slice(0, 64),
+    fullKey: contactKey,
     contact: { ...contact },
     prevLen,
     prevPath,
@@ -5250,6 +5368,12 @@ async function initClientSession(baudrate) {
 
   await syncNodeClock();
 
+  try {
+    await recoverPendingCompanionRestore(selfInfo);
+  } catch (e) {
+    appendLog(`Restauration après OTA interrompue impossible: ${e.message}`);
+  }
+
   await refreshKnownRepeaters(true);
 
   updateSelfInfoUi(selfInfo, true);
@@ -5486,7 +5610,18 @@ async function restoreTargetRadioPresetAfterFailedOta(targetHex, previousPreset)
   // PENDANT la tentative d'OTA suivante, refaisant basculer la cible sur le
   // preset standard en plein établissement de lien. Attendre l'ACK garantit
   // qu'il est délivré (et non ré-émis) avant qu'on rende la main.
-  const ackRes = await client.sendRepeaterCmdAndWaitReply(targetHex, cmd, TEMP_RADIO_ACK_TIMEOUT_SEC);
+  // Trois tentatives : sinon la cible reste injoignable sur le preset court
+  // jusqu'à l'expiration du tempradio (20 min par défaut). Renvoyer tempradio
+  // est sans risque, il ne fait que reprogrammer la même bascule.
+  let ackRes = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    ackRes = await client.sendRepeaterCmdAndWaitReply(targetHex, cmd, TEMP_RADIO_ACK_TIMEOUT_SEC);
+    if (!ackRes.error) break;
+    if (attempt < 3) {
+      appendLog(`Restauration cible sans ACK (${ackRes.error}), tentative ${attempt + 1}/3…`);
+      await sleep(OTA_STATUS_QUIET_MS);
+    }
+  }
   if (ackRes.error) {
     throw new Error(`restauration cible non confirmée (${ackRes.error})`);
   }
@@ -5838,6 +5973,9 @@ if (ui.checkPathBtn) {
     ui.checkPathBtn.disabled = true;
     try {
       const fullKey = await client.resolveTargetFullKeyForBinary(targetHex);
+      // Photographier avant l'amorçage, qui purge le chemin : c'est cet état-là
+      // que la restauration finale doit remettre.
+      if (fullKey) await snapshotOriginalTargetPath(fullKey);
       const primed = await primeReturnPath(targetHex, fullKey, "vérification");
       if (ui.forceDirectPath?.checked) {
         if (!fullKey) {
@@ -5868,6 +6006,7 @@ if (ui.checkPathBtn) {
       // La verification ne doit rien laisser derriere elle.
       try {
         await restoreTargetContactPath();
+        await restoreUnusedPathSnapshot();
       } catch (pathErr) {
         appendLog(`Warning: restauration du chemin echouee (${pathErr.message}).`);
       }
@@ -5986,6 +6125,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
           + `LNA FEM ${"fem_rxgain" in vars ? (femBypass ? "en bypass" : "actif") : "n/a"}.`
         );
         if (rxpsOn && ui.suspendCompanionRxps?.checked) {
+          notePendingRestore({ rxps: true });
           const r = await client.setCustomVar("rxps", "0");
           if (r.ok) {
             restoreCompanionRxps = true;
@@ -6007,23 +6147,20 @@ ui.startOtaBtn.addEventListener("click", async () => {
       appendLog(`Réception companion non vérifiée: ${e.message}`);
     }
 
-    // ETAPE CHEMIN : avant la moindre commande vers la cible (login inclus),
-    // imposer un chemin direct 0 saut depuis le companion. Sans ca, les paquets
-    // suivent le out_path deja memorise - typiquement multi-saut - et l'OTA ne
-    // peut pas aboutir : sur preset temporaire les relais n'entendent plus rien.
+    // ETAPE CHEMIN (1/2) : photographier le chemin d'origine AVANT tout ce qui
+    // peut le réécrire (login rattrapé en flood, amorçage), pour que la
+    // restauration finale remette bien celui de l'utilisateur. L'amorçage et le
+    // forçage du direct viennent après le login (étape 2/2).
+    let fullKeyForPath = null;
     if (ui.forceDirectPath?.checked) {
-      setOtaStatus("Chemin direct vers la cible…");
-      const fullKeyForPath = await client.resolveTargetFullKeyForBinary(selectedTargetHex);
+      fullKeyForPath = await client.resolveTargetFullKeyForBinary(selectedTargetHex);
       if (!fullKeyForPath) {
         throw new Error(
           "Impossible de resoudre la cle complete de la cible pour imposer le chemin direct. "
           + "Rafraichis la liste des repeteurs, ou renseigne la cle 64 hex."
         );
       }
-      // Amorcer AVANT de forcer : l'amorcage purge puis reapprend le chemin
-      // (c'est tout l'interet), le forcage doit donc venir apres.
-      await primeReturnPath(selectedTargetHex, fullKeyForPath, "avant OTA");
-      await forceDirectPathToTarget(fullKeyForPath, "ota-start");
+      await snapshotOriginalTargetPath(fullKeyForPath);
     } else {
       const known = lookupCachedContact(selectedTargetHex);
       if (known) {
@@ -6064,6 +6201,13 @@ ui.startOtaBtn.addEventListener("click", async () => {
     } else {
       appendLog(`Firmware: ${file.name} (source ${firmwareInfo?.sourceFormat || "bin"} ${formatByteCount(firmwareInfo?.originalSize || firmware.length)})`);
     }
+    // Les cibles récentes annoncent leur disposition ('vtor=') et l'image est
+    // vérifiée contre elle après START. Pour les plus anciennes, l'afficher
+    // reste le seul garde-fou : une erreur coûte un transfert complet.
+    const layoutVtor = rp2040ImageVectorTable(firmwareVariants?.raw?.bytes);
+    if (layoutVtor) {
+      appendLog(`Image RP2040 : disposition ${describeRp2040Layout(layoutVtor)} — doit correspondre à la cible.`);
+    }
     updatePlanLine(true);
 
     const password = String(ui.targetPassword.value || "").trim();
@@ -6096,12 +6240,23 @@ ui.startOtaBtn.addEventListener("click", async () => {
       await reassertDirectPath("post-login");
     }
 
+    // ETAPE CHEMIN (2/2) : amorcer le chemin retour puis imposer le direct 0 saut,
+    // avant les commandes OTA. Après le login : une cible qui n'a pas encore ce
+    // client dans son ACL ne peut pas déchiffrer la requête d'amorçage. Amorcer
+    // AVANT de forcer : l'amorçage purge puis réapprend le chemin.
+    if (fullKeyForPath) {
+      setOtaStatus("Chemin direct vers la cible…");
+      await primeReturnPath(selectedTargetHex, fullKeyForPath, "avant OTA");
+      await forceDirectPathToTarget(fullKeyForPath, "ota-start");
+    }
+
     // Booste le budget d'airtime du companion local le temps de l'OTA (réglage
     // par USB, restauré en fin de transfert). Sans ça, le duty cycle par défaut
     // plafonne le débit radio bien en dessous de l'airtime réel des chunks.
     try {
       const tuning = await client.getTuningParams();
       if (tuning && tuning.airtime_factor > OTA_AIRTIME_FACTOR) {
+        notePendingRestore({ tuning });
         const set = await client.setTuningParams(tuning.rx_delay_base, OTA_AIRTIME_FACTOR);
         if (set.ok) {
           restoreTuningParams = tuning;
@@ -6130,6 +6285,8 @@ ui.startOtaBtn.addEventListener("click", async () => {
       // les presets) au lieu de lancer l'OTA à l'aveugle sur un lien désynchro
       // et de laisser la cible bloquée sur le preset court jusqu'au timeout.
       setOtaStatus("Bascule radio de la cible…");
+      const presetBefore = extractRadioPresetFromSelfInfo(lastSelfInfo);
+      if (presetBefore) notePendingRestore({ preset: presetBefore });
       restoreClientPreset = await applyTempRadioPresetForOta(params.targetHex, tempPreset);
 
       setOtaStatus("Vérification de la cible…");
@@ -6138,7 +6295,12 @@ ui.startOtaBtn.addEventListener("click", async () => {
         // Sur le preset temporaire, aucun relais n'ecoute : un flood y est
         // forcement direct. C'est donc le moment ideal pour aligner le chemin
         // de retour du repeteur. Une reponse vaut sonde, on ne la refait pas.
-        const primed = await primeReturnPath(params.targetHex, probeKey, `preset temporaire ${attempt}`);
+        // Seulement si le forçage est actif : l'amorçage purge le chemin, et
+        // rien ne le restaurerait sinon (sans réponse, il resterait inconnu et
+        // tout le transfert partirait en flood).
+        const primed = ui.forceDirectPath?.checked
+          ? await primeReturnPath(params.targetHex, probeKey, `preset temporaire ${attempt}`)
+          : { ok: false };
         await reassertDirectPath("post-amorcage");
         const probe = primed.ok ? primed : await probeTargetReachable(
           params.targetHex,
@@ -6238,15 +6400,18 @@ ui.startOtaBtn.addEventListener("click", async () => {
         );
       }
     }
+    let companionRestoreFailed = false;
     if (restoreTuningParams) {
       try {
         const r = await client.setTuningParams(restoreTuningParams.rx_delay_base, restoreTuningParams.airtime_factor);
         if (r.ok) {
           appendLog(`Airtime factor companion restauré (${restoreTuningParams.airtime_factor}).`);
         } else {
+          companionRestoreFailed = true;
           appendLog(`Warning: restauration airtime factor échouée (${r.error}) — vérifie les réglages du companion.`);
         }
       } catch (tuningErr) {
+        companionRestoreFailed = true;
         appendLog(`Warning: restauration airtime factor échouée (${tuningErr.message}) — vérifie les réglages du companion.`);
       }
     }
@@ -6257,6 +6422,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
           applyAutoOtaSettings("restore");
         }
       } catch (restoreErr) {
+        companionRestoreFailed = true;
         appendLog(`Warning: restauration preset client échouée: ${restoreErr.message}`);
       }
     }
@@ -6265,17 +6431,25 @@ ui.startOtaBtn.addEventListener("click", async () => {
     if (restoreCompanionRxps) {
       try {
         const r = await client.setCustomVar("rxps", "1");
+        if (!r.ok) companionRestoreFailed = true;
         appendLog(
           r.ok
             ? "RXPS companion réactivé."
             : `Warning: réactivation du RXPS companion échouée (${r.error}) — réactive-le dans l'appli (variable rxps = 1).`
         );
       } catch (rxpsErr) {
+        companionRestoreFailed = true;
         appendLog(`Warning: réactivation du RXPS companion échouée (${rxpsErr.message}) — réactive-le dans l'appli (variable rxps = 1).`);
       }
     }
+    if (companionRestoreFailed) {
+      appendLog("Les réglages du companion seront restaurés automatiquement à sa prochaine connexion.");
+    } else {
+      savePendingRestore(null);
+    }
     try {
       await restoreTargetContactPath();
+      await restoreUnusedPathSnapshot();
     } catch (pathErr) {
       appendLog(`Warning: restauration du chemin d'origine echouee (${pathErr.message}).`);
     }
