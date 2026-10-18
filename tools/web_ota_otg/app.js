@@ -28,6 +28,10 @@ const OTA_STATUS_QUIET_MS = 700;
 // renvoi, rounds au plus par bloc, et rounds consécutifs sans progrès tolérés
 // avant de se replier sur le rembobinage.
 const OTA_REPAIR_STATUS_ATTEMPTS = 3;
+// Marge ajoutée au temps d'antenne d'un fragment avant le suivant : la cible
+// relance sa réception après chaque paquet (veille, TCXO, configuration RX,
+// ~7 ms), et un préambule qui commence pendant ce temps est perdu.
+const OTA_RX_TURNAROUND_GUARD_MS = 25;
 const OTA_REPAIR_MAX_ROUNDS = 12;
 const OTA_REPAIR_MAX_STALLS = 3;
 const CMD_GET_DEVICE_TIME = 5;
@@ -1039,6 +1043,27 @@ function estimateRejectedChunks(localOffset, serverOffset, chunkSize) {
 function otaBusyRetryDelay(noAckGapMs, busyOrdinal = 1) {
   const base = Math.max(55, Number(noAckGapMs) || 0);
   return Math.min(180, base + (20 * Math.max(0, busyOrdinal - 1)));
+}
+
+// Temps d'antenne d'un paquet LoRa (formule Semtech : en-tête explicite, CRC),
+// avec le préambule que le firmware applique (preambleLengthForSF : 32 symboles
+// jusqu'à SF8, 16 au-delà). SF6/BW250/CR5, 150 octets : ~77 ms.
+function loraAirtimeMs(payloadBytes, sf, bwKhz, crDenom) {
+  const tsym = (2 ** sf) / bwKhz;
+  const preamble = sf <= 8 ? 32 : 16;
+  const de = tsym > 16 ? 1 : 0;
+  const cr = clamp(crDenom - 4, 1, 4);
+  const extra = sf <= 6 ? 6.25 : 4.25;
+  const payloadSym = 8 + Math.max(
+    Math.ceil((8 * payloadBytes - 4 * sf + 44) / (4 * (sf - 2 * de))) * (cr + 4), 0);
+  return (preamble + extra + payloadSym) * tsym;
+}
+
+// Octets à l'antenne d'une requête OTA WRITE : en-tête 1 + path_len 1 + hashes 2
+// + MAC 2 + partie chiffrée (tag 4, type 1, opcode 1, offset 4, longueur 1,
+// données) complétée par AES à un multiple de 16.
+function otaWritePacketBytes(dataLen) {
+  return 6 + (Math.ceil((11 + dataLen) / 16) * 16);
 }
 
 function estimateOtaRadioProfile(radioBwKhz, radioSf, radioCr) {
@@ -3718,6 +3743,19 @@ async function runBinaryOta(params) {
     .map((r) => ({ off: r.off, len: Math.min(r.len, fwSize - r.off) }));
   const sameRanges = (a, b) => a.length === b.length
     && a.every((r, i) => r.off === b[i].off && r.len === b[i].len);
+  // Cadence plancher : jamais un fragment avant que le précédent soit parti
+  // (temps d'antenne) et que la cible ait relancé sa réception. En BLE,
+  // l'aller-retour (~90 ms) dépasse déjà ce plancher ; en USB, sans lui, le
+  // companion émettait les fragments bord à bord : la cible n'en recevait que
+  // le premier, et le companion, occupé à vider sa file, n'entendait plus ses
+  // réponses. Le même plancher sépare le dernier fragment d'un STATUS.
+  const selfPreset = extractRadioPresetFromSelfInfo(lastSelfInfo);
+  const pacingRadio = radioProfile
+    || (selfPreset ? { sf: selfPreset.sf, bwKhz: selfPreset.bw, cr: selfPreset.cr } : null);
+  const minChunkIntervalMs = (dataLen) => (pacingRadio
+    ? loraAirtimeMs(otaWritePacketBytes(dataLen), pacingRadio.sf, pacingRadio.bwKhz, pacingRadio.cr)
+      + OTA_RX_TURNAROUND_GUARD_MS
+    : 0);
   otaBusyStats.events = 0;
   otaBusyStats.sleepMs = 0;
 
@@ -3742,6 +3780,7 @@ async function runBinaryOta(params) {
           firmware.subarray(missOff, missOff + n)
         );
         const busyDeadlineMs = performance.now() + Math.max(8000, (Number(checkpointTimeoutMs) || 1500) * 4);
+        const repairStartMs = performance.now();
         let busyWaits = 0;
         for (;;) {
           chunkWriteAttempts += 1;
@@ -3774,7 +3813,10 @@ async function runBinaryOta(params) {
         }
         missOff += n;
         left -= n;
-        if (noAckGapMs > 0) await sleep(noAckGapMs);
+        // Même plancher que la boucle principale, mesuré depuis l'envoi : il
+        // sépare aussi le dernier renvoi du STATUS de confirmation qui suit.
+        const repairWait = Math.max(noAckGapMs, minChunkIntervalMs(n)) - (performance.now() - repairStartMs);
+        if (repairWait > 0) await sleep(repairWait);
       }
     }
     return !otaCancelRequested;
@@ -4183,15 +4225,16 @@ async function runBinaryOta(params) {
           paceWindowCongested = 0;
         }
 
-        if (!checkpointDue && dynamicGapMs > 0) {
-          // Le round-trip série (attente du msg_sent) et les attentes code=3
-          // font déjà partie de l'intervalle : on ne dort que le reliquat, pas
-          // en plus. Un chunk qui a busy-waité au-delà du gap ne dort donc pas.
-          const gapLeft = dynamicGapMs - (performance.now() - writeStartMs);
-          if (gapLeft > 0) {
-            feedGapSleepMs += gapLeft;
-            await sleep(gapLeft);
-          }
+        // Le round-trip série (attente du msg_sent) et les attentes code=3
+        // font déjà partie de l'intervalle : on ne dort que le reliquat, pas
+        // en plus. Avant un checkpoint, seul le plancher radio compte : il
+        // laisse partir ce dernier fragment avant le STATUS.
+        const floorMs = minChunkIntervalMs(chunkLen);
+        const intervalMs = checkpointDue ? floorMs : Math.max(dynamicGapMs, floorMs);
+        const gapLeft = intervalMs - (performance.now() - writeStartMs);
+        if (gapLeft > 0) {
+          feedGapSleepMs += gapLeft;
+          await sleep(gapLeft);
         }
       } else {
         continue;
