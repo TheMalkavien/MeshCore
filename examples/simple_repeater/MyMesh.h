@@ -106,7 +106,10 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   CayenneLPP telemetry;
   unsigned long set_radio_at, revert_radio_at;
   bool temp_radio_for_ota;
-  unsigned long temp_radio_ota_quiet_since;   // 0 = not watching
+  unsigned long temp_radio_ota_quiet_since;   // last OTA traffic on a 'tempradio ...,ota' preset; 0 = not watching
+  void noteOtaTraffic() {
+    if (temp_radio_ota_quiet_since) temp_radio_ota_quiet_since = millis() | 1;
+  }
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;
