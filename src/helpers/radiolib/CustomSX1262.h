@@ -42,7 +42,13 @@ class CustomSX1262 : public SX1262 {
       if (err != RADIOLIB_ERR_NONE) return err;
       err = calibrate(RADIOLIB_SX126X_CALIBRATE_ALL);
       delay(50);
-      return err;
+      if (err != RADIOLIB_ERR_NONE) return err;
+      // Calibrate(0x7F) also redoes the image calibration, for the chip's default
+      // 902-928 MHz band. begin() had already done it for the real band, and
+      // setFrequency() only recalibrates on a jump of 20 MHz or more, so nothing
+      // would ever put it back: the receiver would run with image rejection tuned
+      // for the wrong band. Same fix as sx126xResetAGC().
+      return calibrateImage(freqMHz);
     }
 
   #ifdef RP2040_PLATFORM
