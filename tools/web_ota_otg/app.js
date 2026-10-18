@@ -26,6 +26,8 @@ const CMD_SET_RADIO_PARAMS = 11;
 const CMD_SET_TUNING_PARAMS = 21;
 const CMD_GET_TUNING_PARAMS = 43;
 const CMD_ADD_UPDATE_CONTACT = 9;
+const CMD_GET_CUSTOM_VARS = 40;
+const CMD_SET_CUSTOM_VAR = 41;
 // MeshCore.h : taille max (en octets) d'un out_path memorise pour un contact.
 const MAX_PATH_SIZE = 64;
 // ContactInfo.h : out_path_len == 0xFF => "aucun chemin connu", le prochain
@@ -89,6 +91,7 @@ const PACKET_TYPE = {
   NO_MORE_MSGS: 10,
   DEVICE_INFO: 13,
   CONTACT_MSG_RECV_V3: 16,
+  CUSTOM_VARS: 21,
   TUNING_PARAMS: 23,
   MESSAGES_WAITING: 0x83,
   LOGIN_SUCCESS: 0x85,
@@ -1577,6 +1580,17 @@ class MeshCoreSerialClient {
         this.emit("contact_msg_recv", msg);
         break;
       }
+      case PACKET_TYPE.CUSTOM_VARS: {
+        // "name:value,name:value" - sensor settings, plus receive-path
+        // settings (rxps, rxps_level, fem_rxgain) on firmwares that expose them.
+        const vars = {};
+        for (const item of textDecoder.decode(frame.slice(1)).split(",")) {
+          const sep = item.indexOf(":");
+          if (sep > 0) vars[item.slice(0, sep).trim()] = item.slice(sep + 1).trim();
+        }
+        this.emit("custom_vars", { vars });
+        break;
+      }
       case PACKET_TYPE.TUNING_PARAMS:
         this.emit("tuning_params", {
           rx_delay_base: frame.length >= 9 ? parseU32LE(frame, 1) / 1000.0 : null,
@@ -2021,6 +2035,28 @@ class MeshCoreSerialClient {
     return { ok: true };
   }
 
+  // Companion custom vars, or null on a firmware that refuses the command.
+  async getCustomVars(timeoutMs = 3000) {
+    const evt = await this.sendCommand(
+      Uint8Array.of(CMD_GET_CUSTOM_VARS),
+      ["custom_vars", "error"],
+      null,
+      timeoutMs
+    );
+    if (!evt || evt.type === "error") return null;
+    return evt.payload?.vars || {};
+  }
+
+  async setCustomVar(name, value, timeoutMs = 3000) {
+    const payload = concatBytes(Uint8Array.of(CMD_SET_CUSTOM_VAR), textEncoder.encode(`${name}:${value}`));
+    const evt = await this.sendCommand(payload, ["ok", "error"], null, timeoutMs);
+    if (!evt || evt.type === "error") {
+      const code = evt?.payload?.error_code;
+      return { ok: false, error: `set ${name} error${code !== undefined ? ` (code=${code})` : ""}` };
+    }
+    return { ok: true };
+  }
+
   async setLocalRadioParams(freqMhz, bwKhz, sf, cr, repeat = 0) {
     const norm = normalizeRadioPreset({ freq: freqMhz, bw: bwKhz, sf, cr });
     if (!norm) {
@@ -2445,6 +2481,7 @@ const ui = {
   targetKey: document.querySelector("#targetKey"),
   targetPassword: document.querySelector("#targetPassword"),
   forceDirectPath: document.querySelector("#forceDirectPath"),
+  suspendCompanionRxps: document.querySelector("#suspendCompanionRxps"),
   restorePathAfter: document.querySelector("#restorePathAfter"),
   checkPathBtn: document.querySelector("#checkPathBtn"),
   pathLine: document.querySelector("#pathLine"),
@@ -2515,7 +2552,7 @@ const PREF_VALUE_FIELDS = [
   "tempRadioFreq", "tempRadioBw", "tempRadioSf", "tempRadioCr", "tempRadioMins",
   "chunkSize", "ackEvery", "noAckGap", "checkpointTimeout",
 ];
-const PREF_CHECK_FIELDS = ["forceDirectPath", "restorePathAfter", "autoTune", "useTempRadio"];
+const PREF_CHECK_FIELDS = ["forceDirectPath", "restorePathAfter", "autoTune", "useTempRadio", "suspendCompanionRxps"];
 
 function setAdvancedOpen(open) {
   if (!ui.advancedBody || !ui.advancedToggle) return;
@@ -5762,6 +5799,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
 
   let restoreClientPreset = null;
   let restoreTuningParams = null;
+  let restoreCompanionRxps = false;
   let activeTargetHex = "";
   // Vrai seulement si la cible a été effectivement jointe sur le preset
   // temporaire. Conditionne la restauration cible du finally : si on ne l'a
@@ -5776,6 +5814,42 @@ ui.startOtaBtn.addEventListener("click", async () => {
       throw new Error("Sélectionne un répéteur cible ou renseigne une pubkey manuelle (>=12 hex).");
     }
     activeTargetHex = selectedTargetHex;
+
+    // ETAPE RECEPTION COMPANION : RXPS et LNA du FEM sont persistés sous des clés
+    // que plusieurs firmwares partagent, donc un réglage laissé par une image
+    // précédente survit au reflash sans se voir. Sur un lien faible il fait perdre
+    // les réponses de la cible (login et pings passent encore). On l'affiche, et
+    // on coupe le RXPS avant le login : il gêne déjà la réception de sa réponse.
+    try {
+      const vars = await client.getCustomVars();
+      if (vars && ("rxps" in vars || "fem_rxgain" in vars)) {
+        const rxpsOn = vars.rxps === "1";
+        const femBypass = vars.fem_rxgain === "0";
+        appendLog(
+          `Réception companion: RXPS ${"rxps" in vars ? (rxpsOn ? `actif (niveau ${vars.rxps_level ?? "?"})` : "inactif") : "n/a"}, `
+          + `LNA FEM ${"fem_rxgain" in vars ? (femBypass ? "en bypass" : "actif") : "n/a"}.`
+        );
+        if (rxpsOn && ui.suspendCompanionRxps?.checked) {
+          const r = await client.setCustomVar("rxps", "0");
+          if (r.ok) {
+            restoreCompanionRxps = true;
+            appendLog("RXPS companion coupé pour la durée de l'OTA (réception continue), réactivé à la fin.");
+          } else {
+            appendLog(`Warning: RXPS companion non coupé (${r.error}) — les réponses de la cible risquent de se perdre sur un lien faible.`);
+          }
+        } else if (rxpsOn) {
+          appendLog("Warning: RXPS companion actif — sur un lien faible, des réponses de la cible seront perdues.");
+        }
+        if (femBypass) {
+          appendLog(
+            "Warning: LNA du FEM companion en bypass — plusieurs dB de sensibilité en moins sur les liens longs. "
+            + "Active-le dans l'appli (variable fem_rxgain = 1) si la cible est loin."
+          );
+        }
+      }
+    } catch (e) {
+      appendLog(`Réception companion non vérifiée: ${e.message}`);
+    }
 
     // ETAPE CHEMIN : avant la moindre commande vers la cible (login inclus),
     // imposer un chemin direct 0 saut depuis le companion. Sans ca, les paquets
@@ -6028,6 +6102,20 @@ ui.startOtaBtn.addEventListener("click", async () => {
         }
       } catch (restoreErr) {
         appendLog(`Warning: restauration preset client échouée: ${restoreErr.message}`);
+      }
+    }
+    // Après le preset : le firmware recalcule les périodes RXPS pour le SF/BW en
+    // vigueur au moment où on le réactive.
+    if (restoreCompanionRxps) {
+      try {
+        const r = await client.setCustomVar("rxps", "1");
+        appendLog(
+          r.ok
+            ? "RXPS companion réactivé."
+            : `Warning: réactivation du RXPS companion échouée (${r.error}) — réactive-le dans l'appli (variable rxps = 1).`
+        );
+      } catch (rxpsErr) {
+        appendLog(`Warning: réactivation du RXPS companion échouée (${rxpsErr.message}) — réactive-le dans l'appli (variable rxps = 1).`);
       }
     }
     try {
