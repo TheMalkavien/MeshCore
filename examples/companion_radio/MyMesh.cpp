@@ -934,6 +934,20 @@ constexpr uint8_t RXPS_COMPANION_DEFAULT_ENABLED = RXPS_DEFAULT_ENABLED ? 1 : 0;
 constexpr uint8_t RXPS_COMPANION_DEFAULT_ENABLED = 0;
 #endif
 
+
+// External FEM receive-path LNA. The board applies it (attachDynamicPrefs reads
+// radio_fem_rxgain through the custom store's fallback to the radio prefs), so
+// this default is what a fresh or migrated install starts with. On the Heltec
+// V4.3 the KCT8103L LNA costs roughly 6 mA of continuous RX current; low-power
+// profiles set RADIO_FEM_RXGAIN_DEFAULT=0 so the preference cannot silently
+// raise consumption.
+#if defined(RADIO_FEM_RXGAIN_DEFAULT)
+constexpr uint8_t FEM_RXGAIN_COMPANION_DEFAULT = RADIO_FEM_RXGAIN_DEFAULT ? 1 : 0;
+#else
+// Preserve the upstream companion default outside explicitly tuned low-power
+// profiles.
+constexpr uint8_t FEM_RXGAIN_COMPANION_DEFAULT = 1;
+#endif
 } // namespace
 
 void MyMesh::armPendingReqTimeout(uint32_t estimated_timeout_ms) {
@@ -1038,7 +1052,7 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   _prefs.rx_ps_enabled = RXPS_COMPANION_DEFAULT_ENABLED;
   _prefs.rx_ps_level = RXPS_COMPANION_DEFAULT_LEVEL;
   _prefs.rx_ps_preamble = RXPS_COMPANION_DEFAULT_PREAMBLE;
-  _prefs.radio_fem_rxgain = 1;
+  _prefs.radio_fem_rxgain = FEM_RXGAIN_COMPANION_DEFAULT;
 #ifdef RADIO_FEM_TXGAIN
   _prefs.radio_fem_txgain = RADIO_FEM_TXGAIN;   // board-specific default for PA
 #else
@@ -1128,12 +1142,13 @@ void MyMesh::begin() {
 #endif
   }
   if (_prefs.prefs_format_version < 2) {
-    // v1 -> v2: RXPS moved from "always off
-    // on upgrade" to "adopt the build default". Applied once, and remains
-    // user-overridable after.
+    // v1 -> v2: radio_fem_rxgain was appended, and RXPS moved from "always off
+    // on upgrade" to "adopt the build default". Both are receive-path changes,
+    // so they are applied together, once, and remain user-overridable after.
     _prefs.rx_ps_enabled = RXPS_COMPANION_DEFAULT_ENABLED;
     _prefs.rx_ps_level = RXPS_COMPANION_DEFAULT_LEVEL;
     _prefs.rx_ps_preamble = RXPS_COMPANION_DEFAULT_PREAMBLE;
+    _prefs.radio_fem_rxgain = FEM_RXGAIN_COMPANION_DEFAULT;
   }
   if (_prefs.prefs_format_version < 3) {
     // RXPS was not compiled into the earlier Heltec V3 BLE/IDF profile, so an
@@ -2368,7 +2383,12 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
                                   radio_driver.rxPowerSavingTransitionUs());
     const RxPowerSavingStatus status = radio_driver.getRxPowerSavingStatus();
     // One line: replies travel back over the app and remote admin too (160 bytes max).
-    snprintf(reply, 160, "> rxps %s L%u P%u %lu/%lu us, armed=%s, wd=%lu/%lu, eff=%lu/%lu, err=%d, fails=%lu%s",
+#if defined(HELTEC_LORA_V4)
+    const char* fem_note = ", SX1262 only (FEM not cycled)";
+#else
+    const char* fem_note = "";
+#endif
+    snprintf(reply, 160, "> rxps %s L%u P%u %lu/%lu us, armed=%s, wd=%lu/%lu, eff=%lu/%lu, err=%d, fails=%lu%s%s",
              _prefs.rx_ps_enabled ? "on" : "off", (unsigned)_prefs.rx_ps_level,
              (unsigned)_prefs.rx_ps_preamble, (unsigned long)rx_us, (unsigned long)sleep_us,
              radio_driver.isRxPowerSavingArmed() ? "yes" : "no",
@@ -2376,7 +2396,7 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
              (unsigned long)radio_driver.getRxPsWatchdogHardCount(),
              (unsigned long)status.effective_rx_us, (unsigned long)status.effective_sleep_us,
              status.last_error, (unsigned long)status.arm_failures,
-             _prefs.rx_ps_level >= 9 ? ", unguarded" : "");
+             _prefs.rx_ps_level >= 9 ? ", unguarded" : "", fem_note);
     return true;
   }
 
