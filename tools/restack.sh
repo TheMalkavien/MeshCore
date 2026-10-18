@@ -4,9 +4,10 @@
 # the integration branch from it.
 #
 #   ./tools/restack.sh check       what would move, and whether the merge still applies cleanly
-#   ./tools/restack.sh rebase      restack every branch onto its parent
+#   ./tools/restack.sh sync        fast-forward the local mirror branch (dev) to upstream
+#   ./tools/restack.sh rebase      sync, then restack every branch onto its parent
 #   ./tools/restack.sh integrate   regenerate the integration branch from the stack
-#   ./tools/restack.sh push        force-push the whole set to origin (asks first)
+#   ./tools/restack.sh push        force-push the whole set to origin, plus dev (asks first)
 #   ./tools/restack.sh all         rebase, then integrate - never push
 #   ./tools/restack.sh order       print the merge order, one per line (used by CI)
 #
@@ -29,6 +30,12 @@ if [ -z "${RESTACK_DETACHED:-}" ]; then
 fi
 
 BASE=upstream/dev
+
+# Local branch kept as a plain mirror of $BASE. The stack never uses it - it
+# rebases straight onto $BASE - but branches started from it (sensor_tracker,
+# the espnow ones) inherit whatever it was left at. It only ever fast-forwards:
+# a mirror that has diverged has commits on it that belong on a feature branch.
+MIRROR=dev
 
 # The branch 'integrate' rewrites. Override to rehearse without touching the real
 # one:  INTEGRATION=patch_public_test ./tools/restack.sh integrate
@@ -104,6 +111,52 @@ confirm() {
   case "$answer" in [yY]*) return 0 ;; *) echo "  aborted"; exit 1 ;; esac
 }
 
+# Prints the worktree that has <branch> checked out, if it is not this one.
+worktree_of() {
+  local here owner
+  here=$(git rev-parse --show-toplevel)
+  owner=$(git worktree list --porcelain | awk -v ref="branch refs/heads/$1" '
+    /^worktree / { wt = substr($0, 10) }
+    $0 == ref    { print wt }')
+  [ "$owner" = "$here" ] || echo "$owner"
+}
+
+# Fast-forwards $MIRROR to $BASE. Expects $BASE to be freshly fetched. Refuses,
+# before anything moves, when the mirror has commits upstream does not.
+do_sync() {
+  say "mirror $MIRROR"
+  if ! git rev-parse --verify --quiet "$MIRROR" >/dev/null; then
+    git branch --quiet --no-track "$MIRROR" "$BASE"
+    ok "$MIRROR" "created at $(git rev-parse --short $BASE)"
+    return 0
+  fi
+  local old behind
+  old=$(git rev-parse --short "$MIRROR")
+  if ! git merge-base --is-ancestor "$MIRROR" "$BASE"; then
+    bad "$MIRROR" "has $(git rev-list --count "$BASE..$MIRROR") commit(s) not in $BASE"
+    echo "  $MIRROR is a mirror; move those commits to a feature branch, then:"
+    echo "    git branch -f $MIRROR $BASE"
+    exit 1
+  fi
+  behind=$(git rev-list --count "$MIRROR..$BASE")
+  if [ "$behind" -eq 0 ]; then
+    ok "$MIRROR" "up to date"
+    return 0
+  fi
+  local owner
+  owner=$(worktree_of "$MIRROR")
+  if [ -z "$owner" ] && [ "$(git symbolic-ref --quiet --short HEAD)" = "$MIRROR" ]; then
+    owner=$(git rev-parse --show-toplevel)
+  fi
+  if [ -n "$owner" ]; then
+    # Checked out somewhere: move it there, so that worktree's files follow.
+    git -C "$owner" merge --quiet --ff-only "$BASE"
+  else
+    git branch --quiet -f "$MIRROR" "$BASE"
+  fi
+  ok "$MIRROR" "$old -> $(git rev-parse --short "$MIRROR") (+$behind)"
+}
+
 record_refs() {
   say "current tips (recover with: git branch -f <branch> <sha>)"
   for b in "${MERGE_ORDER[@]}"; do
@@ -130,6 +183,7 @@ do_rebase() {
   local before
   before=$(count_own_commits)
   git fetch upstream --quiet
+  do_sync
 
   # Every old base is computed BEFORE anything moves. This is the whole trick:
   # once a parent has been rebased, 'git rebase <parent> <branch>' picks a merge
@@ -198,12 +252,8 @@ do_integrate() {
   # git refuses to move a branch checked out in another worktree from here, so
   # when one owns it, the result is checked out over there instead - which also
   # keeps that worktree's files in step. That needs its tree clean too.
-  local here owner orig
-  here=$(git rev-parse --show-toplevel)
-  owner=$(git worktree list --porcelain | awk -v ref="branch refs/heads/$INTEGRATION" '
-    /^worktree / { wt = substr($0, 10) }
-    $0 == ref    { print wt }')
-  [ "$owner" = "$here" ] && owner=""
+  local owner orig
+  owner=$(worktree_of "$INTEGRATION")
   if [ -n "$owner" ] && { ! git -C "$owner" diff --quiet || ! git -C "$owner" diff --cached --quiet; }; then
     echo "$INTEGRATION is checked out in $owner, which has uncommitted changes" >&2
     echo "commit or stash them there first" >&2
@@ -269,9 +319,28 @@ do_push() {
     fi
   done
 
-  if [ "$changed" -eq 0 ]; then
+  # The mirror is pushed separately and never forced: if origin's copy is not an
+  # ancestor of it, something was committed there and the push should fail.
+  local push_mirror=0 mirror_remote=""
+  if git rev-parse --verify --quiet "$MIRROR" >/dev/null; then
+    git rev-parse --verify --quiet "origin/$MIRROR" >/dev/null && mirror_remote=$(git rev-parse --short "origin/$MIRROR")
+    local_sha=$(git rev-parse --short "$MIRROR")
+    if [ "$local_sha" = "$mirror_remote" ]; then
+      printf '  %-34s %s  unchanged\n' "$MIRROR" "$local_sha"
+    else
+      printf '  %-34s %s -> %s  (fast-forward)\n' "$MIRROR" "${mirror_remote:-new}" "$local_sha"
+      push_mirror=1
+    fi
+  fi
+
+  if [ "$changed" -eq 0 ] && [ "$push_mirror" -eq 0 ]; then
     echo
     echo "  nothing to push"
+    return 0
+  fi
+  if [ "$changed" -eq 0 ]; then
+    confirm "push $MIRROR?"
+    git push origin "$MIRROR"
     return 0
   fi
 
@@ -281,12 +350,17 @@ do_push() {
   echo
   confirm "push?"
   git push --force-with-lease origin "${refs[@]}"
+  [ "$push_mirror" -eq 0 ] || git push origin "$MIRROR"
 }
 
 # Read-only: does each branch still apply, and does the whole set still merge?
 do_check() {
   git fetch upstream --quiet
   say "behind $BASE"
+  if git rev-parse --verify --quiet "$MIRROR" >/dev/null; then
+    printf '  %-34s %s commits%s\n' "$MIRROR (mirror)" "$(git rev-list --count "$MIRROR..$BASE")" \
+      "$(git merge-base --is-ancestor "$MIRROR" "$BASE" || echo ' - DIVERGED, sync will refuse')"
+  fi
   for b in "${MERGE_ORDER[@]}"; do
     printf '  %-34s %s commits\n' "$b" "$(git rev-list --count "$b..$BASE")"
   done
@@ -318,9 +392,10 @@ do_check() {
 case "${1:-check}" in
   order)     printf '%s\n' "${MERGE_ORDER[@]}" ;;   # for CI - see stack-check.yml
   check)     do_check ;;
+  sync)      git fetch upstream --quiet; do_sync ;;
   rebase)    do_rebase ;;
   integrate) do_integrate ;;
   push)      do_push ;;
   all)       do_rebase; do_integrate ;;   # deliberately no push - see do_push()
-  *)         sed -n '3,18p' "$0"; exit 1 ;;
+  *)         sed -n '3,20p' "$0"; exit 1 ;;
 esac
