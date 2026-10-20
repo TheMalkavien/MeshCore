@@ -610,6 +610,10 @@
           <label for="restorePathAfter">Restaurer le chemin d'origine après l'opération</label>
         </div>
         <div class="check-row">
+          <input id="rebootAfterAbort" type="checkbox" checked>
+          <label for="rebootAfterAbort" title="Une OTA interrompue laisse la cible avec un horodatage en avance pour ce companion : après un redémarrage du companion, elle l'ignorerait plusieurs minutes. Le reboot (seulement si la session est close et qu'aucun END n'est parti) efface cette avance et ramène la cible sur son preset permanent.">Redémarrer la cible après une OTA annulée ou échouée</label>
+        </div>
+        <div class="check-row">
           <input id="suspendCompanionRxps" type="checkbox" checked>
           <label for="suspendCompanionRxps" title="La réception cyclique (RXPS) du companion rate des réponses de la cible sur un lien faible. Elle est remise à l'identique en fin d'opération.">Couper le RXPS du companion pendant l'OTA (réception continue)</label>
         </div>
