@@ -1,0 +1,6 @@
+# MeshCore → Telegram relay bot dependencies
+# The bot requests CallbackAPIVersion.VERSION1 when available, so both paho-mqtt
+# 1.6.x and 2.x work.
+paho-mqtt>=1.6.1
+requests>=2.25.0
+pycryptodome>=3.15.0
