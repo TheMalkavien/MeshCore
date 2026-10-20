@@ -154,6 +154,11 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   PendingPing pending_ping;
   CayenneLPP telemetry;
   unsigned long set_radio_at, revert_radio_at;
+  bool temp_radio_for_ota;
+  unsigned long temp_radio_ota_quiet_since;   // last OTA traffic on a 'tempradio ...,ota' preset; 0 = not watching
+  void noteOtaTraffic() {
+    if (temp_radio_ota_quiet_since) temp_radio_ota_quiet_since = millis() | 1;
+  }
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;
@@ -226,9 +231,9 @@ protected:
   bool getCADEnabled() const override {
     return _prefs.cad_enabled;
   }
-  int getAGCResetInterval() const override {
-    return ((int)_prefs.agc_reset_interval) * 4000;   // milliseconds
-  }
+  int getAGCResetInterval() const override;      // defined in .cpp: suspended during OTA
+  uint32_t getCADFailRetryDelay() const override;
+  uint32_t getCADFailMaxDuration() const override;
   uint8_t getExtraAckTransmitCount() const override {
     return _prefs.multi_acks;
   }
@@ -278,6 +283,7 @@ public:
 
   // CommonCLICallbacks
   void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) override;
+  void setTempRadioForOta(bool for_ota) override { temp_radio_for_ota = for_ota; }
   bool formatFileSystem() override;
   void sendSelfAdvertisement(int delay_millis, bool flood) override;
   void updateAdvertTimer() override;

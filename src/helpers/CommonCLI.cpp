@@ -235,9 +235,27 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       } else {
         strcpy(reply, "ERR: clock cannot go backwards");
       }
-    } else if (memcmp(command, "start ota", 9) == 0) {
+    }
+#ifdef MLK_ESP32_FLASHER_PIN
+    else if (memcmp(command, "start esp32ota", 14) == 0) {
+      // Boards that carry an ESP32 co-processor acting as the flasher: pulse the
+      // wake pin, then let the ESP32 drive the update over its own transport.
+      pinMode(MLK_ESP32_FLASHER_PIN, OUTPUT);
+      digitalWrite(MLK_ESP32_FLASHER_PIN, HIGH); // wake up esp32flasher
+      delay(500);
+      digitalWrite(MLK_ESP32_FLASHER_PIN, LOW);  // stay low to avoid another wake up
+      strcpy(reply, "Waking UP ESP32Flasher to flash the firmware.");
+    }
+#endif
+    else if (memcmp(command, "start ota", 9) == 0) {
       if (!_board->startOTAUpdate(_prefs->node_name, reply)) {
         strcpy(reply, "Error");
+      }
+    } else if (memcmp(command, "ota", 3) == 0 && (command[3] == 0 || command[3] == ' ')) {
+      const char* sub = &command[3];
+      while (*sub == ' ') sub++;
+      if (!_board->handleOTACommand(sub, reply)) {
+        strcpy(reply, "Err - OTA unsupported");
       }
     } else if (memcmp(command, "clock", 5) == 0) {
       uint32_t now = getRTCClock()->getCurrentTime();
@@ -269,15 +287,20 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       }
     } else if (memcmp(command, "tempradio ", 10) == 0) {
       StrHelper::strncpy(tmp, &command[10], sizeof(tmp));
-      const char *parts[5];
-      int num = mesh::Utils::parseTextParts(tmp, parts, 5);
+      // Optional 6th field 'ota': the preset is for a firmware update, so the
+      // node may drop it early once no update is running. Older firmware parses
+      // five fields and ignores it.
+      const char *parts[6];
+      int num = mesh::Utils::parseTextParts(tmp, parts, 6);
       float freq  = num > 0 ? strtof(parts[0], nullptr) : 0.0f;
       float bw    = num > 1 ? strtof(parts[1], nullptr) : 0.0f;
       uint8_t sf  = num > 2 ? atoi(parts[2]) : 0;
       uint8_t cr  = num > 3 ? atoi(parts[3]) : 0;
       int temp_timeout_mins  = num > 4 ? atoi(parts[4]) : 0;
+      bool for_ota = num > 5 && strcmp(parts[5], "ota") == 0;
       if (freq >= 150.0f && freq <= 2500.0f && sf >= 5 && sf <= 12 && cr >= 5 && cr <= 8 && bw >= 7.0f && bw <= 500.0f && temp_timeout_mins > 0) {
         _callbacks->applyTempRadioParams(freq, bw, sf, cr, temp_timeout_mins);
+        _callbacks->setTempRadioForOta(for_ota);
         sprintf(reply, "OK - temp params for %d mins", temp_timeout_mins);
       } else {
         strcpy(reply, "Error, invalid params");

@@ -64,6 +64,7 @@ extern "C" bool meshcore_board_usb_is_connected(void) {
 #define REQ_TYPE_GET_ACCESS_LIST    0x05
 #define REQ_TYPE_GET_NEIGHBOURS     0x06
 #define REQ_TYPE_GET_OWNER_INFO     0x07     // FIRMWARE_VER_LEVEL >= 2
+#define REQ_TYPE_OTA_BINARY         0x70
 
 #define RESP_SERVER_LOGIN_OK        0 // response to ANON_REQ
 
@@ -72,6 +73,28 @@ extern "C" bool meshcore_board_usb_is_connected(void) {
 #define ANON_REQ_TYPE_BASIC        0x03   // just remote clock
 
 #define CLI_REPLY_DELAY_MILLIS      600
+
+/* ------------------------- Mesh OTA timing ---------------------------- */
+// An OTA transfer is a long chain of small request/reply round trips, and each
+// of the standard delays below is tuned for sparse human traffic. Applied to a
+// firmware upload they dominate the transfer time: the 300ms response delay
+// alone adds ~15s. While an OTA session is running the client sits silent in
+// RX, so a short turnaround is safe.
+#ifndef OTA_CLI_REPLY_DELAY_MILLIS
+  #define OTA_CLI_REPLY_DELAY_MILLIS 40
+#endif
+#ifndef OTA_TXT_ACK_DELAY
+  #define OTA_TXT_ACK_DELAY 0
+#endif
+// See MyMesh::loop(): how long a 'tempradio ...,ota' preset outlives the last
+// open update session (or the switch, if none ever opened).
+#ifndef TEMP_RADIO_OTA_IDLE_MILLIS
+  #define TEMP_RADIO_OTA_IDLE_MILLIS (2UL * 60UL * 1000UL)
+#endif
+
+#ifndef OTA_SERVER_RESPONSE_DELAY_MILLIS
+  #define OTA_SERVER_RESPONSE_DELAY_MILLIS 40
+#endif
 
 #define LAZY_CONTACTS_WRITE_DELAY    5000
 #define PING_TIMEOUT_MILLIS          8000
@@ -101,6 +124,54 @@ extern "C" bool meshcore_board_usb_is_connected(void) {
 
 #define OTHER_PREFS_VERSION  1
 #define OTHER_PREFS_FILE     "/other_prefs"
+
+static const char* skipCommandSpaces(const char* p) {
+  while (*p == ' ') p++;
+  return p;
+}
+
+// True for the CLI commands that belong to an OTA transfer, so the reply/ACK
+// delays above can be applied to them and only them.
+static bool isOtaCLICommand(const char* command) {
+  if (command == NULL) return false;
+  const char* p = skipCommandSpaces(command);
+  p += CommonCLI::getCommandPrefixLen(p);   // same prefix rule handleCommand() strips
+  p = skipCommandSpaces(p);
+
+  if (memcmp(p, "start ota", 9) == 0 && (p[9] == 0 || p[9] == ' ')) return true;
+  if (memcmp(p, "ota", 3) == 0 && (p[3] == 0 || p[3] == ' ')) return true;
+  return false;
+}
+
+int MyMesh::getAGCResetInterval() const {
+  // The periodic AGC reset puts the radio into a brief warm sleep; during an
+  // OTA chunk stream that RX gap loses packets (seen as periodic resync
+  // bursts), so suspend it while a session is active.
+  if (board.isOTASessionActive()) {
+    return 0;
+  }
+  return ((int)_prefs.agc_reset_interval) * 4000;   // milliseconds
+}
+
+uint32_t MyMesh::getCADFailRetryDelay() const {
+  // At the fast OTA presets (low SF) the sticky PREAMBLE_DETECTED flag is
+  // frequently raised by noise; the default 120-360ms backoff quantizes every
+  // STATUS reply stall to multiples of that and dominates checkpoint latency.
+  // During an OTA session the channel is otherwise quiet, so re-check quickly.
+  if (board.isOTASessionActive()) {
+    return 20;
+  }
+  return mesh::Mesh::getCADFailRetryDelay();
+}
+
+uint32_t MyMesh::getCADFailMaxDuration() const {
+  // Bound how long a noise-stuck preamble flag can defer the STATUS reply;
+  // the OTA client is silent while waiting, so forcing TX after 400ms is safe.
+  if (board.isOTASessionActive()) {
+    return 400;
+  }
+  return mesh::Mesh::getCADFailMaxDuration();
+}
 
 void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
 #if MAX_NEIGHBOURS // check if neighbours enabled
@@ -935,6 +1006,39 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
   } else if (payload[0] == REQ_TYPE_GET_OWNER_INFO) {
     sprintf((char *) &reply_data[4], "%s\n%s\n%s", FIRMWARE_VERSION, _prefs.node_name, _prefs.owner_info);
     return 4 + strlen((char *) &reply_data[4]);
+  } else if (payload[0] == REQ_TYPE_OTA_BINARY) {
+    // Platform-neutral: the board decides whether mesh OTA is supported
+    // (RP2040 and ESP32 boards implement it; others reply 'unsupported'
+    // instead of staying silent, which the web client reports clearly).
+    if (sender == NULL || !sender->isAdmin()) {
+      strcpy((char*)&reply_data[4], "Err - admin required");
+      return 4 + strlen((char*)&reply_data[4]);
+    }
+    noteOtaTraffic();
+    if (payload_len < 2) {
+      strcpy((char*)&reply_data[4], "Err - bad OTA req");
+      return 4 + strlen((char*)&reply_data[4]);
+    }
+
+    uint8_t opcode = payload[1];
+    const uint8_t *req_payload = payload_len > 2 ? &payload[2] : NULL;
+    size_t req_len = payload_len > 2 ? payload_len - 2 : 0;
+
+    char ota_reply[160];
+    ota_reply[0] = 0;
+    if (!board.handleOTABinaryCommand(opcode, req_payload, req_len, ota_reply)) {
+      strcpy(ota_reply, "Err - OTA unsupported");
+    }
+
+    size_t ota_reply_len = strlen(ota_reply);
+    if (ota_reply_len == 0) {
+      return 0; // no reply for intermediate write chunks
+    }
+    if (ota_reply_len > MAX_PACKET_PAYLOAD - 4) {
+      ota_reply_len = MAX_PACKET_PAYLOAD - 4;
+    }
+    memcpy(&reply_data[4], ota_reply, ota_reply_len);
+    return 4 + ota_reply_len;
   }
   return 0; // unknown command
 }
@@ -1278,25 +1382,28 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
     memcpy(&timestamp, data, 4);
 
     if (timestamp > client->last_timestamp) { // prevent replay attacks
+      bool is_ota_req = (len > 4 && data[4] == REQ_TYPE_OTA_BINARY);
       int reply_len = handleRequest(client, timestamp, &data[4], len - 4);
       if (reply_len == 0) return; // invalid command
 
       client->last_timestamp = timestamp;
       client->last_activity = getRTCClock()->getCurrentTime();
 
+      uint32_t response_delay = is_ota_req ? OTA_SERVER_RESPONSE_DELAY_MILLIS : SERVER_RESPONSE_DELAY;
+
       if (packet->isRouteFlood()) {
         // let this sender know path TO here, so they can use sendDirect(), and ALSO encode the response
         mesh::Packet *path = createPathReturn(client->id, secret, packet->path, packet->path_len,
                                               PAYLOAD_TYPE_RESPONSE, reply_data, reply_len);
-        if (path) sendFloodReply(path, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+        if (path) sendFloodReply(path, response_delay, packet->getPathHashSize());
       } else {
         mesh::Packet *reply =
             createDatagram(PAYLOAD_TYPE_RESPONSE, client->id, secret, reply_data, reply_len);
         if (reply) {
           if (client->out_path_len != OUT_PATH_UNKNOWN) { // we have an out_path, so send DIRECT
-            sendDirect(reply, client->out_path, client->out_path_len, SERVER_RESPONSE_DELAY);
+            sendDirect(reply, client->out_path, client->out_path_len, response_delay);
           } else {
-            sendFloodReply(reply, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+            sendFloodReply(reply, response_delay, packet->getPathHashSize());
           }
         }
       }
@@ -1317,6 +1424,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
       // len can be > original length, but 'text' will be padded with zeroes
       data[len] = 0; // need to make a C string again, with null terminator
+      bool ota_command = isOtaCLICommand((char *)&data[5]);
 
       if (flags == TXT_TYPE_PLAIN) { // for legacy CLI, send Acks
         uint32_t ack_hash; // calc truncated hash of the message timestamp + text + sender pub_key, to prove
@@ -1326,10 +1434,11 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
         mesh::Packet *ack = createAck(ack_hash);
         if (ack) {
+          uint32_t ack_delay = ota_command ? OTA_TXT_ACK_DELAY : TXT_ACK_DELAY;
           if (client->out_path_len == OUT_PATH_UNKNOWN) {
             sendFloodReply(ack, TXT_ACK_DELAY, packet->getPathHashSize());
           } else {
-            sendDirect(ack, client->out_path, client->out_path_len, TXT_ACK_DELAY);
+            sendDirect(ack, client->out_path, client->out_path_len, ack_delay);
           }
         }
       }
@@ -1361,10 +1470,11 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
         auto reply = createDatagram(PAYLOAD_TYPE_TXT_MSG, client->id, secret, temp, 5 + text_len);
         if (reply) {
+          uint32_t reply_delay = ota_command ? OTA_CLI_REPLY_DELAY_MILLIS : CLI_REPLY_DELAY_MILLIS;
           if (client->out_path_len == OUT_PATH_UNKNOWN) {
             sendFloodReply(reply, CLI_REPLY_DELAY_MILLIS, packet->getPathHashSize());
           } else {
-            sendDirect(reply, client->out_path, client->out_path_len, CLI_REPLY_DELAY_MILLIS);
+            sendDirect(reply, client->out_path, client->out_path_len, reply_delay);
           }
         }
       }
@@ -1490,6 +1600,8 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   next_local_advert = next_flood_advert = 0;
   dirty_contacts_expiry = 0;
   set_radio_at = revert_radio_at = 0;
+  temp_radio_for_ota = false;
+  temp_radio_ota_quiet_since = 0;
   _logging = false;
   region_load_active = false;
   active_cli_client = NULL;
@@ -1630,6 +1742,8 @@ void MyMesh::applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, 
   pending_bw = bw;
   pending_sf = sf;
   pending_cr = cr;
+  temp_radio_for_ota = false;        // set again by setTempRadioForOta() for 'tempradio ...,ota'
+  temp_radio_ota_quiet_since = 0;
 
   revert_radio_at = futureMillis(2000 + timeout_mins * 60 * 1000); // schedule when to revert radio params
 }
@@ -1829,7 +1943,17 @@ void MyMesh::clearStats() {
   ((SimpleMeshTables *)getTables())->resetStats();
 }
 
+// 'ota ...' and 'start ota' (text transport), after the optional '<hex>|'
+// reply-matching prefix the web client adds.
+static bool isOtaCliCommand(const char *c) {
+  const char *bar = strchr(c, '|');
+  if (bar && bar - c <= 4) c = bar + 1;
+  while (*c == ' ') c++;
+  return memcmp(c, "ota", 3) == 0 || memcmp(c, "start ota", 9) == 0;
+}
+
 void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply) {
+  if (isOtaCliCommand(command)) noteOtaTraffic();
   if (region_load_active) {
     if (StrHelper::isBlank(command)) {  // empty/blank line, signal to terminate 'load' operation
       region_map = temp_map;  // copy over the temp instance as new current map
@@ -2006,14 +2130,18 @@ void MyMesh::loop() {
     }
   }
 
-  if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
+  // No adverts during a firmware update: each one is a transmit the node cannot
+  // receive through, landing in the middle of the client's chunk stream. A due
+  // advert simply goes out once the session ends.
+  const bool ota_quiet = board.isOTASessionActive();
+  if (!ota_quiet && next_flood_advert && millisHasNowPassed(next_flood_advert)) {
     mesh::Packet *pkt = createSelfAdvert();
     uint32_t delay_millis = 0;
     if (pkt) sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
 
     updateFloodAdvertTimer(); // schedule next flood advert
     updateAdvertTimer();      // also schedule local advert (so they don't overlap)
-  } else if (next_local_advert && millisHasNowPassed(next_local_advert)) {
+  } else if (!ota_quiet && next_local_advert && millisHasNowPassed(next_local_advert)) {
     mesh::Packet *pkt = createSelfAdvert();
     if (pkt) sendZeroHop(pkt);
 
@@ -2024,10 +2152,22 @@ void MyMesh::loop() {
     set_radio_at = 0;                                     // clear timer
     radio_driver.setParams(pending_freq, pending_bw, pending_sf, pending_cr);
     MESH_DEBUG_PRINTLN("Temp radio params");
+    if (temp_radio_for_ota) temp_radio_ota_quiet_since = millis() | 1;   // 0 means 'not watching'
   }
 
-  if (revert_radio_at && millisHasNowPassed(revert_radio_at)) { // revert radio params to orig
+  // A preset set up for a firmware update ('tempradio ...,ota') is dropped once no
+  // OTA traffic has arrived for TEMP_RADIO_OTA_IDLE_MILLIS: none ever came, or the
+  // client stopped - finished, failed, or lost mid-transfer with the session still
+  // open. Otherwise the node stays unreachable on the short preset until the
+  // tempradio timeout (often 20 min). A live transfer talks far more often.
+  // Signed compare: the '| 1' marker can put the stamp 1 ms in the future, and an
+  // unsigned difference would then wrap and drop the preset mid-transfer.
+  const bool ota_preset_idle = temp_radio_ota_quiet_since
+      && (int32_t)(millis() - temp_radio_ota_quiet_since) > (int32_t)TEMP_RADIO_OTA_IDLE_MILLIS;
+
+  if (revert_radio_at && (ota_preset_idle || millisHasNowPassed(revert_radio_at))) { // revert radio params to orig
     revert_radio_at = 0;                                        // clear timer
+    temp_radio_ota_quiet_since = 0;
     radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
     MESH_DEBUG_PRINTLN("Radio params restored");
   }
