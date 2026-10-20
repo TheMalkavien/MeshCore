@@ -4,6 +4,12 @@
 #include <helpers/SensorManager.h>
 #include <helpers/sensors/LocationProvider.h>
 
+#if ENV_INCLUDE_INA219
+// True and fills `mv` when an INA219 was detected at begin() and gives a plausible reading.
+// Lets a board prefer it over its ADC pin for battery voltage; false -> keep using the ADC.
+bool env_ina219_battery_mv(uint16_t& mv);
+#endif
+
 class EnvironmentSensorManager : public SensorManager {
 protected:
   static const int MAX_ACTIVE_SENSORS = 16;
