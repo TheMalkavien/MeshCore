@@ -3,6 +3,9 @@
 #include <Arduino.h>
 #include <MeshCore.h>
 #include <helpers/KeyValueStore.h>
+#if defined(MLK_SENSORS) && ENV_INCLUDE_INA219
+  #include <helpers/sensors/EnvironmentSensorManager.h>
+#endif
 
 #if defined(ARDUINO_ARCH_RP2040)
   #include <hardware/clocks.h>
@@ -53,6 +56,11 @@ public:
 #endif
 
   uint16_t getBattMilliVolts() override {
+#if defined(MLK_SENSORS) && ENV_INCLUDE_INA219
+    // A detected INA219 takes priority; otherwise fall through to the ADC pin.
+    uint16_t ina_mv;
+    if (env_ina219_battery_mv(ina_mv)) return ina_mv;
+#endif
 #if defined(PIN_VBAT_READ) && defined(ADC_MULTIPLIER)
     analogReadResolution(12);
 
