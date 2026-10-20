@@ -2557,6 +2557,7 @@ const ui = {
   forceDirectPath: document.querySelector("#forceDirectPath"),
   suspendCompanionRxps: document.querySelector("#suspendCompanionRxps"),
   restorePathAfter: document.querySelector("#restorePathAfter"),
+  rebootAfterAbort: document.querySelector("#rebootAfterAbort"),
   checkPathBtn: document.querySelector("#checkPathBtn"),
   pathLine: document.querySelector("#pathLine"),
   firmwareFile: document.querySelector("#firmwareFile"),
@@ -2605,6 +2606,11 @@ let otaCompleted = false;
 // Compteurs de backpressure locale (code=3), partagés entre runBinaryOta et
 // getOtaStatusBinary, remis à zéro à chaque transfert.
 const otaBusyStats = { events: 0, sleepMs: 0 };
+// État de la session cible pour le nettoyage d'une OTA interrompue, remis à
+// zéro à chaque lancement. Le reboot de nettoyage exige un abort confirmé et
+// aucun END émis : un END dont seule la réponse s'est perdue a pu valider une
+// image, qu'un reboot appliquerait.
+const otaTargetCleanup = { abortAttempted: false, abortConfirmed: false, endAttempted: false };
 let lastSelfInfo = null;
 // Verrou d'ecran maintenu pendant l'OTA. En USB OTG sur telephone, l'extinction
 // de l'ecran endort l'onglet et gele l'alimentation des chunks en plein
@@ -3493,24 +3499,40 @@ function isOkOtaReply(text) {
   return String(text || "").trim().toLowerCase().startsWith("ok");
 }
 
+// ERR_CODE_TABLE_FULL (code=3) au nettoyage : à l'annulation, la file TX du
+// companion est encore pleine des derniers chunks. Abandonner aussitôt laissait
+// la session ouverte côté cible (horloge OTA, anti-rejeu en avance) ; on attend
+// le drain, quelques secondes au pire en SF8, sans consommer de tentative radio.
+const OTA_CLEANUP_BUSY_BUDGET_MS = 12000;
+
+async function retryWhileCompanionBusy(send, errorOf) {
+  const deadline = performance.now() + OTA_CLEANUP_BUSY_BUDGET_MS;
+  let res = await send();
+  for (let busy = 0;
+       String(errorOf(res) || "").includes("code=3") && performance.now() < deadline;
+       busy += 1) {
+    await sleep(Math.min(1000, 250 + (150 * busy)));
+    res = await send();
+  }
+  return res;
+}
+
 async function abortTargetOtaSession(targetHex, targetFullKeyHex = "", reason = "reset") {
   const cleanFull = normalizeHex(targetFullKeyHex || "");
   const cleanTarget = normalizeHex(targetHex || "");
 
   appendLog(`OTA cleanup (${reason}): tentative de remise à zéro de la session cible.`);
+  otaTargetCleanup.abortAttempted = true;
 
   if (cleanFull.length >= 64) {
     try {
-      const binRes = await client.sendOtaBinaryCmd(
-        cleanFull,
-        OTA_BIN_OP.ABORT,
-        new Uint8Array(),
-        true,
-        6000,
-        400
+      const binRes = await retryWhileCompanionBusy(
+        () => client.sendOtaBinaryCmd(cleanFull, OTA_BIN_OP.ABORT, new Uint8Array(), true, 6000, 400),
+        (r) => r.error
       );
       if (!binRes.error && isOkOtaReply(binRes.replyText)) {
         appendLog(`OTA cleanup (${reason}): abort binaire confirmé.`);
+        otaTargetCleanup.abortConfirmed = true;
         return true;
       }
       appendLog(
@@ -3524,9 +3546,13 @@ async function abortTargetOtaSession(targetHex, targetFullKeyHex = "", reason = 
 
   if (cleanTarget.length >= 12) {
     try {
-      const textRes = await client.sendRepeaterCmdAndWaitReply(cleanTarget, "ota abort", 8);
+      const textRes = await retryWhileCompanionBusy(
+        () => client.sendRepeaterCmdAndWaitReply(cleanTarget, "ota abort", 8),
+        (r) => r.error
+      );
       if (!textRes.error && isOkOtaReply(textRes.reply)) {
         appendLog(`OTA cleanup (${reason}): abort texte confirmé.`);
+        otaTargetCleanup.abortConfirmed = true;
         return true;
       }
       appendLog(
@@ -4371,6 +4397,7 @@ async function runBinaryOta(params) {
     let endOk = false;
     let endFailure = "";
     for (let attempt = 1; attempt <= OTA_END_ATTEMPTS && !otaCancelRequested; attempt += 1) {
+      otaTargetCleanup.endAttempted = true;
       const endRes = await client.sendOtaBinaryCmd(
         targetFullKeyHex,
         OTA_BIN_OP.END,
@@ -4832,6 +4859,7 @@ async function runTextOta(params) {
       }
     }
 
+    otaTargetCleanup.endAttempted = true;
     const endRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "ota end", endTimeoutSec);
     if (endRes.error) {
       throw new Error(`OTA end failed: ${endRes.error}`);
@@ -5487,11 +5515,18 @@ const TEMP_RADIO_MAX_ATTEMPTS = 3;        // renvois tempradio avant abandon pro
 const REBOOT_SEND_ATTEMPTS = 3;
 const REBOOT_SEND_GAP_MS = 2500;
 
-async function sendTargetRebootRepeatedly(targetHex, attempts = REBOOT_SEND_ATTEMPTS) {
+async function sendTargetRebootRepeatedly(
+  targetHex,
+  attempts = REBOOT_SEND_ATTEMPTS,
+  failHint = "redémarre le nœud à la main pour appliquer l'image."
+) {
   let delivered = 0;
   for (let i = 0; i < attempts; i += 1) {
     if (i > 0) await sleep(REBOOT_SEND_GAP_MS);
-    const err = await client.sendRepeaterCmdNoReply(targetHex, "reboot");
+    const err = await retryWhileCompanionBusy(
+      () => client.sendRepeaterCmdNoReply(targetHex, "reboot"),
+      (e) => e
+    );
     if (err) {
       appendLog(`Reboot cible: échec d'émission ${i + 1}/${attempts} (${err}).`);
     } else {
@@ -5499,11 +5534,45 @@ async function sendTargetRebootRepeatedly(targetHex, attempts = REBOOT_SEND_ATTE
     }
   }
   if (delivered === 0) {
-    appendLog("Reboot cible: aucune émission n'a abouti — redémarre le nœud à la main pour appliquer l'image.");
+    appendLog(`Reboot cible: aucune émission n'a abouti — ${failHint}`);
   } else {
     appendLog(`Reboot cible: ${delivered}/${attempts} émission(s) envoyée(s).`);
   }
   return delivered > 0;
+}
+
+// Une OTA interrompue sans reboot laisse la cible avec, pour ce companion, un
+// last_timestamp en avance sur l'heure réelle : chaque requête binaire consomme
+// une seconde de getCurrentTimeUnique() côté companion, ~1 s par chunk. Tant que
+// le companion tourne, son compteur reste devant et tout passe ; après un reset
+// (horloge resynchronisée sur le PC), la cible l'ignore sans rien dire jusqu'à
+// ce que l'heure réelle rattrape. last_timestamp ne vit qu'en RAM : un reboot de
+// la cible le remet à zéro, et la ramène au passage sur son preset permanent et
+// son horloge CPU par défaut. Il n'est sûr que si la session est close : sur
+// 'OTA active' / 'armed' / 'staged', un reboot laisserait la session en plan ou
+// appliquerait une image.
+async function rebootTargetAfterAbortedOta(targetHex, targetFullKeyHex) {
+  if (!otaTargetCleanup.abortConfirmed || otaTargetCleanup.endAttempted) {
+    appendLog(
+      "Nettoyage cible: pas de reboot ("
+      + (otaTargetCleanup.endAttempted ? "END déjà émis, une image a pu être validée" : "abort non confirmé")
+      + ")."
+    );
+    return false;
+  }
+  const cleanFull = normalizeHex(targetFullKeyHex || "");
+  let st = null;
+  if (cleanFull.length >= 64) {
+    st = await getOtaStatusBinary(cleanFull, 2, 4000, { quietMs: OTA_STATUS_QUIET_MS });
+  }
+  if (!st || st.error) st = await getOtaStatus(targetHex, 8);
+  const reply = String(st?.reply || "").trim();
+  if (st?.error || !reply || /\b(active|armed|staged)\b/i.test(reply)) {
+    appendLog(`Nettoyage cible: pas de reboot, session non close (${st?.error || reply || "réponse vide"}).`);
+    return false;
+  }
+  appendLog(`Nettoyage cible: session close (${reply}), reboot pour effacer l'anti-rejeu et revenir au preset permanent.`);
+  return sendTargetRebootRepeatedly(targetHex, 2, "la cible ignorera ce companion après son prochain redémarrage, le temps que l'heure réelle rattrape.");
 }
 
 // La fenetre est un budget de DEMARRAGE, pas une limite dure : le timeout
@@ -6131,6 +6200,9 @@ ui.startOtaBtn.addEventListener("click", async () => {
   otaRunning = true;
   otaCancelRequested = false;
   otaCompleted = false;
+  otaTargetCleanup.abortAttempted = false;
+  otaTargetCleanup.abortConfirmed = false;
+  otaTargetCleanup.endAttempted = false;
   await acquireOtaWakeLock();
   updateButtons();
   setProgress(0);
@@ -6428,7 +6500,25 @@ ui.startOtaBtn.addEventListener("click", async () => {
     ui.metricsLine.textContent = `Erreur: ${e.message}`;
   } finally {
     ui.progressBar.classList.remove("indeterminate");
-    if (restoreClientPreset && !otaCompleted && activeTargetHex) {
+    // Reboot de nettoyage d'abord : s'il part, la cible redémarre sur son preset
+    // permanent et la restauration tempradio devient inutile.
+    let targetRebootedAfterAbort = false;
+    if (!otaCompleted && activeTargetHex && targetReachedOnTemp && ui.rebootAfterAbort?.checked) {
+      try {
+        const fullKey = await client.resolveTargetFullKeyForBinary(activeTargetHex);
+        targetRebootedAfterAbort = await rebootTargetAfterAbortedOta(activeTargetHex, fullKey);
+      } catch (rebootErr) {
+        appendLog(`Warning: reboot de nettoyage échoué (${rebootErr.message}).`);
+      }
+    }
+    if (!otaCompleted && otaTargetCleanup.abortAttempted && !targetRebootedAfterAbort) {
+      appendLog(
+        "Attention : la cible garde une avance d'horodatage pour ce companion. Ne le redémarre pas "
+        + "et ne le reconnecte pas avant quelques minutes (environ une seconde par chunk envoyé), "
+        + "sinon la cible l'ignorera jusque-là. Un reboot de la cible lève ce blocage."
+      );
+    }
+    if (restoreClientPreset && !otaCompleted && activeTargetHex && !targetRebootedAfterAbort) {
       if (targetReachedOnTemp) {
         try {
           await restoreTargetRadioPresetAfterFailedOta(activeTargetHex, restoreClientPreset);
