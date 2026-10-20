@@ -17,6 +17,7 @@ public:
     ((CustomSX1276 *)_radio)->setBandwidth(bw);
     ((CustomSX1276 *)_radio)->setCodingRate(cr);
     updatePreamble(sf);
+    (void) calcMaxPacketMillis(sf, bw, cr, preambleLengthForSF(sf));   // populates the airtime cache
   }
 
   bool isReceivingPacket() override { 

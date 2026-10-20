@@ -76,6 +76,35 @@ public:
   */
   virtual bool isReceiving() { return false; }
 
+  /**
+   * \brief  Whether the busy state reported by the most recent isReceiving() call was a
+   *         valid LoRa header, ie. a real packet is being demodulated right now.
+   *
+   * Only meaningful immediately after isReceiving() returned true; implementations latch it
+   * there rather than re-reading the radio. A busy state that is NOT mid-packet - a bare
+   * preamble detect that never produced a header, RSSI above the noise floor, a hardware CAD
+   * hit - may well be noise, and the dispatcher may transmit through it after a short
+   * deadline. Mid-packet must not be interrupted: transmitting aborts the receive and
+   * destroys the very packet we were about to relay.
+   *
+   * The default is the conservative answer, ie. the pre-existing behaviour of never forcing
+   * a transmit early. Radios that can tell the two apart override it.
+  */
+  virtual bool isMidPacket() { return true; }
+
+  /**
+   * \returns  worst case milliseconds a single packet can occupy the channel at the current
+   *           radio settings (preamble + maximum payload), or 0 if the radio cannot say.
+  */
+  virtual uint32_t getMaxPacketMillis() const { return 0; }
+
+  /**
+   * \returns  milliseconds from preamble-detect to header-valid at the current radio
+   *           settings, ie. how long a bare preamble detect can legitimately stay raised.
+   *           0 if the radio cannot say.
+  */
+  virtual uint32_t getPreambleMillis() const { return 0; }
+
   virtual float getLastRSSI() const { return 0; }
   virtual float getLastSNR() const { return 0; }
 };
@@ -128,9 +157,11 @@ class Dispatcher {
   unsigned long tx_budget_ms;
   unsigned long last_budget_update;
   unsigned long duty_cycle_window_ms;
+  float _cached_airtime_factor, _cached_duty_cycle;   // memoised duty cycle (see currentDutyCycle)
 
   void processRecvPacket(Packet* pkt);
   void updateTxBudget();
+  float currentDutyCycle();
 
 protected:
   PacketManager* _mgr;
@@ -152,6 +183,8 @@ protected:
     tx_budget_ms = 0;
     last_budget_update = 0;
     duty_cycle_window_ms = 3600000;
+    _cached_airtime_factor = -1.0f;   // force currentDutyCycle() to compute on first use
+    _cached_duty_cycle = 0.5f;
   }
 
   virtual DispatcherAction onRecvPacket(Packet* pkt) = 0;
@@ -171,6 +204,17 @@ protected:
   virtual bool getCADEnabled() const { return false; }    // hardware CAD disabled by default
   virtual int getAGCResetInterval() const { return 0; }    // disabled by default
   virtual unsigned long getDutyCycleWindowMs() const { return 3600000; }
+
+  /**
+   * \brief  Nearest scheduled wake time (absolute millis) from subclass-specific timed
+   *         work, or 0 if there is none.
+   *
+   * A subclass that runs its own timers off loop() (retry queues, in-flight probes, ...)
+   * reports its earliest deadline here. Platforms whose loop() idles the core between
+   * radio events consult it so they never sleep past such a deadline. The base class has
+   * no timed work of its own.
+   */
+  virtual uint32_t nextAppWake(uint32_t now) const { return 0; }
 
 public:
   void begin();
