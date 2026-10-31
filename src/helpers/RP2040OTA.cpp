@@ -209,6 +209,8 @@ void RP2040OTAController::buildStatus(char reply[], uint8_t bitmap_chunk) {
     } else {
       appendMissList(reply, 140);
     }
+  } else if (_awaiting_reboot_since != 0) {
+    strcpy(reply, "OTA staged, reboot now");
   } else if (_armed) {
     strcpy(reply, "OTA armed");
   } else if (_last_error[0]) {
@@ -616,6 +618,15 @@ bool RP2040OTAController::handleCommand(const char *command, char reply[]) {
 
   if (strncmp(sub, "end", 3) == 0 && (sub[3] == 0 || sub[3] == ' ')) {
     if (!_active || !Update.isRunning()) {
+      // The reply to a successful 'end' can be lost like any packet, and the
+      // client then retries. Answering the retry with 'not started' would fail
+      // a transfer that in fact succeeded, so a repeat of 'end' while an image
+      // is staged simply repeats the answer.
+      if (!_active && _awaiting_reboot_since != 0) {
+        OTA_DEBUG_PRINTLN("end repeated: image already staged");
+        strcpy(reply, "OK - OTA staged, reboot now");
+        return true;
+      }
       OTA_DEBUG_PRINTLN("end rejected: not started");
       strcpy(reply, "Err - OTA not started");
       return true;

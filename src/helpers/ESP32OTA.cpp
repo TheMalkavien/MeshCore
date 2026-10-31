@@ -533,6 +533,8 @@ bool ESP32OTAController::handleCommand(const char *command, char reply[]) {
       // ne réémette qu'eux. Suffixe ignoré par les anciens clients (leur
       // parseur ne lit que done/total).
       appendMissList(reply, 140);
+    } else if (_awaiting_reboot_since != 0) {
+      strcpy(reply, "OTA staged, reboot now");
     } else if (_armed) {
       strcpy(reply, "OTA armed");
     } else {
@@ -746,6 +748,15 @@ bool ESP32OTAController::handleCommand(const char *command, char reply[]) {
 
   if (strncmp(sub, "end", 3) == 0 && (sub[3] == 0 || sub[3] == ' ')) {
     if (!_active) {
+      // The reply to a successful 'end' can be lost like any packet, and the
+      // client then retries. Answering the retry with 'not started' would fail
+      // a transfer that in fact succeeded, so a repeat of 'end' while an image
+      // is staged simply repeats the answer.
+      if (_awaiting_reboot_since != 0) {
+        OTA_DEBUG_PRINTLN("end repeated: image already staged");
+        strcpy(reply, "OK - OTA staged, reboot now");
+        return true;
+      }
       OTA_DEBUG_PRINTLN("end rejected: not started");
       strcpy(reply, "Err - OTA not started");
       return true;
