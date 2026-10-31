@@ -31,6 +31,10 @@ const OTA_REPAIR_STATUS_ATTEMPTS = 3;
 const OTA_REPAIR_MAX_ROUNDS = 12;
 const OTA_REPAIR_MAX_STALLS = 3;
 const OTA_END_ATTEMPTS = 3;
+// Date de génération de l'outil, affichée dans l'en-tête pour savoir d'un coup
+// d'œil si la page chargée est la dernière. Tenue à jour par stamp.sh, avec la
+// meta 'ota-tool-build' et le '?v=' de index.html.
+const OTA_TOOL_BUILD = "2026-10-31 11:02";
 // ERR_CODE_TABLE_FULL du companion : file TX pleine. Les erreurs d'envoi le
 // portent en suffixe '(code=N)' (voir sendOtaBinaryCmd et consorts) ; le motif
 // ancré évite de prendre code=30..39 pour lui.
@@ -6758,3 +6762,18 @@ if (ui.autoTune?.checked) {
 }
 updatePlanLine(false);
 updateButtons();
+
+// Version affichée = celle d'app.js, le code réellement exécuté. Une page plus
+// récente que son app.js signale un app.js resservi depuis le cache.
+{
+  const pageBuild = document.querySelector('meta[name="ota-tool-build"]')?.content || "";
+  const el = document.querySelector("#toolBuild");
+  if (el) {
+    el.textContent = `version ${OTA_TOOL_BUILD}`;
+    if (pageBuild && pageBuild !== OTA_TOOL_BUILD) {
+      el.textContent += " (cache ? rechargez)";
+      el.title = `Page ${pageBuild}, script ${OTA_TOOL_BUILD} : rechargez sans cache.`;
+    }
+  }
+  appendLog(`Outil web OTA, version ${OTA_TOOL_BUILD}.`);
+}
