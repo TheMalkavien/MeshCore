@@ -48,8 +48,11 @@ extern "C" {
   #define NRF52_OTA_STAGE_BUFFER_BYTES NRF52_OTA_PAGE_SIZE
 #endif
 
+// Off by default, as on RP2040: these go to USB Serial, and a host that holds
+// the port open without reading makes each print block for up to a second -
+// mid-transfer, that is a deaf receiver.
 #ifndef NRF52_OTA_SERIAL_DEBUG
-  #define NRF52_OTA_SERIAL_DEBUG 1
+  #define NRF52_OTA_SERIAL_DEBUG 0
 #endif
 
 #if NRF52_OTA_SERIAL_DEBUG
@@ -146,30 +149,33 @@ bool NRF52OTAController::insertStageRange(size_t start, size_t end) {
   return true;
 }
 
-// Append ' miss=<abs>+<len>,...' for the holes BETWEEN received segments of
-// the current block (the tail past the last segment is data the client simply
-// hasn't sent yet, not a loss).
+// Append ' miss=<abs>+<len>,...' for the holes of the current block. One pass
+// past the last range reports the hole between it and the end of the block
+// too, as on RP2040: without it the tail of a block was never listed and had
+// to be recovered by a rewind. The client only repairs holes in data it has
+// already sent, so a tail it hasn't sent yet is not replayed.
 void NRF52OTAController::appendMissList(char reply[], size_t max_len) const {
   if (_stage_range_count == 0) return;
 
   size_t len = strlen(reply);
   int added = 0;
   size_t hole_start = 0;  // block-relative
-  for (int k = 0; k <= _stage_range_count - 1; k++) {
-    if (_stage_ranges[k].start > hole_start) {
+  const size_t extent = stageExtent();
+  for (int k = 0; k <= _stage_range_count; k++) {
+    size_t next_start = k < _stage_range_count ? _stage_ranges[k].start : extent;
+    if (next_start > hole_start) {
       char item[32];
       snprintf(item, sizeof(item), "%s%lu+%lu",
                added == 0 ? " miss=" : ",",
                (unsigned long)(_stage_base + hole_start),
-               (unsigned long)(_stage_ranges[k].start - hole_start));
+               (unsigned long)(next_start - hole_start));
       size_t item_len = strlen(item);
       if (len + item_len >= max_len) break;
       strcpy(reply + len, item);
       len += item_len;
-      added++;
-      if (added >= 8) break;
+      if (++added >= 8) break;
     }
-    hole_start = _stage_ranges[k].end;
+    if (k < _stage_range_count) hole_start = _stage_ranges[k].end;
   }
 }
 
@@ -366,6 +372,11 @@ bool NRF52OTAController::handleCommand(const char *command, char reply[]) {
 
   if (strncmp(sub, "status", 6) == 0 && (sub[6] == 0 || sub[6] == ' ')) {
     if (_active) {
+      // A complete block is written to flash here, when the client asks for
+      // status, rather than from the write that completed it: that write
+      // usually arrives in the middle of a burst, and every chunk behind the
+      // flush was lost. A client waiting for this reply is silent.
+      if (_stage_size > 0 && !flushStage(reply)) return true;   // reply set by the failed flush
       sprintf(reply, "OTA active %lu/%lu nack=miss blk=%u",
               (unsigned long) _received_size, (unsigned long) _expected_size,
               (unsigned int) flushBlockBytes());
@@ -692,6 +703,13 @@ bool NRF52OTAController::writeChunk(size_t offset, const uint8_t *chunk, size_t 
 
       size_t extent = stageExtent();
       size_t win_end = _stage_base + extent;
+      if (extent != 0 && off >= win_end && stagePrefix() == extent) {
+        // The complete block normally waits for the STATUS that flushes it.
+        // Data for the next one means the client moved on without asking:
+        // flush now rather than drop it.
+        if (!flushStage(reply)) return true;  // reply set by the failed flush
+        continue;
+      }
       if (extent == 0 || off >= win_end) {
         if (!consumed_any) {
           OTA_DEBUG_PRINTLN("write rejected: bad offset %lu expected %lu",
@@ -726,9 +744,6 @@ bool NRF52OTAController::writeChunk(size_t offset, const uint8_t *chunk, size_t 
       consumed_any = true;
 
       _received_size = _stage_base + stagePrefix();
-      if (stagePrefix() == extent && !flushStage(reply)) {
-        return true;  // reply set by the failed flush
-      }
     }
   } else {
     // No staging buffer (alloc failed): strict sequential mode.
