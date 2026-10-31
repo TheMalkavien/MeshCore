@@ -10,7 +10,12 @@ WRAPPER_CLASS radio_driver(radio, board);
 
 VolatileRTCClock fallback_clock;
 AutoDiscoverRTCClock rtc_clock(fallback_clock);
+
+#ifdef MLK_SENSORS
+EnvironmentSensorManager sensors;
+#else
 SensorManager sensors;
+#endif
 
 bool radio_init() {
   rtc_clock.begin(Wire);
@@ -26,6 +31,21 @@ bool radio_init() {
 
   //passing NULL skips init of SPI
   return radio.std_init(NULL);
+}
+
+uint32_t radio_get_rng_seed() {
+  return radio.random(0x7FFFFFFF);
+}
+
+void radio_set_params(float freq, float bw, uint8_t sf, uint8_t cr) {
+  radio.setFrequency(freq);
+  radio.setSpreadingFactor(sf);
+  radio.setBandwidth(bw);
+  radio.setCodingRate(cr);
+}
+
+void radio_set_tx_power(int8_t dbm) {
+  radio.setOutputPower(dbm);
 }
 
 mesh::LocalIdentity radio_new_identity() {
