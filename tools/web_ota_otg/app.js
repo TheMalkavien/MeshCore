@@ -31,6 +31,14 @@ const OTA_REPAIR_STATUS_ATTEMPTS = 3;
 const OTA_REPAIR_MAX_ROUNDS = 12;
 const OTA_REPAIR_MAX_STALLS = 3;
 const OTA_END_ATTEMPTS = 3;
+// ERR_CODE_TABLE_FULL du companion : file TX pleine. Les erreurs d'envoi le
+// portent en suffixe '(code=N)' (voir sendOtaBinaryCmd et consorts) ; le motif
+// ancré évite de prendre code=30..39 pour lui.
+const ERR_CODE_TABLE_FULL = 3;
+const TABLE_FULL_ERROR_RE = new RegExp(`\\(code=${ERR_CODE_TABLE_FULL}\\)$`);
+function isCompanionTableFull(err) {
+  return TABLE_FULL_ERROR_RE.test(String(err || ""));
+}
 const CMD_GET_DEVICE_TIME = 5;
 const CMD_RESET_PATH = 13;
 const CMD_SET_DEVICE_TIME = 6;
@@ -142,6 +150,10 @@ const UF2_FAMILY_BASE = {
   [UF2_RP2040_FAMILY_ID]: XIP_BASE,
   [UF2_NRF52840_FAMILY_ID]: 0x26000,
 };
+// Le RP2040 a aussi des images liées derrière un bootloader (voir
+// describeRp2040Layout) : leur UF2 commence à l'origine de l'app, pas en XIP_BASE.
+// La cible vérifie ensuite que la table des vecteurs correspond à son layout.
+const UF2_RP2040_ALT_BASES = [0x10004000, 0x10007000];
 const NRF52_APP_BASE = 0x26000;
 const UF2_MAX_PADDING_BYTES = 16 * 1024 * 1024;
 const WEBUSB_DEVICE_FILTERS = [
@@ -301,7 +313,8 @@ function convertUf2ToBin(bytes) {
   blocks.sort((a, b) => a.targetAddr - b.targetAddr);
   const baseAddr = blocks[0].targetAddr >>> 0;
   const expectedBase = UF2_FAMILY_BASE[family];
-  if (baseAddr !== expectedBase) {
+  const altBases = family === UF2_RP2040_FAMILY_ID ? UF2_RP2040_ALT_BASES : [];
+  if (baseAddr !== expectedBase && !altBases.includes(baseAddr)) {
     throw new Error(
       `UF2 inattendu: adresse de base 0x${baseAddr.toString(16)} `
       + `(attendu 0x${expectedBase.toString(16)})`
@@ -2601,6 +2614,9 @@ const ui = {
 
 let client = null;
 let otaRunning = false;
+// Vrai pendant la préparation du firmware qui précède otaRunning : sans lui, un
+// second clic pendant cet await lançait une seconde OTA sur la même cible.
+let otaStarting = false;
 let otaCancelRequested = false;
 let otaCompleted = false;
 // Compteurs de backpressure locale (code=3), partagés entre runBinaryOta et
@@ -3084,7 +3100,7 @@ function updateButtons() {
   ui.disconnectBtn.disabled = !connected || otaRunning;
   // Le bouton etait vert des la connexion : le clic ne faisait que logger
   // "aucun firmware selectionne". On le grise tant que l'etape 2 est incomplete.
-  ui.startOtaBtn.disabled = !connected || otaRunning || !otaInputsReady();
+  ui.startOtaBtn.disabled = !connected || otaRunning || otaStarting || !otaInputsReady();
   ui.cancelOtaBtn.disabled = !otaRunning;
   if (ui.refreshTargetsBtn) ui.refreshTargetsBtn.disabled = !connected || otaRunning;
   if (ui.targetSelect) ui.targetSelect.disabled = !connected || otaRunning;
@@ -3473,7 +3489,7 @@ async function getOtaStatusBinary(targetFullKeyHex, maxAttempts = 2, timeoutMs =
     // on resoumet sans consommer de tentative radio. Ce délai laisse aussi le
     // chunk-frontière atterrir et le gel flash de la cible se terminer avant
     // que le STATUS ne parte en l'air.
-    for (let busy = 0; busy < 4 && res.error && String(res.error).includes("code=3"); busy += 1) {
+    for (let busy = 0; busy < 4 && isCompanionTableFull(res.error); busy += 1) {
       otaBusyStats.events += 1;
       otaBusyStats.sleepMs += 90 + (60 * busy);
       await sleep(90 + (60 * busy));
@@ -3509,7 +3525,7 @@ async function retryWhileCompanionBusy(send, errorOf) {
   const deadline = performance.now() + OTA_CLEANUP_BUSY_BUDGET_MS;
   let res = await send();
   for (let busy = 0;
-       String(errorOf(res) || "").includes("code=3") && performance.now() < deadline;
+       isCompanionTableFull(errorOf(res)) && performance.now() < deadline;
        busy += 1) {
     await sleep(Math.min(1000, 250 + (150 * busy)));
     res = await send();
@@ -3792,7 +3808,7 @@ async function runBinaryOta(params) {
             repairedBytes += n;
             break;
           }
-          const isLocalBusy = String(res.error || "").includes("code=3");
+          const isLocalBusy = isCompanionTableFull(res.error);
           if (isLocalBusy && performance.now() < busyDeadlineMs) {
             busyWaits += 1;
             const busySleep = otaBusyRetryDelay(noAckGapMs, busyWaits);
@@ -4140,7 +4156,7 @@ async function runBinaryOta(params) {
 
         failure = writeRes.error || failure;
 
-        const isLocalBusy = String(writeRes.error || "").includes("code=3");
+        const isLocalBusy = isCompanionTableFull(writeRes.error);
         if (isLocalBusy && performance.now() < busyDeadlineMs) {
           busyWaits += 1;
           const busySleep = otaBusyRetryDelay(noAckGapMs, busyWaits);
@@ -4390,10 +4406,11 @@ async function runBinaryOta(params) {
 
     // END se rejoue : sa réponse se perd comme n'importe quel paquet, et un
     // seul END sans réponse faisait échouer une OTA entièrement transférée.
-    // La cible referme la session en validant l'image : un END répété après
-    // un premier resté sans réponse reçoit donc « OTA not started ». Comme la
-    // session était encore ouverte juste avant, c'est que le premier END a
-    // abouti et que seule sa réponse s'est perdue.
+    // Les cibles récentes répondent de nouveau « OK - OTA staged » à un END
+    // répété. Les anciennes referment la session en validant l'image et
+    // répondent « OTA not started » : comme la session était encore ouverte
+    // juste avant, c'est que le premier END a abouti et que seule sa réponse
+    // s'est perdue.
     let endOk = false;
     let endFailure = "";
     for (let attempt = 1; attempt <= OTA_END_ATTEMPTS && !otaCancelRequested; attempt += 1) {
@@ -4411,7 +4428,7 @@ async function runBinaryOta(params) {
         break;
       }
       if (!endRes.error && attempt > 1 && /not started/i.test(endRes.replyText || "")) {
-        appendLog("END : réponse du premier END perdue, la cible a déjà refermé la session (image validée).");
+        appendLog("END : réponse du premier END perdue, la cible a déjà refermé la session (image validée, cible ancienne).");
         endOk = true;
         break;
       }
@@ -4710,10 +4727,10 @@ async function runTextOta(params) {
         // code=3 : file TX du companion pleine — backpressure locale, on
         // laisse drainer (~48 ms/paquet) et on resoumet le même chunk, borné
         // par une échéance murale. Voir le même traitement en binaire.
-        if (sendErr && String(sendErr).includes("code=3")) {
+        if (isCompanionTableFull(sendErr)) {
           const busyDeadlineMs = performance.now() + Math.max(8000, (Number(checkpointTimeoutMs) || 1500) * 4);
           let busyWaits = 0;
-          while (sendErr && String(sendErr).includes("code=3")
+          while (isCompanionTableFull(sendErr)
                  && performance.now() < busyDeadlineMs && !otaCancelRequested) {
             busyWaits += 1;
             const busySleep = otaBusyRetryDelay(noAckGapMs, busyWaits);
@@ -4859,13 +4876,33 @@ async function runTextOta(params) {
       }
     }
 
-    otaTargetCleanup.endAttempted = true;
-    const endRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "ota end", endTimeoutSec);
-    if (endRes.error) {
-      throw new Error(`OTA end failed: ${endRes.error}`);
+    // END se rejoue comme en binaire (voir runBinaryOta) : une seule réponse
+    // perdue faisait échouer une OTA entièrement transférée.
+    let endOk = false;
+    let endFailure = "";
+    for (let attempt = 1; attempt <= OTA_END_ATTEMPTS && !otaCancelRequested; attempt += 1) {
+      otaTargetCleanup.endAttempted = true;
+      const endRes = await client.sendRepeaterCmdAndWaitReply(targetHex, "ota end", endTimeoutSec);
+      if (!endRes.error && isOkOtaReply(endRes.reply)) {
+        endOk = true;
+        break;
+      }
+      if (!endRes.error && attempt > 1 && /not started/i.test(endRes.reply || "")) {
+        appendLog("END : réponse du premier END perdue, la cible a déjà refermé la session (image validée, cible ancienne).");
+        endOk = true;
+        break;
+      }
+      if (!endRes.error) {
+        throw new Error(`OTA end failed: ${endRes.reply}`);
+      }
+      endFailure = endRes.error;
+      if (attempt < OTA_END_ATTEMPTS) {
+        appendLog(`END sans réponse (${attempt}/${OTA_END_ATTEMPTS}): ${endRes.error} — nouvel essai.`);
+        await sleep(OTA_STATUS_QUIET_MS);
+      }
     }
-    if (!isOkOtaReply(endRes.reply)) {
-      throw new Error(`OTA end failed: ${endRes.reply}`);
+    if (!endOk) {
+      throw new Error(`OTA end failed: ${endFailure || "annulé"}`);
     }
     shouldCleanupTargetOta = false;
 
@@ -6155,7 +6192,7 @@ ui.startOtaBtn.addEventListener("click", async () => {
     appendLog(`Lancer OTA: abandon, connexion inactive (client=${Boolean(client)}, connected=${Boolean(client?.connected)}).`);
     return;
   }
-  if (otaRunning) {
+  if (otaRunning || otaStarting) {
     appendLog("Lancer OTA: ignoré, OTA déjà en cours.");
     return;
   }
@@ -6171,6 +6208,8 @@ ui.startOtaBtn.addEventListener("click", async () => {
   let firmwareVariants;
   let firmware;
   let firmwareMd5;
+  otaStarting = true;
+  updateButtons();
   try {
     // Conversion et gzip ont deja ete faits a la selection du fichier (en
     // silence) : prepareFirmware ne refait que ce qui manque, ici les MD5.
@@ -6194,9 +6233,12 @@ ui.startOtaBtn.addEventListener("click", async () => {
     );
   } catch (e) {
     appendLog(`Préparation firmware échouée: ${e.message}`);
+    otaStarting = false;
+    updateButtons();
     return;
   }
 
+  otaStarting = false;
   otaRunning = true;
   otaCancelRequested = false;
   otaCompleted = false;
