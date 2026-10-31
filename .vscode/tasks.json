@@ -1,0 +1,74 @@
+{
+  // Patch-stack maintenance, runnable from Terminal > Run Task (or Ctrl+Shift+P >
+  // "Tasks: Run Task"). Every task pins Git Bash explicitly, so it works whatever
+  // your default terminal is - no need to switch VSCode over to bash.
+  //
+  // Git Bash ships with Git for Windows; nothing else to install.
+  "version": "2.0.0",
+  "options": {
+    "shell": {
+      "executable": "C:\\Program Files\\Git\\bin\\bash.exe",
+      "args": ["-c"]
+    }
+  },
+  "presentation": {
+    "reveal": "always",
+    "panel": "dedicated",
+    "clear": true
+  },
+  "tasks": [
+    {
+      "label": "Stack: check (read-only)",
+      "detail": "How far behind upstream, and would the 7 branches still merge cleanly. Touches nothing.",
+      "type": "shell",
+      "command": "./tools/restack.sh check",
+      "problemMatcher": []
+    },
+    {
+      "label": "Stack: rebase onto upstream",
+      "detail": "Restack every branch onto its parent. REWRITES your branches.",
+      "type": "shell",
+      "command": "./tools/restack.sh rebase",
+      "problemMatcher": []
+    },
+    {
+      "label": "Stack: regenerate patch_public",
+      "detail": "Rebuild the integration branch from the stack. Leaves patch_public untouched on failure.",
+      "type": "shell",
+      "command": "./tools/restack.sh integrate",
+      "problemMatcher": []
+    },
+    {
+      "label": "Stack: build integration",
+      "detail": "The only thing that proves a merge is sound - rerere replays wrong resolutions just as happily as right ones.",
+      "type": "shell",
+      "command": "\"$USERPROFILE/.platformio/penv/Scripts/pio.exe\" run -e waveshare_rp2040_lora_repeater -e waveshare_rp2040_lora_repeater_lowpower -e waveshare_rp2040_lora_repeater_ota_esp32 -e Heltec_v3_repeater -e Heltec_v3_companion_radio_usb",
+      "group": "build",
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "Stack: push to origin",
+      "detail": "Force-pushes the seven branches and patch_public. Asks first, and cannot tell whether you built - if you did not, say no.",
+      "type": "shell",
+      "command": "./tools/restack.sh push",
+      "problemMatcher": []
+    },
+    {
+      "label": "Stack: update from upstream (full)",
+      "detail": "check, rebase, regenerate, build. Stops at the first failure.",
+      "type": "shell",
+      "command": "./tools/restack.sh all",
+      "dependsOrder": "sequence",
+      "dependsOn": ["Stack: build integration"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Stack: run tools unit tests",
+      "detail": "The Python tests carried by tools/companion-tools.",
+      "type": "shell",
+      "command": "python -m unittest discover -s tools -p 'test_*.py' -t tools && python -m unittest discover -s tools/telegram_bot -p 'test_*.py' -t tools/telegram_bot",
+      "group": "test",
+      "problemMatcher": []
+    }
+  ]
+}
