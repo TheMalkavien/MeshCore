@@ -131,6 +131,16 @@ Puis ouvrir :
 - `http://127.0.0.1:8080` (desktop)
 - ou l'URL locale équivalente depuis ton appareil (si même réseau).
 
+### Version affichée
+
+L'en-tête affiche discrètement la date de génération de l'outil (`version AAAA-MM-JJ HH:MM`),
+lue dans `app.js` : c'est celle du code réellement exécuté, donc la bonne pour savoir si
+l'on a la dernière version. Si `index.html` est plus récent que l'`app.js` chargé (copie
+en cache), elle est suivie de « (cache ? rechargez) ».
+
+Avant de commiter une modification de `index.html` ou `app.js`, lancer `./stamp.sh` : il
+met à jour ensemble `OTA_TOOL_BUILD`, la meta `ota-tool-build` et le `?v=` du script.
+
 ## Mode TCP (companion WiFi) — pont local
 
 Le companion WiFi expose son interface série sur une socket TCP brute (port `5000`
