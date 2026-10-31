@@ -13,6 +13,10 @@
 #define WITH_BRIDGE
 #endif
 
+// Size of the 'reply' buffer every handleCommand()/handleGetCmd()/handleSetCmd()
+// caller is expected to provide.
+#define CLI_REPLY_SIZE        160
+
 #define ADVERT_LOC_NONE       0
 #define ADVERT_LOC_SHARE      1
 #define ADVERT_LOC_PREFS      2
@@ -321,4 +325,17 @@ public:
   bool savePrefs(FILESYSTEM* _fs);
   void handleCommand(uint32_t sender_timestamp, char* command, char* reply);
   uint8_t buildAdvertData(uint8_t node_type, uint8_t* app_data);
+
+  static const uint8_t MAX_CMD_PREFIX_LEN = 9;   // 8 hex chars + '|'
+
+  /**
+   * \brief  Length of the optional "<hex-token>|" prefix in front of a command (0 if absent).
+   *
+   * Clients that pipeline CLI commands tag each one with a short hex token so a late
+   * reply can be matched to the request it answers; the token is expected to be
+   * reflected back on the reply. Token length is client-specific (mccli uses 2 hex
+   * chars, the web OTA tool 2..4), so callers must not assume a fixed width: strip
+   * exactly this many chars before dispatch, and reflect the same count back.
+   */
+  static uint8_t getCommandPrefixLen(const char* command);
 };
