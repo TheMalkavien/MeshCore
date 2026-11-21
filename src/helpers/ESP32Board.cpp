@@ -7,7 +7,16 @@
 RTC_NOINIT_ATTR uint32_t _rtc_backup_time;
 RTC_NOINIT_ATTR uint32_t _rtc_backup_magic;
 
-#if defined(ADMIN_PASSWORD) && !defined(DISABLE_WIFI_OTA)   // Repeater or Room Server only
+// 'start ota' keeps its stock ESP32 behavior: it spawns the WiFi AP + ElegantOTA
+// web portal. Build with -D MESH_LORA_OTA to arm a mesh OTA session over LoRa
+// instead (same protocol as the RP2040 targets — see helpers/ESP32OTA.cpp); that
+// build drops the WiFi/AsyncWebServer stack, worth ~520KB flash and ~24KB RAM.
+#if defined(MESH_LORA_OTA)
+bool ESP32Board::startOTAUpdate(const char* id, char reply[]) {
+  return ota.startSession(id, reply);
+}
+
+#elif defined(ADMIN_PASSWORD) && !defined(DISABLE_WIFI_OTA)   // Repeater or Room Server only
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
