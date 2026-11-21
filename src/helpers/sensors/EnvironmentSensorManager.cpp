@@ -116,6 +116,7 @@ static Adafruit_INA3221 INA3221;
 #endif
 #include <Adafruit_INA219.h>
 static Adafruit_INA219 INA219(TELEM_INA219_ADDRESS);
+static bool ina219_present = false;   // set once begin() succeeded (device ACKed on the bus)
 #endif
 
 #if ENV_INCLUDE_INA260
@@ -330,7 +331,16 @@ static Adafruit_INA219* active_ina219 = &INA219;
 
 static uint8_t init_ina219(TwoWire* wire, uint8_t addr) {
   active_ina219 = (addr == TELEM_INA219_ADDRESS) ? &INA219 : &INA219_ALT;
-  return active_ina219->begin(wire) ? 1 : 0;
+  ina219_present = active_ina219->begin(wire);
+  return ina219_present ? 1 : 0;
+}
+bool env_ina219_battery_mv(uint16_t& mv) {
+  if (!ina219_present) return false;
+  // Bus voltage is measured on the load side of the shunt; add the drop to get the battery side.
+  float v = active_ina219->getBusVoltage_V() + active_ina219->getShuntVoltage_mV() / 1000.0f;
+  if (v < 1.0f || v > 32.0f) return false;   // implausible reading (bus glitch / unplugged)
+  mv = (uint16_t)(v * 1000.0f + 0.5f);
+  return true;
 }
 static void query_ina219(uint8_t ch, uint8_t, CayenneLPP& lpp) {
   lpp.addVoltage(ch, active_ina219->getBusVoltage_V());
