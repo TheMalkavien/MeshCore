@@ -97,16 +97,24 @@ class SerialBroadcastProxy(ProxyCore):
             "[proxy] listening on %s -> serial %s @ %d baud", addr, self.serial_port, self.baudrate
         )
 
+    def _open_serial(self) -> "serial.Serial":
+        # Build the port closed, drive DTR/RTS low, then open: on USB-UART bridges
+        # wired to an ESP32 auto-reset circuit, asserted DTR/RTS at open() reboots
+        # the node every time the proxy (re)connects.
+        conn = serial.Serial()
+        conn.port = self.serial_port
+        conn.baudrate = self.baudrate
+        conn.timeout = self.read_timeout
+        conn.write_timeout = self.write_timeout
+        conn.dtr = False
+        conn.rts = False
+        conn.open()
+        return conn
+
     async def _connect_backend(self) -> None:
         try:
             self._logger.info("[backend] opening %s @ %d ...", self.serial_port, self.baudrate)
-            conn = await asyncio.to_thread(
-                serial.Serial,
-                self.serial_port,
-                self.baudrate,
-                timeout=self.read_timeout,
-                write_timeout=self.write_timeout,
-            )
+            conn = await asyncio.to_thread(self._open_serial)
             self.serial_conn = conn
             self.backend_parser.reset()
             self.backend_connected.set()

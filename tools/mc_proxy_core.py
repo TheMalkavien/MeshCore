@@ -36,6 +36,24 @@ CMD_RESET_PATH = 0x0D
 CMD_REMOVE_CONTACT = 0x0F
 CMD_GET_CHANNEL = 0x1F
 CMD_SET_CHANNEL = 0x20
+# Commands that change the node's identity / configuration. After one of these
+# is forwarded, the cached node info is stale: it is re-read from the node right
+# away (see _node_info_refresh_loop) so every client sees the change at once.
+CONFIG_MUTATING_COMMANDS = frozenset({
+    0x08,  # SET_ADVERT_NAME
+    0x0B,  # SET_RADIO_PARAMS
+    0x0C,  # SET_RADIO_TX_POWER
+    0x0E,  # SET_ADVERT_LATLON
+    0x15,  # SET_TUNING_PARAMS
+    0x18,  # IMPORT_PRIVATE_KEY
+    0x25,  # SET_DEVICE_PIN
+    0x26,  # SET_OTHER_PARAMS
+    0x29,  # SET_CUSTOM_VAR
+    0x36,  # SET_FLOOD_SCOPE_KEY
+    0x3A,  # SET_AUTOADD_CONFIG
+    0x3D,  # SET_PATH_HASH_MODE
+    0x3F,  # SET_DEFAULT_FLOOD_SCOPE
+})
 RESP_CODE_SELF_INFO = 0x05
 RESP_CODE_NO_MORE_MESSAGES = 0x0A
 RESP_CODE_CONTACTS_START = 0x02
@@ -121,6 +139,18 @@ CONTACT_SYNC_IDLE_TIMEOUT = 15.0
 # A backend connection must stay up at least this long to be considered "stable"
 # and reset the exponential reconnect backoff. Shorter -> treated as flapping.
 DEFAULT_STABLE_CONNECTION_SECS = 5.0
+# Re-read the node's identity/config this often (seconds) to catch changes made
+# outside the proxy (node CLI, another app). 0 disables the periodic refresh;
+# changes made through a proxied client are always refreshed immediately.
+DEFAULT_NODE_INFO_REFRESH = 10.0
+# Backend watchdog: this many consecutive unanswered message polls (5 s each)
+# mean the node is frozen even though the transport is still up -> reconnect.
+BACKEND_WATCHDOG_TIMEOUTS = 3
+POLL_RESPONSE_TIMEOUT = 5.0
+# A TCP client must send APP_START within this many seconds of connecting.
+UNIDENTIFIED_CLIENT_TIMEOUT = 60.0
+# Upper bound on queued, not-yet-synced messages kept per client.
+MAX_PENDING_MESSAGE_FRAMES = 4096
 
 # Synthetic sent echoes are local proxy events, not RF receptions.  Using the
 # receive-side 0xFF "direct" sentinel here makes clients which decode the byte
@@ -281,7 +311,9 @@ class ClientState:
     # client whose prior session already served a message is not re-served it.
     app_started: bool = False
     replay_capture_seq: int = 0
-    pending_message_frames: deque = field(default_factory=deque)
+    pending_message_frames: deque = field(
+        default_factory=lambda: deque(maxlen=MAX_PENDING_MESSAGE_FRAMES)
+    )
     outbound_queue: Optional[asyncio.Queue] = None
     sender_task: Optional[asyncio.Task] = None
     last_disconnect_at: float = 0.0
@@ -331,7 +363,9 @@ class ProxyCore:
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         max_clients: int = DEFAULT_MAX_CLIENTS,
         inactive_state_max_age: float = DEFAULT_INACTIVE_STATE_MAX_AGE,
+        node_info_refresh: float = DEFAULT_NODE_INFO_REFRESH,
     ):
+        self.node_info_refresh = max(node_info_refresh, 0.0)
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.reconnect_delay = reconnect_delay
@@ -389,6 +423,16 @@ class ProxyCore:
         self._background_tasks: set[asyncio.Task] = set()
         # Monotonically increasing counter for exponential reconnect backoff.
         self._reconnect_attempt: int = 0
+        # Node-info refresh (identity / radio config seen by clients).
+        self._node_info_event: asyncio.Event = asyncio.Event()
+        self._node_info_task: Optional[asyncio.Task] = None
+        self._node_info_urgent: bool = False
+        # Loop-time deadline while a proxy-issued APP_START is outstanding: the
+        # SELF_INFO answering it is compared with the cache, not blindly relayed.
+        self._self_info_refresh_deadline: float = 0.0
+        self._self_info_seen: asyncio.Event = asyncio.Event()
+        # Consecutive unanswered message polls (watchdog).
+        self._poll_timeouts: int = 0
 
     # --- Transport hooks: implemented by subclasses ------------------------
 
@@ -471,21 +515,21 @@ class ProxyCore:
 
         self._backend_task = asyncio.create_task(self._backend_manager(), name="backend-manager")
         self._poll_task = asyncio.create_task(self._poll_backend_loop(), name="poll-loop")
+        self._node_info_task = asyncio.create_task(
+            self._node_info_refresh_loop(), name="node-info-refresh"
+        )
 
         try:
-            async with self._server:
-                await self._stop.wait()
+            # Do NOT use "async with self._server": on Python >= 3.12.1 its exit
+            # awaits wait_closed(), which blocks until every connected client is
+            # gone — i.e. before _close_all_clients() below ever runs.
+            await self._stop.wait()
         finally:
             self._logger.info("[proxy] stopping...")
-
-            if self._server:
-                self._server.close()
-                await self._server.wait_closed()
-
-            await self._close_all_clients()
+            await self._shutdown_listener_and_clients()
             await self._close_backend()
 
-            for task in (self._backend_task, self._poll_task):
+            for task in (self._backend_task, self._poll_task, self._node_info_task):
                 if task and not task.done():
                     task.cancel()
                     try:
@@ -501,20 +545,105 @@ class ProxyCore:
             return
         self._stop.set()
 
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
-
-        await self._close_all_clients()
+        await self._shutdown_listener_and_clients()
         await self._close_backend()
 
-        for task in (self._backend_task, self._poll_task):
+        for task in (self._backend_task, self._poll_task, self._node_info_task):
             if task and not task.done():
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
+
+    async def _shutdown_listener_and_clients(self) -> None:
+        """Stop accepting, drop every client, then wait (bounded) for the server.
+
+        Order matters: Server.wait_closed() waits for open connections on
+        Python >= 3.12.1, so the clients must be closed first, and the wait is
+        bounded so a half-open peer can never stall the shutdown.
+        """
+        if self._server:
+            self._server.close()
+        await self._close_all_clients()
+        if self._server:
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                self._logger.info("[proxy] listener did not close in 5s, continuing")
+
+    # --- Node info freshness -------------------------------------------------
+
+    def _request_node_info_refresh(self, urgent: bool = False) -> None:
+        """Ask the refresh loop to re-read the node's identity/config.
+
+        ``urgent`` (a config command was just forwarded, or the backend just
+        reconnected) skips the periodic wait; a short debounce lets the node apply
+        the command before it is queried.
+        """
+        if urgent:
+            self._node_info_urgent = True
+        self._node_info_event.set()
+
+    def _drop_stale_node_singletons(self) -> None:
+        """Forget cached singletons a config change may have invalidated.
+
+        SELF_INFO itself is re-read right after; the others (device info, custom
+        vars, tuning, auto-add, repeat freqs) are refilled live on the next
+        client request instead of being replayed stale.
+        """
+        for ptype, key_fn in CACHE_TYPES.items():
+            if key_fn is None and ptype != RESP_CODE_SELF_INFO:
+                self._state_cache.pop(ptype, None)
+
+    @staticmethod
+    def _build_app_start_frame() -> bytes:
+        # '<' + len_LE(2) + CMD_APP_START, app_ver, 6 reserved bytes, app name
+        payload = bytes([CMD_APP_START, 3]) + b"\x00" * 6 + b"mc-proxy-refresh"
+        return b"<" + struct.pack("<H", len(payload)) + payload
+
+    async def _refresh_node_info(self) -> None:
+        """Send one proxy-owned APP_START and let _handle_backend_frame compare."""
+        loop = asyncio.get_running_loop()
+        for _attempt in range(3):
+            if not self.backend_connected.is_set() or self._stop.is_set():
+                return
+            self._self_info_seen.clear()
+            self._self_info_refresh_deadline = loop.time() + 3.0
+            await self._send_to_backend(self._build_app_start_frame())
+            try:
+                await asyncio.wait_for(self._self_info_seen.wait(), timeout=3.0)
+                return
+            except asyncio.TimeoutError:
+                # e.g. an ESP32 still booting right after the serial port opened.
+                self._logger.debug("[node-info] no SELF_INFO yet, retrying")
+        self._self_info_refresh_deadline = 0.0
+
+    async def _node_info_refresh_loop(self) -> None:
+        interval = self.node_info_refresh or None
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._node_info_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            urgent = self._node_info_urgent
+            self._node_info_event.clear()
+            self._node_info_urgent = False
+            if urgent:
+                await asyncio.sleep(0.5)  # let the node apply the change first
+            if not self.backend_connected.is_set():
+                continue  # the reconnect path requests a fresh refresh itself
+            if self._contact_sync_active:
+                if urgent:  # don't lose an urgent refresh: retry shortly
+                    await asyncio.sleep(1.0)
+                    self._request_node_info_refresh(urgent=True)
+                continue
+            try:
+                await self._refresh_node_info()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._logger.info("[node-info] refresh failed: %s", exc)
 
     async def _poll_backend_loop(self) -> None:
         self._logger.debug("[poll] loop started")
@@ -541,14 +670,34 @@ class ProxyCore:
             await self._send_to_backend(SYNC_FRAME)
 
             try:
-                await asyncio.wait_for(self._poll_event.wait(), timeout=5.0)
+                await asyncio.wait_for(self._poll_event.wait(), timeout=POLL_RESPONSE_TIMEOUT)
             except asyncio.TimeoutError:
-                self._logger.debug("[poll] timeout waiting for backend response")
+                self._poll_timeouts += 1
+                self._logger.debug(
+                    "[poll] timeout waiting for backend response (%d/%d)",
+                    self._poll_timeouts, BACKEND_WATCHDOG_TIMEOUTS,
+                )
+                if self._poll_timeouts >= BACKEND_WATCHDOG_TIMEOUTS:
+                    # Transport is up but the node no longer answers: it is hung.
+                    # Tear the link down so the backend manager reconnects (same
+                    # path as a write error).
+                    self._logger.warning(
+                        "[watchdog] node unresponsive for %d polls — reconnecting backend",
+                        self._poll_timeouts,
+                    )
+                    self._poll_timeouts = 0
+                    self.backend_connected.clear()
+                    self._poll_event.set()
+                    self._transport_after_write_error()
+                    continue
                 await asyncio.sleep(self.poll_interval)
                 continue
 
             if not self.backend_connected.is_set():
+                self._poll_timeouts = 0
                 continue
+
+            self._poll_timeouts = 0
 
             if not self._poll_got_message:
                 await asyncio.sleep(self.poll_interval)
@@ -621,7 +770,9 @@ class ProxyCore:
             other.outbound_queue = None
             self.client_states.pop(other.client_id, None)
 
-        state.pending_message_frames = deque(bf for _, bf in sorted(merged.items()))
+        state.pending_message_frames = deque(
+            (bf for _, bf in sorted(merged.items())), maxlen=MAX_PENDING_MESSAGE_FRAMES
+        )
 
         self._logger.info(
             "[client] %s identified as %s — superseded %d prior session(s)%s "
@@ -1107,9 +1258,27 @@ class ProxyCore:
             peer, state.client_id, self._connected_client_count(),
         )
 
+        connected_at = asyncio.get_running_loop().time()
         try:
             while not self._stop.is_set():
-                data = await reader.read(65536)
+                if state.app_started:
+                    data = await reader.read(65536)
+                else:
+                    # Idle/never-identified connections must not hold a slot (and
+                    # block max_clients) forever: APP_START is due promptly.
+                    remaining = UNIDENTIFIED_CLIENT_TIMEOUT - (
+                        asyncio.get_running_loop().time() - connected_at
+                    )
+                    try:
+                        data = await asyncio.wait_for(
+                            reader.read(65536), timeout=max(remaining, 0.1)
+                        )
+                    except asyncio.TimeoutError:
+                        self._logger.info(
+                            "[client] %s sent no APP_START within %.0fs — closing",
+                            peer, UNIDENTIFIED_CLIENT_TIMEOUT,
+                        )
+                        break
                 if not data:
                     break
 
@@ -1118,6 +1287,7 @@ class ProxyCore:
                 # forwarded to a live backend (see below), never for a message
                 # that was dropped because the backend was down.
                 pending_echoes: list[tuple[int, bytes]] = []
+                config_changed = False
                 for frame in state.client_parser.feed(data):
                     if len(frame) < 4:
                         forward_frames.append(frame)
@@ -1234,16 +1404,25 @@ class ProxyCore:
                         # PX-5: defer the echo until we know the frame was actually
                         # forwarded to a live backend (scheduled after the batch).
                         pending_echoes.append((chan_idx, text_data))
+                    elif command in CONFIG_MUTATING_COMMANDS:
+                        # Identity / radio / tuning change: the cached node info is
+                        # stale. Drop what we can't re-read and refresh SELF_INFO
+                        # right after the command, so all clients see it at once.
+                        forward_frames.append(frame)
+                        config_changed = True
                     else:
                         forward_frames.append(frame)
 
                 if forward_frames:
                     payload = b"".join(forward_frames)
                     if self.backend_connected.is_set():
-                        await self._send_to_backend(payload)
+                        sent_ok = await self._send_to_backend(payload)
+                        if sent_ok and config_changed:
+                            self._drop_stale_node_singletons()
+                            self._request_node_info_refresh(urgent=True)
                         # PX-5: the batch reached a connected backend — now it is
                         # safe to echo the channel messages to the other clients.
-                        for chan_idx, text_data in pending_echoes:
+                        for chan_idx, text_data in (pending_echoes if sent_ok else ()):
                             task = asyncio.create_task(
                                 self._inject_sent_echo(chan_idx, text_data, state.client_id),
                                 name=f"echo-ch{chan_idx}-{state.client_id}",
@@ -1298,6 +1477,9 @@ class ProxyCore:
                 )
                 await asyncio.sleep(delay)
                 continue
+
+            # The node may have rebooted or been reconfigured while we were away.
+            self._request_node_info_refresh(urgent=True)
 
             # A client may have requested contacts while the backend was down.
             # Keep the request pending and satisfy it as soon as transport returns.
@@ -1380,16 +1562,18 @@ class ProxyCore:
                 pass
         for writer in writers:
             try:
-                await writer.wait_closed()
+                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
             except Exception:
                 pass
 
-    async def _send_to_backend(self, data: bytes) -> None:
+    async def _send_to_backend(self, data: bytes) -> bool:
+        """Write to the backend; True only if the write actually succeeded."""
         async with self.backend_lock:
             if self._stop.is_set() or not self._backend_is_writable():
-                return
+                return False
             try:
                 await self._transport_write(data)
+                return True
             except Exception as exc:
                 self._logger.info("[backend] write error: %s", exc)
                 # Tear the connection down so the read loop exits and reconnects;
@@ -1398,6 +1582,7 @@ class ProxyCore:
                 self.backend_connected.clear()
                 self._poll_event.set()
                 self._transport_after_write_error()
+                return False
 
     async def _inject_sent_echo(self, channel_idx: int, text_data: bytes, exclude_client_id: str) -> None:
         """Inject a synthetic CHANNEL_MSG_RECV_V3 for a message sent by a client.
@@ -1415,9 +1600,10 @@ class ProxyCore:
             text_data = node_name.encode("utf-8") + b": " + text_data
 
         frame = _build_sent_echo_frame(channel_idx, text_data, timestamp)
+        # Message text is private: log only its size, never its content.
         self._logger.info(
-            "[echo] injecting sent msg ch=%d text=%r excluding=%s",
-            channel_idx, text_data.decode("utf-8", "ignore"), exclude_client_id,
+            "[echo] injecting sent msg ch=%d len=%dB excluding=%s",
+            channel_idx, len(text_data), exclude_client_id,
         )
 
         # Pass exclude_ids instead of mutating client_states around an await —
@@ -1482,8 +1668,25 @@ class ProxyCore:
         # so (re)connecting clients can be served without hitting the backend.
         # NEW_ADVERT (0x8A) is intentionally not allowlisted: it is a transient,
         # unapproved discovery rather than an authoritative stored contact.
+        swallow_refresh = False
         if not is_msg:
+            if (packet_type == RESP_CODE_SELF_INFO and not synthetic
+                    and asyncio.get_running_loop().time() < self._self_info_refresh_deadline):
+                # Answer to the proxy's own refresh APP_START. Relay it to the
+                # clients only when the node's identity/config really changed.
+                self._self_info_refresh_deadline = 0.0
+                old_self_info = self._state_cache.get(RESP_CODE_SELF_INFO, {}).get(None)
+                # Never swallow while a client waits for its own SELF_INFO (and the
+                # replay that follows it): it could be this very frame.
+                swallow_refresh = old_self_info == frame and not any(
+                    s.awaiting_replay_after_self_info for s in self.client_states.values()
+                )
+                if not swallow_refresh:
+                    self._logger.info("[node-info] node config changed — pushing to clients")
+                self._self_info_seen.set()
             self._cache_backend_frame(frame, packet_type)
+            if swallow_refresh:
+                return
             # These pushes refer to an accepted/stored contact and indicate that
             # metadata or its path changed in firmware. Validate the snapshot
             # lazily on the next GET_CONTACTS.
